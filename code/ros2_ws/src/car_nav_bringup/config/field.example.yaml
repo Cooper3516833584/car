@@ -1,0 +1,4 @@
+# Replace every value with survey measurements.  Do not use this template as a map.
+boundary_m: []
+obstacle_polygons_m: []
+boundary_margin_m: 0.0

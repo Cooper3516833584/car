@@ -21,6 +21,7 @@ from .steering_servo import (
 )
 from .ackermann_drive import (
     AckermannDrive,
+    HardwareLockError,
     AckermannMotionPlan,
     plan_ackermann_motion,
 )
@@ -39,6 +40,7 @@ from .radar_driver import (
     D500SerialDriver,
     DroneGlobalAlignment,
     DroneGlobalPointMap,
+    GlobalCorrectionMode,
     ICPResult,
     ICPScanMatcher,
     Pose2D,
@@ -113,6 +115,7 @@ __all__ = [
     "steering_angle_to_pulse_us",
     "yaw_to_steering_command",
     "AckermannDrive",
+    "HardwareLockError",
     "AckermannMotionPlan",
     "plan_ackermann_motion",
     "BridgeCodecStats",
@@ -127,6 +130,7 @@ __all__ = [
     "D500SerialDriver",
     "DroneGlobalAlignment",
     "DroneGlobalPointMap",
+    "GlobalCorrectionMode",
     "ICPResult",
     "ICPScanMatcher",
     "Pose2D",

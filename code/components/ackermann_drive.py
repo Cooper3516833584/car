@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 import threading
 from typing import Final
 
@@ -23,10 +24,20 @@ from .steering_servo import (
     yaw_to_steering_command,
 )
 
+try:
+    import fcntl
+except ModuleNotFoundError:  # Unit tests on Windows never start hardware.
+    fcntl = None
+
 
 DEFAULT_WHEELBASE_MM: Final[float] = 142.5
 DEFAULT_TRACK_WIDTH_MM: Final[float] = 117.1
 DEFAULT_FIRMWARE_TRACK_WIDTH_MM: Final[float] = 164.0
+DEFAULT_HARDWARE_LOCK_PATH: Final[str] = "/run/lock/car-hardware.lock"
+
+
+class HardwareLockError(RuntimeError):
+    """Another process already controls the servo or C10B driver board."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +142,7 @@ class AckermannDrive:
         track_width_mm: float = DEFAULT_TRACK_WIDTH_MM,
         firmware_track_width_mm: float | None = None,
         max_wheel_speed_mm_s: float | None = None,
+        hardware_lock_path: str | os.PathLike[str] | None = DEFAULT_HARDWARE_LOCK_PATH,
     ) -> None:
         if rear_motors is None:
             firmware_track = (
@@ -184,6 +196,8 @@ class AckermannDrive:
         self._speed_mm_s = 0.0
         self._direction = MotorDirection.FORWARD
         self._rear_differential_linked = True
+        self._hardware_lock_path = None if hardware_lock_path is None else os.fspath(hardware_lock_path)
+        self._hardware_lock_file = None
 
     @property
     def is_running(self) -> bool:
@@ -193,11 +207,16 @@ class AckermannDrive:
         with self._lock:
             if self._started:
                 raise RuntimeError("Ackermann drive is already running")
-            self.steering.start()
+            self._acquire_hardware_lock()
             try:
-                self.rear_motors.start()
+                self.steering.start()
+                try:
+                    self.rear_motors.start()
+                except BaseException:
+                    self.steering.close()
+                    raise
             except BaseException:
-                self.steering.close()
+                self._release_hardware_lock()
                 raise
             self._started = True
         return self
@@ -316,6 +335,7 @@ class AckermannDrive:
                 self.steering.close()
                 self._started = False
                 self._speed_mm_s = 0.0
+                self._release_hardware_lock()
 
     def _plan(
         self,
@@ -362,3 +382,24 @@ class AckermannDrive:
     def _require_started(self) -> None:
         if not self._started:
             raise RuntimeError("Ackermann drive is not running")
+
+    def _acquire_hardware_lock(self) -> None:
+        if self._hardware_lock_path is None:
+            return
+        if fcntl is None:
+            raise HardwareLockError("hardware locking is unavailable on this platform")
+        try:
+            lock_file = open(self._hardware_lock_path, "w", encoding="utf-8")
+        except OSError as exc:
+            raise HardwareLockError(f"cannot open hardware lock {self._hardware_lock_path}: {exc}") from exc
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            lock_file.close()
+            raise HardwareLockError(f"hardware lock is held: {self._hardware_lock_path}") from exc
+        self._hardware_lock_file = lock_file
+
+    def _release_hardware_lock(self) -> None:
+        if self._hardware_lock_file is not None:
+            self._hardware_lock_file.close()
+            self._hardware_lock_file = None

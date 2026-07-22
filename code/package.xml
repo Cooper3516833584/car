@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>car_components</name>
+  <version>0.1.0</version>
+  <description>Hardware and navigation components for the Ackermann car.</description>
+  <maintainer email="maintainer@example.invalid">car maintainers</maintainer>
+  <license>Proprietary</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <test_depend>python3-pytest</test_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

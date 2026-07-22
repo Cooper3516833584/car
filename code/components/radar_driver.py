@@ -16,6 +16,7 @@ translation to both poses and map points.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 import math
 import os
 import select
@@ -41,6 +42,13 @@ D500_POINT_COUNT: Final[int] = 12
 
 class RadarDriverError(RuntimeError):
     """The UART, parser, or optional localization dependency failed."""
+
+
+class GlobalCorrectionMode(Enum):
+    """Where an accepted absolute wall correction is absorbed."""
+
+    LEGACY_REWRITE_ODOMETRY = "legacy_rewrite_odometry"
+    UPDATE_ALIGNMENT = "update_alignment"
 
 
 def normalize_yaw_cw_deg(angle_deg: float) -> float:
@@ -1246,15 +1254,20 @@ class D500RadarComponent:
         global_map: DroneGlobalPointMap | None = None,
         wall_localizer: WallLineLocalizer | None = None,
         wall_fusion_config: WallFusionConfig = WallFusionConfig(),
+        global_correction_mode: GlobalCorrectionMode = GlobalCorrectionMode.LEGACY_REWRITE_ODOMETRY,
     ) -> None:
+        if not isinstance(global_correction_mode, GlobalCorrectionMode):
+            raise TypeError("global_correction_mode must be a GlobalCorrectionMode")
         self.mount = mount
-        self.alignment = alignment
+        self._alignment = alignment
         self.on_update = on_update
         self.assembler = assembler or RadarScanAssembler()
         self.odometry = odometry or RadarOdometry(mount=mount)
         self.global_map = global_map or DroneGlobalPointMap()
         self.wall_localizer = wall_localizer
         self.wall_fusion_config = wall_fusion_config
+        self.global_correction_mode = global_correction_mode
+        self._state_lock = threading.RLock()
         self._wall_scan_count = 0
         self.serial = D500SerialDriver(
             port=port,
@@ -1263,13 +1276,36 @@ class D500RadarComponent:
             on_disconnected=on_disconnected,
         )
 
+    @property
+    def alignment(self) -> DroneGlobalAlignment | None:
+        """Return a stable snapshot of the map-to-odom alignment."""
+
+        return self.get_alignment()
+
+    @alignment.setter
+    def alignment(self, alignment: DroneGlobalAlignment | None) -> None:
+        self.set_alignment(alignment)
+
+    def set_alignment(self, alignment: DroneGlobalAlignment | None) -> None:
+        """Safely replace the global alignment used by the processing thread."""
+
+        if alignment is not None and not isinstance(alignment, DroneGlobalAlignment):
+            raise TypeError("alignment must be a DroneGlobalAlignment or None")
+        with self._state_lock:
+            self._alignment = alignment
+
+    def get_alignment(self) -> DroneGlobalAlignment | None:
+        with self._state_lock:
+            return self._alignment
+
     def set_global_reference(
         self,
         car_local_pose: Pose2D,
         drone_global_pose: Pose2D,
     ) -> DroneGlobalAlignment:
-        self.alignment = DroneGlobalAlignment.from_reference(car_local_pose, drone_global_pose)
-        return self.alignment
+        alignment = DroneGlobalAlignment.from_reference(car_local_pose, drone_global_pose)
+        self.set_alignment(alignment)
+        return alignment
 
     def enable_wall_fusion(
         self,
@@ -1280,18 +1316,20 @@ class D500RadarComponent:
     ) -> WallLineLocalizer:
         """Enable periodic absolute correction from known back/right walls."""
 
-        self.wall_localizer = WallLineLocalizer(
-            reference,
-            mount=self.mount,
-            config=line_config,
-        )
-        self.wall_fusion_config = fusion_config
-        self._wall_scan_count = 0
-        return self.wall_localizer
+        with self._state_lock:
+            self.wall_localizer = WallLineLocalizer(
+                reference,
+                mount=self.mount,
+                config=line_config,
+            )
+            self.wall_fusion_config = fusion_config
+            self._wall_scan_count = 0
+            return self.wall_localizer
 
     def disable_wall_fusion(self) -> None:
-        self.wall_localizer = None
-        self._wall_scan_count = 0
+        with self._state_lock:
+            self.wall_localizer = None
+            self._wall_scan_count = 0
 
     def start(self) -> "D500RadarComponent":
         self.serial.start()
@@ -1315,19 +1353,28 @@ class D500RadarComponent:
             global_pose: Pose2D | None = None
             global_points: tuple[tuple[float, float], ...] = ()
             wall_fusion: WallFusionResult | None = None
-            if self.alignment is not None:
-                global_pose = self.alignment.pose_to_global(odometry_update.pose)
-                if odometry_update.accepted and self.wall_localizer is not None:
-                    self._wall_scan_count += 1
-                    if self._wall_scan_count >= self.wall_fusion_config.update_every_scans:
-                        self._wall_scan_count = 0
+            with self._state_lock:
+                alignment = self._alignment
+                wall_localizer = self.wall_localizer
+                wall_fusion_config = self.wall_fusion_config
+            if alignment is not None:
+                global_pose = alignment.pose_to_global(odometry_update.pose)
+                if odometry_update.accepted and wall_localizer is not None:
+                    with self._state_lock:
+                        self._wall_scan_count += 1
+                        try_wall_fusion = (
+                            self._wall_scan_count >= wall_fusion_config.update_every_scans
+                        )
+                        if try_wall_fusion:
+                            self._wall_scan_count = 0
+                    if try_wall_fusion:
                         try:
-                            observation = self.wall_localizer.observe(scan, global_pose)
+                            observation = wall_localizer.observe(scan, global_pose)
                             wall_fusion = fuse_wall_observation(
                                 global_pose,
                                 observation,
-                                self.wall_localizer.reference,
-                                self.wall_fusion_config,
+                                wall_localizer.reference,
+                                wall_fusion_config,
                             )
                         except (RadarDriverError, ValueError) as exc:
                             wall_fusion = WallFusionResult(
@@ -1339,19 +1386,29 @@ class D500RadarComponent:
                             )
                         if wall_fusion.accepted:
                             global_pose = wall_fusion.fused_global_pose
-                            corrected_local_pose = self.alignment.pose_to_local(global_pose)
-                            self.odometry.pose = corrected_local_pose
-                            odometry_update = RadarOdometryUpdate(
-                                corrected_local_pose,
-                                True,
-                                odometry_update.initialized,
-                                odometry_update.icp,
-                                odometry_update.rejection_reason,
-                            )
+                            if self.global_correction_mode is GlobalCorrectionMode.LEGACY_REWRITE_ODOMETRY:
+                                corrected_local_pose = alignment.pose_to_local(global_pose)
+                                self.odometry.pose = corrected_local_pose
+                                odometry_update = RadarOdometryUpdate(
+                                    corrected_local_pose,
+                                    True,
+                                    odometry_update.initialized,
+                                    odometry_update.icp,
+                                    odometry_update.rejection_reason,
+                                )
+                            else:
+                                # In ROS, map->odom carries the discontinuous
+                                # wall correction and odom->base_link remains
+                                # a continuous ICP trajectory for Nav2.
+                                alignment = DroneGlobalAlignment.from_reference(
+                                    odometry_update.pose,
+                                    global_pose,
+                                )
+                                self.set_alignment(alignment)
                 if odometry_update.accepted:
                     global_points = tuple(
                         scan_points_in_drone_global(
-                            scan, odometry_update.pose, self.mount, self.alignment
+                            scan, odometry_update.pose, self.mount, alignment
                         )
                     )
                     self.global_map.add_points(global_points)

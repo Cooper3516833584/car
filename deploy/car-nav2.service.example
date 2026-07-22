@@ -1,0 +1,13 @@
+[Unit]
+Description=Car ROS 2 Nav2 bringup
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/radxa/car
+EnvironmentFile=/etc/car-nav2.env
+ExecStart=/bin/bash -lc 'source /opt/ros/jazzy/setup.bash && source install/setup.bash && ros2 launch car_nav_bringup bringup.launch.py use_hardware:=true field_config:=${CAR_FIELD_CONFIG} map:=${CAR_MAP} radar_x_m:=${CAR_RADAR_X_M} radar_y_m:=${CAR_RADAR_Y_M} radar_yaw_rad:=${CAR_RADAR_YAW_RAD} enable_hc14:=true'
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

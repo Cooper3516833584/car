@@ -1,0 +1,81 @@
+amcl: {ros__parameters: {enabled: false}}
+map_server: {ros__parameters: {use_sim_time: false}}
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 2.0
+    planner_plugins: [GridBased]
+    GridBased:
+      plugin: nav2_smac_planner::SmacPlannerHybrid
+      motion_model_for_search: REEDS_SHEPP
+      minimum_turning_radius: 0.49
+      angle_quantization_bins: 72
+      allow_reverse_expansion: true
+      allow_unknown: false
+      analytic_expansion_ratio: 3.5
+controller_server:
+  ros__parameters:
+    controller_frequency: 20.0
+    controller_plugins: [FollowPath]
+    goal_checker_plugins: [pose_goal_checker, position_goal_checker]
+    FollowPath:
+      plugin: nav2_mppi_controller::MPPIController
+      motion_model: Ackermann
+      vx_max: 0.30
+      vx_min: -0.12
+      wz_max: 0.62
+      time_steps: 56
+      model_dt: 0.05
+      batch_size: 1000
+      iteration_count: 1
+      temperature: 0.3
+      gamma: 0.015
+      visualize: false
+    pose_goal_checker:
+      plugin: nav2_controller::SimpleGoalChecker
+      xy_goal_tolerance: 0.10
+      yaw_goal_tolerance: 0.10
+      stateful: true
+    position_goal_checker:
+      plugin: nav2_controller::SimpleGoalChecker
+      xy_goal_tolerance: 0.10
+      yaw_goal_tolerance: 6.283
+      stateful: true
+behavior_server:
+  ros__parameters:
+    behavior_plugins: [backup, wait]
+    backup: {plugin: nav2_behaviors/BackUp}
+    wait: {plugin: nav2_behaviors/Wait}
+velocity_smoother:
+  ros__parameters:
+    enable_stamped_cmd_vel: false
+    smoothing_frequency: 20.0
+    feedback: OPEN_LOOP
+    max_velocity: [0.30, 0.0, 0.62]
+    min_velocity: [-0.12, 0.0, -0.62]
+    max_accel: [0.30, 0.0, 0.80]
+    max_decel: [-0.40, 0.0, -1.0]
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      global_frame: map
+      robot_base_frame: base_link
+      footprint: "[[0.18625, 0.07250], [0.18625, -0.07250], [-0.04375, -0.07250], [-0.04375, 0.07250]]"
+      resolution: 0.02
+      track_unknown_space: true
+      plugins: [static_layer, obstacle_layer, inflation_layer]
+      static_layer: {plugin: nav2_costmap_2d::StaticLayer}
+      obstacle_layer: {plugin: nav2_costmap_2d::ObstacleLayer, observation_sources: scan, scan: {topic: /scan, data_type: LaserScan, marking: true, clearing: true, obstacle_max_range: 3.0, raytrace_max_range: 3.5}}
+      inflation_layer: {plugin: nav2_costmap_2d::InflationLayer, inflation_radius: 0.22, cost_scaling_factor: 5.0}
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      global_frame: odom
+      robot_base_frame: base_link
+      rolling_window: true
+      width: 4.0
+      height: 4.0
+      resolution: 0.02
+      footprint: "[[0.18625, 0.07250], [0.18625, -0.07250], [-0.04375, -0.07250], [-0.04375, 0.07250]]"
+      plugins: [obstacle_layer, inflation_layer]
+      obstacle_layer: {plugin: nav2_costmap_2d::ObstacleLayer, observation_sources: scan, scan: {topic: /scan, data_type: LaserScan, marking: true, clearing: true, obstacle_max_range: 3.0, raytrace_max_range: 3.5}}
+      inflation_layer: {plugin: nav2_costmap_2d::InflationLayer, inflation_radius: 0.22, cost_scaling_factor: 5.0}
