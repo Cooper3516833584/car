@@ -1,0 +1,95 @@
+diff --git a/Inc/tim.h b/Inc/tim.h
+--- a/Inc/tim.h
++++ b/Inc/tim.h
+@@
++void MX_TIM2_Init(void);
+ void MX_TIM1_Init(void);
+diff --git a/CONTROL/control.h b/CONTROL/control.h
+--- a/CONTROL/control.h
++++ b/CONTROL/control.h
+@@
+ extern int Servo_PWM;
++extern int Gimbal_A2_PWM, Gimbal_A3_PWM;
+diff --git a/CONTROL/control.c b/CONTROL/control.c
+--- a/CONTROL/control.c
++++ b/CONTROL/control.c
+@@
+ int Servo_PWM = SERVO_INIT;
++int Gimbal_A2_PWM = SERVO_INIT;
++int Gimbal_A3_PWM = SERVO_INIT;
+@@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+ 		Set_Pwm(-MotorA.Motor_Pwm,MotorB.Motor_Pwm);
++		__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, Gimbal_A2_PWM);
++		__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_4, Gimbal_A3_PWM);
+ 	}
+ }
+diff --git a/CONTROL/bluetooth.c b/CONTROL/bluetooth.c
+--- a/CONTROL/bluetooth.c
++++ b/CONTROL/bluetooth.c
+@@ if(Receive_Data.buffer[9] ==Check_Sum(9,0))
+ 					{
++						/*
++						 * Extended USB command, backwards compatible with the normal
++						 * 11-byte velocity frame:
++						 *   bytes 1..2 = A2 pulse, bytes 5..6 = A3 pulse (microseconds).
++						 * Zero means leave that axis unchanged.  Normal ROS velocity
++						 * senders put zero in these unused fields and remain unaffected.
++						 */
++						u16 a2 = ((u16)Receive_Data.buffer[1] << 8) | Receive_Data.buffer[2];
++						u16 a3 = ((u16)Receive_Data.buffer[5] << 8) | Receive_Data.buffer[6];
++						if (a2 >= 900 && a2 <= 2100) Gimbal_A2_PWM = a2;
++						if (a3 >= 900 && a3 <= 2100) Gimbal_A3_PWM = a3;
+ 						float Vz;
+diff --git a/Src/main.c b/Src/main.c
+--- a/Src/main.c
++++ b/Src/main.c
+@@
++  MX_TIM2_Init();
+   MX_TIM1_Init();
+@@
+-    PWM_Cap_Init(65535,72-1);  // PWM capture for model-aircraft receiver
++    /* PWM_Cap_Init(...) is disabled: TIM2_CH3/CH4 are now A2/A3 servo PWM. */
+diff --git a/Src/tim.c b/Src/tim.c
+--- a/Src/tim.c
++++ b/Src/tim.c
+@@
+ TIM_HandleTypeDef htim2;
++
++/* A2=PA2/TIM2_CH3 and A3=PA3/TIM2_CH4, 50 Hz, one timer tick = 1 us. */
++void MX_TIM2_Init(void)
++{
++  TIM_MasterConfigTypeDef master = {0};
++  TIM_OC_InitTypeDef oc = {0};
++  htim2.Instance = TIM2;
++  htim2.Init.Prescaler = 71;
++  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
++  htim2.Init.Period = 19999;
++  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
++  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
++  if (HAL_TIM_PWM_Init(&htim2) != HAL_OK) Error_Handler();
++  master.MasterOutputTrigger = TIM_TRGO_RESET;
++  master.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
++  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &master) != HAL_OK) Error_Handler();
++  oc.OCMode = TIM_OCMODE_PWM1;
++  oc.Pulse = 1500;
++  oc.OCPolarity = TIM_OCPOLARITY_HIGH;
++  oc.OCFastMode = TIM_OCFAST_DISABLE;
++  if (HAL_TIM_PWM_ConfigChannel(&htim2, &oc, TIM_CHANNEL_3) != HAL_OK) Error_Handler();
++  if (HAL_TIM_PWM_ConfigChannel(&htim2, &oc, TIM_CHANNEL_4) != HAL_OK) Error_Handler();
++  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
++  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4);
++  HAL_TIM_MspPostInit(&htim2);
++}
+@@ void HAL_TIM_PWM_MspInit(TIM_HandleTypeDef* tim_pwmHandle)
++  if(tim_pwmHandle->Instance==TIM2) { __HAL_RCC_TIM2_CLK_ENABLE(); }
+   if(tim_pwmHandle->Instance==TIM1)
+@@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef* timHandle)
++  if(timHandle->Instance==TIM2)
++  {
++    __HAL_RCC_GPIOA_CLK_ENABLE();
++    GPIO_InitStruct.Pin = GPIO_PIN_2|GPIO_PIN_3;
++    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
++    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
++    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
++  }
+   if(timHandle->Instance==TIM1)

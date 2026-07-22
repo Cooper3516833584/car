@@ -1,0 +1,11 @@
+[Unit]
+Description=Grant ROCK 5A PWM0 access to the pwm group
+After=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rock5a-pwm0-permissions
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
