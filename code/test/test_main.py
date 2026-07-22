@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -14,21 +15,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from components import (  # noqa: E402
     AckStatus,
     DroneGlobalAlignment,
+    ICPResult,
     NavigationCommandReceipt,
     NavigationCommandRejected,
     NavigationGoal,
     NavigationState,
     Pose2D,
+    RadarLocalizationUpdate,
+    RadarScan,
     RectangularWallReference,
     RectangleFieldCalibration,
+    WallFusionResult,
     pack_navigation_command,
     unpack_authenticated_frame,
 )
+from components.radar_driver import RadarOdometryUpdate  # noqa: E402
 from main import (  # noqa: E402
     CarMainApplication,
     MainConfig,
     NAVIGATION_ALLOW_REVERSE,
     NAVIGATION_CRUISE_SPEED_CM_S,
+    NAVIGATION_REVERSE_SPEED_CM_S,
     build_argument_parser,
     configure_logging,
     default_log_dir,
@@ -99,6 +106,23 @@ class MainCoordinatorTests(unittest.TestCase):
         app._ready = True
         return app
 
+    @staticmethod
+    def make_radar_update(
+        pose: Pose2D,
+        *,
+        error_cm: float = 1.0,
+        points: tuple[tuple[float, float], ...] = (),
+        wall_fusion: WallFusionResult | None = None,
+    ) -> RadarLocalizationUpdate:
+        icp = ICPResult(Pose2D(), 100, error_cm, 3)
+        return RadarLocalizationUpdate(
+            RadarScan((), 1000, 3600),
+            RadarOdometryUpdate(pose, True, True, icp),
+            pose,
+            points,
+            wall_fusion,
+        )
+
     def test_grid_marks_field_exterior_occupied(self) -> None:
         app = self.make_app()
         calibration = make_calibration()
@@ -110,6 +134,88 @@ class MainCoordinatorTests(unittest.TestCase):
         self.assertTrue(grid.is_occupied(*outside))
         self.assertFalse(grid.is_occupied(*inside))
         self.assertTrue(grid.is_occupied(*radar_hit))
+
+    def test_trusted_localization_rejects_pose_jump_and_field_exit(self) -> None:
+        app = self.make_app()
+        app._last_trusted_pose = Pose2D()
+
+        jump = app._trusted_localization_rejection(
+            self.make_radar_update(Pose2D(30.0, 0.0, 0.0))
+        )
+        outside = app._trusted_localization_rejection(
+            self.make_radar_update(Pose2D(195.0, 0.0, 0.0))
+        )
+
+        self.assertIn("translation jump", jump or "")
+        self.assertIn("footprint outside", outside or "")
+
+    def test_trusted_localization_rejects_large_icp_error(self) -> None:
+        app = self.make_app()
+        app._last_trusted_pose = Pose2D()
+
+        rejection = app._trusted_localization_rejection(
+            self.make_radar_update(Pose2D(2.0, 0.0, 0.0), error_cm=10.1)
+        )
+
+        self.assertIn("ICP error", rejection or "")
+
+    def test_rejected_pose_does_not_update_navigation_or_trusted_map(self) -> None:
+        app = self.make_app()
+        app._last_trusted_pose = Pose2D()
+        app._last_map_update = time.monotonic()
+        update = self.make_radar_update(
+            Pose2D(30.0, 0.0, 0.0),
+            points=((50.0, 20.0),),
+        )
+
+        app._on_radar_update(update)
+
+        self.assertIsNone(app.navigation.pose)
+        self.assertEqual(app._trusted_map.cells(), [])
+        self.assertIn("translation jump", app._last_trusted_rejection or "")
+
+    def test_vehicle_footprint_points_are_removed_from_map(self) -> None:
+        app = self.make_app()
+        pose = Pose2D(50.0, 20.0, 0.0)
+
+        retained = app._filter_vehicle_footprint_points(
+            [(50.0, 20.0), (55.0, 20.0), (80.0, 20.0), (50.0, 40.0)],
+            pose,
+        )
+
+        self.assertEqual(retained, [(80.0, 20.0), (50.0, 40.0)])
+
+    def test_forced_grid_refresh_clears_historical_hits_under_current_car(self) -> None:
+        app = self.make_app()
+        pose = Pose2D(50.0, 20.0, 0.0)
+        app._last_trusted_pose = pose
+        app._trusted_map.add_points([(50.0, 20.0), (50.0, 20.0), (80.0, 20.0), (80.0, 20.0)])
+
+        app._refresh_trusted_grid(force=True)
+
+        grid = app._grid
+        self.assertIsNotNone(grid)
+        assert grid is not None
+        self.assertFalse(grid.is_occupied(*grid.world_to_cell(50.0, 20.0)))
+        self.assertTrue(grid.is_occupied(*grid.world_to_cell(80.0, 20.0)))
+
+    def test_rejected_wall_correction_scan_does_not_pollute_trusted_map(self) -> None:
+        app = self.make_app()
+        app._last_trusted_pose = Pose2D()
+        app._last_map_update = time.monotonic()
+        pose = Pose2D(2.0, 0.0, 0.0)
+        wall = WallFusionResult(True, False, None, pose, "wall X residual gate")
+
+        app._on_radar_update(
+            self.make_radar_update(
+                pose,
+                points=((50.0, 20.0),),
+                wall_fusion=wall,
+            )
+        )
+
+        self.assertEqual(app.navigation.pose.x_cm if app.navigation.pose else None, 2.0)
+        self.assertEqual(app._trusted_map.cells(), [])
 
     def test_default_and_detailed_log_file(self) -> None:
         previous = os.environ.pop("CAR_LOG_DIR", None)
@@ -128,15 +234,24 @@ class MainCoordinatorTests(unittest.TestCase):
             self.assertEqual(log_path.name, "car-main.log")
             self.assertIn("detailed-log-probe", log_path.read_text(encoding="utf-8"))
 
-    def test_top_level_cruise_speed_is_applied_to_navigation(self) -> None:
+    def test_top_level_drive_speeds_are_applied_to_navigation(self) -> None:
         app = self.make_app()
         self.assertEqual(
             app.navigation.controller.config.cruise_speed_mm_s,
             NAVIGATION_CRUISE_SPEED_CM_S * 10.0,
         )
         self.assertEqual(
+            app.navigation.controller.config.reverse_speed_mm_s,
+            NAVIGATION_REVERSE_SPEED_CM_S * 10.0,
+        )
+        self.assertEqual(
             app.navigation.drive.rear_motors.max_wheel_speed_mm_s,
-            NAVIGATION_CRUISE_SPEED_CM_S * 10.0 * 1.20,
+            max(
+                NAVIGATION_CRUISE_SPEED_CM_S,
+                NAVIGATION_REVERSE_SPEED_CM_S,
+            )
+            * 10.0
+            * 1.20,
         )
 
     def test_top_level_reverse_switch_and_cli_override(self) -> None:

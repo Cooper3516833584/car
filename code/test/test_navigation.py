@@ -219,6 +219,28 @@ class PurePursuitTests(unittest.TestCase):
         self.assertIs(command.direction, MotorDirection.REVERSE)
         self.assertLessEqual(command.speed_mm_s, controller.config.reverse_speed_mm_s)
 
+    def test_reverse_speed_below_approach_floor_is_not_raised(self) -> None:
+        controller = PurePursuitController(
+            config=PurePursuitConfig(
+                cruise_speed_mm_s=500.0,
+                max_speed_mm_s=500.0,
+                approach_speed_mm_s=50.0,
+                reverse_speed_mm_s=30.0,
+            )
+        )
+        path = NavigationPath(
+            (
+                PathPoint(0, 0, 0),
+                PathPoint(-100, 0, 0, MotorDirection.REVERSE),
+            ),
+            NavigationGoal(-100, 0),
+        )
+
+        command = controller.compute(NavigationPose(0, 0, 0, 0), path)
+
+        self.assertIs(command.direction, MotorDirection.REVERSE)
+        self.assertEqual(command.speed_mm_s, 30.0)
+
     def test_speed_reduces_near_goal(self) -> None:
         controller = PurePursuitController()
         far_path = NavigationPath(

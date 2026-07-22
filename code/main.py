@@ -22,6 +22,7 @@ from components import (
     AckStatus,
     D500RadarComponent,
     DroneGlobalAlignment,
+    DroneGlobalPointMap,
     GroundNavigationProtocol,
     Navigation,
     NavigationCommandReceipt,
@@ -45,6 +46,7 @@ from components import (
     RejectReason,
     SerialCommunicationDriver,
     WallFusionConfig,
+    VehicleCollisionChecker,
     load_navigation_hmac_key,
     scan_points_in_drone_global,
 )
@@ -54,6 +56,9 @@ from components import (
 # 允许范围为 0～100 cm/s。主程序会自动为阿克曼弯道外侧轮预留 20% 速度余量，
 # 以后只需修改这一处即可调整正常行驶速度。
 NAVIGATION_CRUISE_SPEED_CM_S = 50.0
+# Reverse cruise speed, in cm/s.  Keep this independent from the forward
+# cruise setting so it can be tuned safely at the top of this file.
+NAVIGATION_REVERSE_SPEED_CM_S = 10.0
 # 自主导航倒车开关；True 允许规划倒车和前进/倒车换挡，False 只允许前进。
 NAVIGATION_ALLOW_REVERSE = True
 _MAX_NAVIGATION_CRUISE_SPEED_CM_S = 100.0
@@ -252,6 +257,10 @@ class MainConfig:
     map_margin_cm: float = 15.0
     map_update_interval_s: float = 2.0
     map_min_hits: int = 2
+    trusted_max_pose_step_cm: float = 25.0
+    trusted_max_yaw_step_deg: float = 15.0
+    trusted_max_icp_error_cm: float = 10.0
+    footprint_clearance_cm: float = 2.0
     console_enabled: bool = True
 
     def __post_init__(self) -> None:
@@ -261,6 +270,12 @@ class MainConfig:
             raise ValueError("invalid map geometry")
         if self.map_update_interval_s <= 0 or self.map_min_hits <= 0:
             raise ValueError("invalid map update configuration")
+        if min(
+            self.trusted_max_pose_step_cm,
+            self.trusted_max_yaw_step_deg,
+            self.trusted_max_icp_error_cm,
+        ) <= 0 or self.footprint_clearance_cm < 0:
+            raise ValueError("invalid trusted localization configuration")
 
 
 class CarMainApplication:
@@ -274,6 +289,10 @@ class CarMainApplication:
         self._startup_scans: list[RadarScan] = []
         self._calibration: RectangleFieldCalibration | None = None
         self._grid: OccupancyGrid | None = None
+        self._trusted_map = DroneGlobalPointMap(resolution_cm=config.map_resolution_cm)
+        self._last_trusted_pose: Pose2D | None = None
+        self._last_trusted_pose_time = 0.0
+        self._last_trusted_rejection: str | None = None
         self._ready = False
         self._last_map_update = 0.0
         self._active_receipt: NavigationCommandReceipt | None = None
@@ -286,7 +305,8 @@ class CarMainApplication:
             "application config radar_port=%s link_port=%s radar_mount=(%.2f,%.2f,%.2f) "
             "startup_scans=%d calibration_timeout_s=%.1f allow_reverse=%s "
             "map_resolution_cm=%.1f map_margin_cm=%.1f map_update_interval_s=%.1f "
-            "map_min_hits=%d console_enabled=%s hmac_enabled=%s",
+            "map_min_hits=%d trusted_gates=(%.1fcm,%.1fdeg,%.1fcm_icp) "
+            "footprint_clearance_cm=%.1f console_enabled=%s hmac_enabled=%s",
             config.radar_port,
             config.link_port,
             config.radar_mount.x_forward_cm,
@@ -299,6 +319,10 @@ class CarMainApplication:
             config.map_margin_cm,
             config.map_update_interval_s,
             config.map_min_hits,
+            config.trusted_max_pose_step_cm,
+            config.trusted_max_yaw_step_deg,
+            config.trusted_max_icp_error_cm,
+            config.footprint_clearance_cm,
             config.console_enabled,
             hmac_key is not None,
         )
@@ -315,16 +339,22 @@ class CarMainApplication:
             raise ValueError(
                 "NAVIGATION_CRUISE_SPEED_CM_S must be in (0, 100] cm/s"
             )
+        if not 0.0 < NAVIGATION_REVERSE_SPEED_CM_S <= _MAX_NAVIGATION_CRUISE_SPEED_CM_S:
+            raise ValueError(
+                "NAVIGATION_REVERSE_SPEED_CM_S must be in (0, 100] cm/s"
+            )
         cruise_speed_mm_s = NAVIGATION_CRUISE_SPEED_CM_S * 10.0
+        reverse_speed_mm_s = NAVIGATION_REVERSE_SPEED_CM_S * 10.0
+        highest_command_speed_mm_s = max(cruise_speed_mm_s, reverse_speed_mm_s)
         max_wheel_speed_mm_s = max(
             300.0,
-            cruise_speed_mm_s * _WHEEL_SPEED_HEADROOM,
+            highest_command_speed_mm_s * _WHEEL_SPEED_HEADROOM,
         )
         pursuit_config = PurePursuitConfig(
             cruise_speed_mm_s=cruise_speed_mm_s,
-            max_speed_mm_s=max(150.0, cruise_speed_mm_s),
-            approach_speed_mm_s=min(50.0, cruise_speed_mm_s),
-            reverse_speed_mm_s=min(60.0, cruise_speed_mm_s),
+            max_speed_mm_s=max(150.0, highest_command_speed_mm_s),
+            approach_speed_mm_s=min(50.0, highest_command_speed_mm_s),
+            reverse_speed_mm_s=reverse_speed_mm_s,
         )
         self.navigation = Navigation(
             config=NavigationConfig(allow_reverse=config.allow_reverse),
@@ -333,8 +363,9 @@ class CarMainApplication:
             on_state_changed=self._on_navigation_state,
         )
         LOG.info(
-            "navigation configured cruise=%.1fcm/s max_wheel=%.1fcm/s allow_reverse=%s",
+            "navigation configured forward=%.1fcm/s reverse=%.1fcm/s max_wheel=%.1fcm/s allow_reverse=%s",
             NAVIGATION_CRUISE_SPEED_CM_S,
+            NAVIGATION_REVERSE_SPEED_CM_S,
             max_wheel_speed_mm_s / 10.0,
             config.allow_reverse,
         )
@@ -415,7 +446,13 @@ class CarMainApplication:
                 )
             )
         self.radar.global_map.add_points(startup_points)
-        grid = self._build_grid(startup_points, calibration)
+        trusted_startup_points = self._filter_vehicle_footprint_points(
+            startup_points,
+            Pose2D(),
+        )
+        self._trusted_map.clear()
+        self._trusted_map.add_points(trusted_startup_points)
+        grid = self._build_grid(trusted_startup_points, calibration)
         self.navigation.update_pose(self._navigation_pose(0.0, 0.0, 0.0))
         self.navigation.set_map(grid)
         self.navigation.start()
@@ -425,6 +462,9 @@ class CarMainApplication:
             self._grid = grid
             self._ready = True
             self._last_map_update = time.monotonic()
+            self._last_trusted_pose = Pose2D()
+            self._last_trusted_pose_time = self._last_map_update
+            self._last_trusted_rejection = None
 
         LOG.info(
             "map complete: startup rear axle=(0,0)cm, startup heading=0deg, "
@@ -502,28 +542,175 @@ class CarMainApplication:
                 self._scan_event.set()
                 return
 
-        navigation_accepted = self.navigation.update_from_radar(update)
-        LOG.debug("radar navigation pose accepted=%s", navigation_accepted)
-        if not navigation_accepted:
-            return
         now = time.monotonic()
-        if now - self._last_map_update < self.config.map_update_interval_s:
+        rejection = self._trusted_localization_rejection(update)
+        if rejection is not None:
+            with self._lock:
+                self._last_trusted_rejection = rejection
+            LOG.warning(
+                "radar trusted localization rejected reason=%s; navigation pose/map not refreshed",
+                rejection,
+            )
             return
-        calibration = self._calibration
+
+        navigation_accepted = self.navigation.update_from_radar(update)
+        LOG.debug("radar trusted navigation pose accepted=%s", navigation_accepted)
+        if not navigation_accepted or update.global_pose is None:
+            return
+
+        with self._lock:
+            self._last_trusted_pose = update.global_pose
+            self._last_trusted_pose_time = now
+            self._last_trusted_rejection = None
+
+        wall = update.wall_fusion
+        wall_rejected = wall is not None and wall.attempted and not wall.accepted
+        filtered_points = self._filter_vehicle_footprint_points(
+            update.global_points_cm,
+            update.global_pose,
+        )
+        if wall_rejected:
+            LOG.warning(
+                "trusted map scan skipped because wall correction was rejected reason=%r",
+                wall.reason,
+            )
+        else:
+            self._trusted_map.add_points(filtered_points)
+        LOG.debug(
+            "trusted map scan accepted raw_points=%d retained_points=%d wall_rejected=%s",
+            len(update.global_points_cm),
+            len(filtered_points),
+            wall_rejected,
+        )
+        self._refresh_trusted_grid(now=now)
+
+    def _trusted_localization_rejection(
+        self,
+        update: RadarLocalizationUpdate,
+    ) -> str | None:
+        """Return why a radar pose cannot safely update Navigation, or None."""
+
+        pose = update.global_pose
+        if pose is None:
+            return "global alignment unavailable"
+        if not update.odometry.accepted:
+            return f"odometry rejected: {update.odometry.rejection_reason or 'unknown'}"
+        if not all(math.isfinite(value) for value in (pose.x_cm, pose.y_cm, pose.yaw_cw_deg)):
+            return "non-finite global pose"
+        icp = update.odometry.icp
+        if icp is not None and (
+            not math.isfinite(icp.mean_error_cm)
+            or icp.mean_error_cm > self.config.trusted_max_icp_error_cm
+        ):
+            return f"ICP error {icp.mean_error_cm:.2f}cm exceeds trusted gate"
+
+        with self._lock:
+            calibration = self._calibration
+            previous = self._last_trusted_pose
         if calibration is None:
-            return
-        cells = self.radar.global_map.cells(min_hits=self.config.map_min_hits)
-        points = [(cell.x_cm, cell.y_cm) for cell in cells]
+            return "field calibration unavailable"
+        outside_corners = [
+            corner
+            for corner in self._vehicle_footprint_corners(pose)
+            if not calibration.contains_point(*corner)
+        ]
+        if outside_corners:
+            return f"vehicle footprint outside fitted field at {outside_corners[0]}"
+        if previous is not None:
+            step_cm = math.hypot(pose.x_cm - previous.x_cm, pose.y_cm - previous.y_cm)
+            if step_cm > self.config.trusted_max_pose_step_cm:
+                return (
+                    f"pose translation jump {step_cm:.2f}cm exceeds "
+                    f"{self.config.trusted_max_pose_step_cm:.2f}cm"
+                )
+            yaw_step = abs(
+                (pose.yaw_cw_deg - previous.yaw_cw_deg + 180.0) % 360.0 - 180.0
+            )
+            if yaw_step > self.config.trusted_max_yaw_step_deg:
+                return (
+                    f"pose yaw jump {yaw_step:.2f}deg exceeds "
+                    f"{self.config.trusted_max_yaw_step_deg:.2f}deg"
+                )
+        return None
+
+    def _vehicle_footprint_corners(self, pose: Pose2D) -> tuple[tuple[float, float], ...]:
+        geometry = self.navigation.geometry
+        clearance = self.config.footprint_clearance_cm
+        centre_x_body = geometry.rear_axle_to_body_center_cm
+        half_length = geometry.body_length_cm / 2.0 + clearance
+        half_width = geometry.body_width_cm / 2.0 + clearance
+        yaw = math.radians(pose.yaw_cw_deg)
+        cosine, sine = math.cos(yaw), math.sin(yaw)
+        corners: list[tuple[float, float]] = []
+        for body_x, body_y in (
+            (centre_x_body + half_length, half_width),
+            (centre_x_body + half_length, -half_width),
+            (centre_x_body - half_length, half_width),
+            (centre_x_body - half_length, -half_width),
+        ):
+            corners.append(
+                (
+                    pose.x_cm + cosine * body_x + sine * body_y,
+                    pose.y_cm - sine * body_x + cosine * body_y,
+                )
+            )
+        return tuple(corners)
+
+    def _filter_vehicle_footprint_points(
+        self,
+        points: list[tuple[float, float]] | tuple[tuple[float, float], ...],
+        pose: Pose2D,
+    ) -> list[tuple[float, float]]:
+        """Remove radar self-returns and stale hits under the physical car."""
+
+        geometry = self.navigation.geometry
+        clearance = self.config.footprint_clearance_cm
+        half_length = geometry.body_length_cm / 2.0 + clearance
+        half_width = geometry.body_width_cm / 2.0 + clearance
+        yaw = math.radians(pose.yaw_cw_deg)
+        cosine, sine = math.cos(yaw), math.sin(yaw)
+        retained: list[tuple[float, float]] = []
+        for point_x, point_y in points:
+            dx, dy = point_x - pose.x_cm, point_y - pose.y_cm
+            body_x = cosine * dx - sine * dy
+            body_y = sine * dx + cosine * dy
+            inside = (
+                abs(body_x - geometry.rear_axle_to_body_center_cm) <= half_length
+                and abs(body_y) <= half_width
+            )
+            if not inside:
+                retained.append((point_x, point_y))
+        return retained
+
+    def _refresh_trusted_grid(self, *, now: float | None = None, force: bool = False) -> bool:
+        timestamp = time.monotonic() if now is None else now
+        with self._lock:
+            calibration = self._calibration
+            pose = self._last_trusted_pose
+            elapsed = timestamp - self._last_map_update
+        if calibration is None or pose is None:
+            return False
+        if not force and elapsed < self.config.map_update_interval_s:
+            return False
+        cells = self._trusted_map.cells(min_hits=self.config.map_min_hits)
+        points = self._filter_vehicle_footprint_points(
+            [(cell.x_cm, cell.y_cm) for cell in cells],
+            pose,
+        )
         grid = self._build_grid(points, calibration)
         changed = self.navigation.set_map(grid)
         with self._lock:
             self._grid = grid
-            self._last_map_update = now
+            self._last_map_update = timestamp
         LOG.debug(
-            "radar map refresh source_cells=%d grid_changed=%s",
+            "trusted map refresh source_cells=%d retained_after_current_footprint=%d "
+            "grid_changed=%s force=%s",
             len(cells),
+            len(points),
             changed,
+            force,
         )
+        return changed
 
     @staticmethod
     def _log_radar_update(update: RadarLocalizationUpdate, *, phase: str) -> None:
@@ -668,6 +855,7 @@ class CarMainApplication:
             calibration = self._calibration
         if not calibration.contains_point(goal.x_cm, goal.y_cm):
             raise NavigationCommandRejected(RejectReason.BAD_PAYLOAD, "goal lies outside field")
+        self._refresh_trusted_grid(force=True)
         with self._lock:
             self._active_receipt = receipt
         try:
@@ -701,6 +889,8 @@ class CarMainApplication:
 
     def _on_navigation_state(self, state: NavigationState, reason: str) -> None:
         LOG.info("navigation state=%s reason=%s", state.value, reason)
+        if state is NavigationState.BLOCKED:
+            self._log_navigation_blocked(reason)
         if state not in (NavigationState.ARRIVED, NavigationState.FAILED, NavigationState.BLOCKED):
             return
         with self._lock:
@@ -734,6 +924,74 @@ class CarMainApplication:
             self._send_or_queue_status(reply)
         self.navigation.cancel(reason=ready_reason)
         LOG.info("terminal mission reset for next remote goal; startup origin retained")
+
+    def _log_navigation_blocked(self, reason: str) -> None:
+        """Record evidence that distinguishes a real obstacle from map drift."""
+
+        pose = self.navigation.pose
+        with self._lock:
+            grid = self._grid
+            calibration = self._calibration
+            trusted_pose = self._last_trusted_pose
+            trusted_time = self._last_trusted_pose_time
+            trusted_rejection = self._last_trusted_rejection
+        if pose is None or grid is None or calibration is None:
+            LOG.error(
+                "navigation blocked diagnostics unavailable reason=%r pose=%s grid=%s calibration=%s",
+                reason,
+                pose is not None,
+                grid is not None,
+                calibration is not None,
+            )
+            return
+
+        radar_pose = Pose2D(pose.x_cm, pose.y_cm, (-pose.heading_deg) % 360.0)
+        corners = self._vehicle_footprint_corners(radar_pose)
+        checker = VehicleCollisionChecker(
+            grid,
+            self.navigation.geometry,
+            safety_margin_cm=self.navigation.planner.config.safety_margin_cm,
+        )
+        min_x, max_x = min(x for x, _ in corners), max(x for x, _ in corners)
+        min_y, max_y = min(y for _, y in corners), max(y for _, y in corners)
+        min_ix, min_iy = grid.world_to_cell(min_x, min_y)
+        max_ix, max_iy = grid.world_to_cell(max_x, max_y)
+        occupied: list[tuple[int, int, float, float, int]] = []
+        for iy in range(max(0, min_iy), min(grid.height - 1, max_iy) + 1):
+            for ix in range(max(0, min_ix), min(grid.width - 1, max_ix) + 1):
+                if not grid.is_occupied(ix, iy):
+                    continue
+                x_cm, y_cm = grid.cell_center(ix, iy)
+                occupied.append((ix, iy, x_cm, y_cm, grid.cells[iy * grid.width + ix]))
+                if len(occupied) >= 16:
+                    break
+            if len(occupied) >= 16:
+                break
+        LOG.error(
+            "navigation blocked diagnostics reason=%r pose=(%.2f,%.2f,%.2f) "
+            "pose_free=%s rear_axle_inside=%s footprint_inside=%s corners=%s "
+            "nearby_occupied=%s map_revision=%d occupied_cells=%d "
+            "trusted_pose=%s trusted_age_s=%.3f last_trusted_rejection=%r "
+            "trusted_map_cells=%d raw_map_cells=%d",
+            reason,
+            pose.x_cm,
+            pose.y_cm,
+            pose.heading_deg,
+            checker.is_pose_free(pose),
+            calibration.contains_point(pose.x_cm, pose.y_cm),
+            all(calibration.contains_point(*corner) for corner in corners),
+            tuple((round(x, 2), round(y, 2)) for x, y in corners),
+            occupied,
+            self.navigation.map_revision,
+            sum(value >= grid.occupied_threshold for value in grid.cells),
+            "none"
+            if trusted_pose is None
+            else f"({trusted_pose.x_cm:.2f},{trusted_pose.y_cm:.2f},{trusted_pose.yaw_cw_deg:.2f})",
+            math.inf if trusted_time <= 0 else max(0.0, time.monotonic() - trusted_time),
+            trusted_rejection,
+            len(self._trusted_map.cells(min_hits=self.config.map_min_hits)),
+            len(self.radar.global_map.cells(min_hits=self.config.map_min_hits)),
+        )
 
     def _send_or_queue_status(self, frame: bytes) -> None:
         with self._lock:
@@ -865,6 +1123,7 @@ class CarMainApplication:
                 raise NavigationCommandRejected(RejectReason.BAD_PAYLOAD, "目标位于拟合场地外")
             self._console_mission_active = True
         try:
+            self._refresh_trusted_grid(force=True)
             self.navigation.set_goal(goal)
             self.navigation.start_navigation()
         except BaseException:

@@ -987,7 +987,16 @@ class PurePursuitController:
             self.config.heading_slowdown_deg,
         )
         speed *= min(cross_track_scale, heading_scale)
-        speed = max(self.config.approach_speed_mm_s, min(speed, self.config.max_speed_mm_s))
+        # A configured reverse cap must remain effective even when it is below
+        # the normal approach-speed floor.  Otherwise a low reverse setting in
+        # main.py would be silently raised back to 50 mm/s.
+        speed_cap = (
+            self.config.reverse_speed_mm_s
+            if direction is MotorDirection.REVERSE
+            else self.config.max_speed_mm_s
+        )
+        speed_floor = min(self.config.approach_speed_mm_s, speed_cap)
+        speed = max(speed_floor, min(speed, speed_cap))
         return TrackerCommand(
             speed,
             steering,
@@ -1221,6 +1230,13 @@ class Navigation:
 
         with self._lock:
             return self._pose
+
+    @property
+    def map_revision(self) -> int:
+        """Current occupancy-map revision, primarily for diagnostics."""
+
+        with self._lock:
+            return self._map_revision
 
     @property
     def last_tracker_command(self) -> TrackerCommand | None:
