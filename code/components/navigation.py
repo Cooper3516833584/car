@@ -111,8 +111,8 @@ class NavigationGoal:
     x_cm: float
     y_cm: float
     final_heading_deg: float | None = None
-    position_tolerance_cm: float = 15.0
-    heading_tolerance_deg: float = 8.0
+    position_tolerance_cm: float = 5.0
+    heading_tolerance_deg: float = 3.0
 
     def __post_init__(self) -> None:
         if not math.isfinite(float(self.x_cm)) or not math.isfinite(float(self.y_cm)):
@@ -1127,6 +1127,8 @@ class NavigationConfig:
     radar_error_slowdown_start_cm: float = 4.0
     radar_error_slowdown_stop_cm: float = 10.0
     minimum_radar_speed_scale: float = 0.40
+    arrival_confirmation_samples: int = 3
+    arrival_confirmation_s: float = 0.5
 
     def __post_init__(self) -> None:
         if (
@@ -1143,6 +1145,8 @@ class NavigationConfig:
             raise ValueError("invalid radar ICP error slowdown thresholds")
         if not 0 < self.minimum_radar_speed_scale <= 1:
             raise ValueError("minimum radar speed scale must be in (0, 1]")
+        if self.arrival_confirmation_samples <= 0 or self.arrival_confirmation_s < 0:
+            raise ValueError("invalid arrival confirmation configuration")
 
 
 class Navigation:
@@ -1201,6 +1205,9 @@ class Navigation:
         self._path_progress_index = 0
         self._deviation_count = 0
         self._last_deviation_pose_revision = -1
+        self._arrival_confirmation_count = 0
+        self._last_arrival_pose_revision = -1
+        self._arrival_confirmation_started_at: float | None = None
         self._last_direction: MotorDirection | None = None
         self._pending_direction: MotorDirection | None = None
         self._gear_change_ready_time = 0.0
@@ -1355,6 +1362,7 @@ class Navigation:
             self._path = None
             self._path_progress_index = 0
             self._reset_deviation_tracking()
+            self._reset_arrival_tracking()
             self._active = False
             self._paused = False
             self._last_direction = None
@@ -1379,6 +1387,7 @@ class Navigation:
             self._pending_direction = None
             self._path_progress_index = 0
             self._reset_deviation_tracking()
+            self._reset_arrival_tracking()
         self._control_wakeup.set()
 
     def pause(self) -> None:
@@ -1396,6 +1405,7 @@ class Navigation:
             self._path = None
             self._path_progress_index = 0
             self._reset_deviation_tracking()
+            self._reset_arrival_tracking()
         self._control_wakeup.set()
 
     def cancel(self, *, reason: str = "navigation cancelled") -> None:
@@ -1410,6 +1420,7 @@ class Navigation:
             self._path = None
             self._path_progress_index = 0
             self._reset_deviation_tracking()
+            self._reset_arrival_tracking()
             self._last_direction = None
             self._pending_direction = None
         self._safe_stop()
@@ -1462,8 +1473,20 @@ class Navigation:
             self.cancel()
             return
         if self._goal_reached(pose, goal):
-            self._finish_goal(pose, goal)
+            self._safe_stop()
+            if self._arrival_confirmed(pose_revision, now):
+                self._finish_goal(pose, goal)
+            else:
+                with self._lock:
+                    count = self._arrival_confirmation_count
+                self._set_state(
+                    NavigationState.FINAL_APPROACH,
+                    f"confirming goal arrival {count}/"
+                    f"{self.config.arrival_confirmation_samples}",
+                )
             return
+        with self._lock:
+            self._reset_arrival_tracking()
 
         if path is None or path.map_revision != revision:
             if now - self._last_plan_time < self.config.replan_interval_s:
@@ -1679,6 +1702,7 @@ class Navigation:
             self._path = None
             self._path_progress_index = 0
             self._reset_deviation_tracking()
+            self._reset_arrival_tracking()
             self._last_direction = None
             self._pending_direction = None
         self._set_state(NavigationState.ARRIVED, "goal position and heading reached")
@@ -1687,6 +1711,26 @@ class Navigation:
                 self.on_goal_reached(goal, pose)
             except BaseException:
                 pass
+
+    def _arrival_confirmed(self, pose_revision: int, now: float) -> bool:
+        with self._lock:
+            if pose_revision != self._last_arrival_pose_revision:
+                self._last_arrival_pose_revision = pose_revision
+                self._arrival_confirmation_count += 1
+                if self._arrival_confirmation_started_at is None:
+                    self._arrival_confirmation_started_at = now
+            started_at = self._arrival_confirmation_started_at
+            return (
+                self._arrival_confirmation_count
+                >= self.config.arrival_confirmation_samples
+                and started_at is not None
+                and now - started_at >= self.config.arrival_confirmation_s
+            )
+
+    def _reset_arrival_tracking(self) -> None:
+        self._arrival_confirmation_count = 0
+        self._last_arrival_pose_revision = -1
+        self._arrival_confirmation_started_at = None
 
     def _safe_stop(self) -> None:
         with self._lock:

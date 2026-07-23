@@ -20,6 +20,7 @@ from components import (
     DEFAULT_D500_PORT,
     DEFAULT_HC14_PORT,
     AckStatus,
+    CoordinateFrameTransform,
     D500RadarComponent,
     DroneGlobalAlignment,
     DroneGlobalPointMap,
@@ -233,12 +234,48 @@ def rebase_calibration_to_start_pose(
             wall_to_start,
             calibration.wall_reference.back_wall_x_cm,
             calibration.wall_reference.right_wall_y_cm,
+            calibration.wall_reference.front_wall_x_cm,
+            calibration.wall_reference.left_wall_y_cm,
         ),
         Pose2D(),
         min_x,
         max_x,
         min_y,
         max_y,
+        calibration.selected_edge_ccw_from_car_deg,
+        calibration.fitted_lines,
+        corners,
+    )
+
+
+def transform_calibration(
+    calibration: RectangleFieldCalibration,
+    transform: DroneGlobalAlignment,
+) -> RectangleFieldCalibration:
+    """Move a complete calibration into another fixed coordinate frame."""
+
+    local_to_global = _compose_alignment(calibration.local_to_global, transform)
+    wall_to_global = _compose_alignment(
+        calibration.wall_reference.wall_to_global,
+        transform,
+    )
+    corners = tuple(
+        transform.point_to_global(point) for point in calibration.field_polygon_cm
+    )
+    return RectangleFieldCalibration(
+        local_to_global,
+        RectangularWallReference(
+            wall_to_global,
+            calibration.wall_reference.back_wall_x_cm,
+            calibration.wall_reference.right_wall_y_cm,
+            calibration.wall_reference.front_wall_x_cm,
+            calibration.wall_reference.left_wall_y_cm,
+        ),
+        transform.pose_to_global(calibration.initial_global_pose),
+        min(point[0] for point in corners),
+        max(point[0] for point in corners),
+        min(point[1] for point in corners),
+        max(point[1] for point in corners),
         calibration.selected_edge_ccw_from_car_deg,
         calibration.fitted_lines,
         corners,
@@ -299,6 +336,7 @@ class CarMainApplication:
         self._post_command_acks: list[bytes] = []
         self._handling_link_frame = False
         self._console_mission_active = False
+        self._coordinate_frame_synchronized = False
         self._console_thread: threading.Thread | None = None
 
         LOG.debug(
@@ -326,6 +364,17 @@ class CarMainApplication:
             config.console_enabled,
             hmac_key is not None,
         )
+        if (
+            abs(config.radar_mount.x_forward_cm) < 1e-9
+            and abs(config.radar_mount.y_left_cm) < 1e-9
+            and abs(config.radar_mount.yaw_cw_deg) < 1e-9
+        ):
+            LOG.warning(
+                "radar mount is configured as (0,0,0); 5cm rear-axle accuracy requires "
+                "the D500 measurement origin to be exactly over the rear axle center and "
+                "its zero ray to align with the vehicle nose; otherwise set "
+                "--radar-x-cm/--radar-y-cm/--radar-yaw-cw-deg from measurements"
+            )
 
         self.calibrator = RectangleFieldCalibrator(mount=config.radar_mount)
         self.radar = D500RadarComponent(
@@ -376,6 +425,7 @@ class CarMainApplication:
                 key=hmac_key,
                 on_goal=self._on_goal_command,
                 on_stop=self._on_stop_command,
+                on_coordinate_frame=self._on_coordinate_frame_command,
             )
             self.link = SerialCommunicationDriver(
                 port=config.link_port,
@@ -564,7 +614,12 @@ class CarMainApplication:
             self._last_trusted_rejection = None
 
         wall = update.wall_fusion
-        wall_rejected = wall is not None and wall.attempted and not wall.accepted
+        wall_rejected = (
+            wall is not None
+            and wall.attempted
+            and not wall.accepted
+            and wall.reason != "no valid wall axes"
+        )
         filtered_points = self._filter_vehicle_footprint_points(
             update.global_points_cm,
             update.global_pose,
@@ -731,12 +786,14 @@ class CarMainApplication:
                 delta.y_cm,
                 delta.yaw_cw_deg,
             )
+        observation = None if wall is None else wall.observation
         LOG.debug(
             "radar phase=%s scan_ts_ms=%d points=%d rotation_deg_s=%d "
             "odometry_accepted=%s initialized=%s rejection=%r "
             "local_pose=(%.3f,%.3f,%.3f) global_pose=%s "
             "icp=(matched=%d,error_cm=%.4f,iterations=%d,delta=%.3f,%.3f,%.3f) "
-            "wall=(attempted=%s,accepted=%s,reason=%r) global_points=%d",
+            "wall=(attempted=%s,accepted=%s,reason=%r,"
+            "observation=%s,correction=%.3f,%.3f,%.3f) global_points=%d",
             phase,
             update.scan.timestamp_ms,
             len(update.scan.points),
@@ -755,6 +812,15 @@ class CarMainApplication:
             False if wall is None else wall.attempted,
             False if wall is None else wall.accepted,
             None if wall is None else wall.reason,
+            "none"
+            if observation is None
+            else f"({observation.x_cm},{observation.y_cm},"
+            f"{observation.yaw_cw_deg};points="
+            f"{observation.back_wall_points},{observation.right_wall_points};"
+            f"rms={observation.back_wall_rms_cm},{observation.right_wall_rms_cm})",
+            0.0 if wall is None else wall.correction_x_cm,
+            0.0 if wall is None else wall.correction_y_cm,
+            0.0 if wall is None else wall.correction_yaw_deg,
             len(update.global_points_cm),
         )
 
@@ -872,6 +938,107 @@ class CarMainApplication:
             goal.y_cm,
             "none" if goal.final_heading_deg is None else f"{goal.final_heading_deg:.2f}",
         )
+
+    def _on_coordinate_frame_command(
+        self,
+        frame: CoordinateFrameTransform,
+        receipt: NavigationCommandReceipt,
+    ) -> None:
+        """Atomically move localization, map and Navigation into drone XY."""
+
+        with self._lock:
+            if not self._ready or self._calibration is None:
+                raise NavigationCommandRejected(
+                    RejectReason.TASK_BUSY,
+                    "startup calibration incomplete",
+                )
+            if self._active_receipt is not None or self._console_mission_active:
+                raise NavigationCommandRejected(
+                    RejectReason.TASK_BUSY,
+                    "cannot change coordinate frame during a mission",
+                )
+            if self._coordinate_frame_synchronized:
+                raise NavigationCommandRejected(
+                    RejectReason.TASK_BUSY,
+                    "coordinate frame is already synchronized; restart to recalibrate it",
+                )
+            calibration = self._calibration
+            old_pose = self._last_trusted_pose
+
+        # Quiesce the D500 processing thread so no scan can be written partly
+        # in the startup frame and partly in the shared frame.
+        radar_was_running = self.radar.serial.running
+        if radar_was_running:
+            self.radar.close()
+
+        # Wire headings are Navigation/CCW-positive.  Radar SE(2) uses
+        # clockwise-positive yaw, so the fixed frame rotation changes sign.
+        startup_to_drone = DroneGlobalAlignment(
+            frame.origin_x_cm,
+            frame.origin_y_cm,
+            -frame.startup_x_heading_ccw_deg,
+        )
+        transformed_calibration = transform_calibration(
+            calibration,
+            startup_to_drone,
+        )
+        current_alignment = self.radar.get_alignment()
+        if current_alignment is None:
+            raise NavigationCommandRejected(
+                RejectReason.BAD_PAYLOAD,
+                "radar alignment unavailable",
+            )
+        self.radar.set_alignment(
+            _compose_alignment(current_alignment, startup_to_drone)
+        )
+        self.radar.enable_wall_fusion(
+            transformed_calibration.wall_reference,
+            fusion_config=WallFusionConfig(),
+        )
+        self.radar.global_map.transform(startup_to_drone)
+        self._trusted_map.transform(startup_to_drone)
+
+        if old_pose is None:
+            local_pose = self.radar.odometry.pose
+            new_alignment = self.radar.get_alignment()
+            assert new_alignment is not None
+            transformed_pose = new_alignment.pose_to_global(local_pose)
+        else:
+            transformed_pose = startup_to_drone.pose_to_global(old_pose)
+        cells = self._trusted_map.cells(min_hits=self.config.map_min_hits)
+        points = [(cell.x_cm, cell.y_cm) for cell in cells]
+        grid = self._build_grid(points, transformed_calibration)
+        self.navigation.update_pose(
+            self._navigation_pose(
+                transformed_pose.x_cm,
+                transformed_pose.y_cm,
+                (-transformed_pose.yaw_cw_deg) % 360.0,
+            )
+        )
+        self.navigation.set_map(grid)
+        with self._lock:
+            self._calibration = transformed_calibration
+            self._grid = grid
+            self._last_trusted_pose = transformed_pose
+            self._last_trusted_pose_time = time.monotonic()
+            self._last_map_update = self._last_trusted_pose_time
+            self._coordinate_frame_synchronized = True
+        LOG.info(
+            "coordinate frame synchronized by session=%d seq=%d "
+            "startup_origin_drone=(%.2f,%.2f) startup_x_heading_ccw=%.2f "
+            "current_pose_drone=(%.2f,%.2f,%.2f_cw)",
+            receipt.session,
+            receipt.seq,
+            frame.origin_x_cm,
+            frame.origin_y_cm,
+            frame.startup_x_heading_ccw_deg,
+            transformed_pose.x_cm,
+            transformed_pose.y_cm,
+            transformed_pose.yaw_cw_deg,
+        )
+        if radar_was_running:
+            self.radar.assembler.reset()
+            self.radar.start()
 
     def _on_stop_command(self, receipt: NavigationCommandReceipt) -> None:
         self.navigation.cancel()

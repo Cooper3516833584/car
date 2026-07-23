@@ -213,9 +213,9 @@ class RadarScanAssembler:
     def __init__(
         self,
         *,
-        min_distance_mm: int = 30,
-        max_distance_mm: int = 12000,
-        min_confidence: int = 1,
+        min_distance_mm: int = 100,
+        max_distance_mm: int = 6500,
+        min_confidence: int = 30,
         min_points: int = 30,
     ) -> None:
         if not 0 <= min_distance_mm < max_distance_mm:
@@ -333,6 +333,8 @@ class RectangularWallReference:
     wall_to_global: DroneGlobalAlignment
     back_wall_x_cm: float = 0.0
     right_wall_y_cm: float = 0.0
+    front_wall_x_cm: float | None = None
+    left_wall_y_cm: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -665,6 +667,17 @@ class RectangleFieldCalibrator:
         mount: RadarMount = RadarMount(),
         config: RectangleCalibrationConfig = RectangleCalibrationConfig(),
     ) -> None:
+        if min(
+            max_step_cm,
+            max_step_yaw_deg,
+            max_mean_error_cm,
+            min_step_cm,
+            min_step_yaw_deg,
+            max_lateral_innovation_cm,
+        ) <= 0:
+            raise ValueError("radar odometry gates must be positive")
+        if min_step_cm >= max_step_cm or min_step_yaw_deg >= max_step_yaw_deg:
+            raise ValueError("radar odometry minimum gates must be below maximum gates")
         self.mount = mount
         self.config = config
 
@@ -721,6 +734,8 @@ class RectangleFieldCalibrator:
             DroneGlobalAlignment(0.0, 0.0, 0.0),
             back_wall_x_cm=min_x,
             right_wall_y_cm=min_y,
+            front_wall_x_cm=max_x,
+            left_wall_y_cm=max_y,
         )
         return RectangleFieldCalibration(
             local_to_global,
@@ -827,13 +842,20 @@ class WallFusionConfig:
     yaw_gain: float = 0.15
     max_position_residual_cm: float = 60.0
     max_yaw_residual_deg: float = 20.0
+    max_position_correction_cm: float = 2.0
+    max_yaw_correction_deg: float = 0.5
 
     def __post_init__(self) -> None:
         if self.update_every_scans <= 0:
             raise ValueError("update_every_scans must be positive")
         if not 0.0 < self.position_gain <= 1.0 or not 0.0 < self.yaw_gain <= 1.0:
             raise ValueError("wall fusion gains must be in (0, 1]")
-        if self.max_position_residual_cm <= 0 or self.max_yaw_residual_deg <= 0:
+        if min(
+            self.max_position_residual_cm,
+            self.max_yaw_residual_deg,
+            self.max_position_correction_cm,
+            self.max_yaw_correction_deg,
+        ) <= 0:
             raise ValueError("wall fusion residual gates must be positive")
 
 
@@ -844,6 +866,9 @@ class WallFusionResult:
     observation: WallPoseObservation | None
     fused_global_pose: Pose2D
     reason: str | None = None
+    correction_x_cm: float = 0.0
+    correction_y_cm: float = 0.0
+    correction_yaw_deg: float = 0.0
 
 
 def fuse_wall_observation(
@@ -858,32 +883,53 @@ def fuse_wall_observation(
     if observation.observed_axes == 0 or observation.yaw_cw_deg is None:
         return WallFusionResult(True, False, observation, predicted_global_pose, "no valid wall axes")
 
-    x_cm, y_cm = predicted_wall.x_cm, predicted_wall.y_cm
+    x_residual = 0.0
+    y_residual = 0.0
     if observation.x_cm is not None:
-        residual = observation.x_cm - predicted_wall.x_cm
-        if abs(residual) > config.max_position_residual_cm:
+        x_residual = observation.x_cm - predicted_wall.x_cm
+        if abs(x_residual) > config.max_position_residual_cm:
             return WallFusionResult(True, False, observation, predicted_global_pose, "wall X residual gate")
-        x_cm += residual * config.position_gain
     if observation.y_cm is not None:
-        residual = observation.y_cm - predicted_wall.y_cm
-        if abs(residual) > config.max_position_residual_cm:
+        y_residual = observation.y_cm - predicted_wall.y_cm
+        if abs(y_residual) > config.max_position_residual_cm:
             return WallFusionResult(True, False, observation, predicted_global_pose, "wall Y residual gate")
-        y_cm += residual * config.position_gain
+    correction_x = x_residual * config.position_gain
+    correction_y = y_residual * config.position_gain
+    if math.hypot(correction_x, correction_y) > config.max_position_correction_cm:
+        return WallFusionResult(
+            True,
+            False,
+            observation,
+            predicted_global_pose,
+            "wall position correction gate",
+        )
     yaw_residual = normalize_yaw_cw_deg(
         observation.yaw_cw_deg - predicted_wall.yaw_cw_deg
     )
     if abs(yaw_residual) > config.max_yaw_residual_deg:
         return WallFusionResult(True, False, observation, predicted_global_pose, "wall yaw residual gate")
+    yaw_correction = yaw_residual * config.yaw_gain
+    if abs(yaw_correction) > config.max_yaw_correction_deg:
+        return WallFusionResult(
+            True,
+            False,
+            observation,
+            predicted_global_pose,
+            "wall yaw correction gate",
+        )
     fused_wall = Pose2D(
-        x_cm,
-        y_cm,
-        normalize_yaw_cw_deg(predicted_wall.yaw_cw_deg + yaw_residual * config.yaw_gain),
+        predicted_wall.x_cm + correction_x,
+        predicted_wall.y_cm + correction_y,
+        normalize_yaw_cw_deg(predicted_wall.yaw_cw_deg + yaw_correction),
     )
     return WallFusionResult(
         True,
         True,
         observation,
         reference.wall_to_global.pose_to_global(fused_wall),
+        correction_x_cm=correction_x,
+        correction_y_cm=correction_y,
+        correction_yaw_deg=yaw_correction,
     )
 
 
@@ -1030,11 +1076,12 @@ class RadarOdometry:
         *,
         mount: RadarMount = RadarMount(),
         matcher: ICPScanMatcher | None = None,
-        max_step_cm: float = 60.0,
-        max_step_yaw_deg: float = 35.0,
-        max_mean_error_cm: float = 12.0,
+        max_step_cm: float = 15.0,
+        max_step_yaw_deg: float = 15.0,
+        max_mean_error_cm: float = 10.0,
         min_step_cm: float = 2.0,
         min_step_yaw_deg: float = 1.0,
+        max_lateral_innovation_cm: float = 5.0,
     ) -> None:
         self.mount = mount
         self.matcher = matcher or ICPScanMatcher()
@@ -1043,6 +1090,7 @@ class RadarOdometry:
         self.max_mean_error_cm = max_mean_error_cm
         self.min_step_cm = min_step_cm
         self.min_step_yaw_deg = min_step_yaw_deg
+        self.max_lateral_innovation_cm = max_lateral_innovation_cm
         self.pose = Pose2D()
         self._reference: list[tuple[float, float]] | None = None
 
@@ -1063,15 +1111,32 @@ class RadarOdometry:
         delta = result.transform_current_to_reference
         if math.hypot(delta.x_cm, delta.y_cm) > self.max_step_cm:
             return RadarOdometryUpdate(self.pose, False, True, result, "translation gate")
+        if result.mean_error_cm > self.max_mean_error_cm:
+            return RadarOdometryUpdate(self.pose, False, True, result, "error gate")
         if (
             math.hypot(delta.x_cm, delta.y_cm) < self.min_step_cm
             and abs(delta.yaw_cw_deg) < self.min_step_yaw_deg
         ):
-            return RadarOdometryUpdate(self.pose, False, True, result, "below min step")
+            # Treat this as a fresh localization observation without integrating
+            # sub-threshold jitter.  Keep the existing keyframe: real low-speed
+            # motion then accumulates against that scan until it crosses a gate,
+            # while stationary noise remains bounded around the same keyframe.
+            # Advancing the reference here would discard every 1--2 cm motion
+            # increment near a goal and freeze odometry indefinitely.
+            return RadarOdometryUpdate(self.pose, True, True, result)
         if abs(delta.yaw_cw_deg) > self.max_step_yaw_deg:
             return RadarOdometryUpdate(self.pose, False, True, result, "yaw gate")
-        if result.mean_error_cm > self.max_mean_error_cm:
-            return RadarOdometryUpdate(self.pose, False, True, result, "error gate")
+        expected_lateral_cm = -delta.x_cm * math.tan(
+            math.radians(delta.yaw_cw_deg) / 2.0
+        )
+        if abs(delta.y_cm - expected_lateral_cm) > self.max_lateral_innovation_cm:
+            return RadarOdometryUpdate(
+                self.pose,
+                False,
+                True,
+                result,
+                "Ackermann lateral gate",
+            )
 
         delta_x, delta_y = rotate_cw(delta.x_cm, delta.y_cm, self.pose.yaw_cw_deg)
         self.pose = Pose2D(
@@ -1109,6 +1174,22 @@ class DroneGlobalPointMap:
             for x_cm, y_cm in global_points_cm:
                 key = (round(x_cm / self.resolution_cm), round(y_cm / self.resolution_cm))
                 self._hits[key] = self._hits.get(key, 0) + 1
+
+    def transform(self, alignment: DroneGlobalAlignment) -> None:
+        """Move every accumulated cell through one fixed SE(2) transform."""
+
+        with self._lock:
+            transformed: dict[tuple[int, int], int] = {}
+            for (ix, iy), hits in self._hits.items():
+                x_cm, y_cm = alignment.point_to_global(
+                    (ix * self.resolution_cm, iy * self.resolution_cm)
+                )
+                key = (
+                    round(x_cm / self.resolution_cm),
+                    round(y_cm / self.resolution_cm),
+                )
+                transformed[key] = transformed.get(key, 0) + hits
+            self._hits = transformed
 
     def cells(self, *, min_hits: int = 1) -> list[MapCell]:
         with self._lock:
@@ -1160,6 +1241,10 @@ class D500SerialDriver:
     @property
     def connected(self) -> bool:
         return self._connected_event.is_set()
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
 
     def wait_connected(self, timeout: float | None = None) -> bool:
         return self._connected_event.wait(timeout)

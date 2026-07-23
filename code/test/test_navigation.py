@@ -411,18 +411,45 @@ class NavigationStateMachineTests(unittest.TestCase):
 
     def test_reaches_goal_and_stops_without_command(self) -> None:
         drive = _FakeDrive()
-        navigation = Navigation(drive=drive, config=NavigationConfig(control_hz=50))
+        navigation = Navigation(
+            drive=drive,
+            config=NavigationConfig(
+                control_hz=50,
+                arrival_confirmation_samples=3,
+                arrival_confirmation_s=0.05,
+            ),
+        )
         navigation.start()
         try:
             navigation.set_map(open_grid())
             navigation.update_pose(NavigationPose(50, 20, 90))
             navigation.set_goal(NavigationGoal(50, 20, final_heading_deg=90))
             navigation.start_navigation()
+            self.assertTrue(
+                self.wait_for(lambda: navigation.state is NavigationState.FINAL_APPROACH)
+            )
+            self.assertIsNot(navigation.state, NavigationState.ARRIVED)
+
+            time.sleep(0.06)
+            navigation.update_pose(NavigationPose(51, 20, 89))
+            self.assertTrue(
+                self.wait_for(lambda: navigation._arrival_confirmation_count >= 2)
+            )
+            navigation.update_pose(NavigationPose(49, 21, 91))
             self.assertTrue(self.wait_for(lambda: navigation.state is NavigationState.ARRIVED))
             self.assertEqual(drive.commands, [])
             self.assertGreater(drive.stop_count, 0)
         finally:
             navigation.close()
+
+    def test_default_goal_tolerance_is_five_centimetres_and_three_degrees(self) -> None:
+        goal = NavigationGoal(0, 0, final_heading_deg=0)
+
+        self.assertEqual(goal.position_tolerance_cm, 5.0)
+        self.assertEqual(goal.heading_tolerance_deg, 3.0)
+        self.assertTrue(Navigation._goal_reached(NavigationPose(3, 4, 3), goal))
+        self.assertFalse(Navigation._goal_reached(NavigationPose(3.1, 4, 3), goal))
+        self.assertFalse(Navigation._goal_reached(NavigationPose(3, 4, 3.1), goal))
 
     def test_cancel_clears_mission_but_retains_pose_and_map(self) -> None:
         drive = _FakeDrive()
