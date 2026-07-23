@@ -3,8 +3,7 @@
 
 The HC-14 transport removes the ``BB 33`` envelope and hands this component one
 complete inner ``AA 22`` frame.  This module preserves the existing V2 metadata,
-checksum and HMAC format and adds car-specific coordinate-frame and navigation
-payloads.
+checksum and HMAC format and adds only the car-specific ``NAVIGATE_TO`` payload.
 """
 
 from __future__ import annotations
@@ -28,7 +27,6 @@ MESSAGE_TYPE_COMMAND: Final[int] = 4
 MESSAGE_TYPE_COMMAND_ACK: Final[int] = 5
 COMMAND_STOP_MISSION: Final[int] = 5
 COMMAND_NAVIGATE_TO: Final[int] = 0x20
-COMMAND_SET_COORDINATE_FRAME: Final[int] = 0x21
 FLAG_HAS_HEADING: Final[int] = 0x01
 HMAC_LEN: Final[int] = 8
 MAX_PAYLOAD_LEN: Final[int] = 128
@@ -36,7 +34,6 @@ HEADER = struct.Struct("<2sBB")
 METADATA = struct.Struct(">BBIH")
 NAVIGATION_BASE = struct.Struct("<BBii")
 HEADING = struct.Struct("<H")
-COORDINATE_FRAME = struct.Struct("<BiiH")
 ACK_PAYLOAD = struct.Struct(">BBHBB")
 
 
@@ -80,21 +77,6 @@ class NavigationCommandReceipt:
     session: int
     seq: int
     command_id: int
-
-
-@dataclass(frozen=True, slots=True)
-class CoordinateFrameTransform:
-    """Transform from the car startup frame into the shared drone frame.
-
-    ``origin_*`` is the car startup origin expressed in the drone frame.
-    ``startup_x_heading_ccw_deg`` is the direction of startup +X measured
-    counter-clockwise from drone +X.  This matches Navigation's public heading
-    convention; the radar component converts it to clockwise-positive yaw.
-    """
-
-    origin_x_cm: float
-    origin_y_cm: float
-    startup_x_heading_ccw_deg: float
 
 
 def load_navigation_hmac_key(
@@ -197,50 +179,6 @@ def decode_navigation_payload(payload: bytes) -> NavigationGoal:
     return NavigationGoal(float(x_cm), float(y_cm), heading)
 
 
-def encode_coordinate_frame_payload(transform: CoordinateFrameTransform) -> bytes:
-    heading_centideg = (
-        round(normalize_heading_deg(transform.startup_x_heading_ccw_deg) * 100)
-        % 36000
-    )
-    return COORDINATE_FRAME.pack(
-        COMMAND_SET_COORDINATE_FRAME,
-        round(transform.origin_x_cm),
-        round(transform.origin_y_cm),
-        heading_centideg,
-    )
-
-
-def decode_coordinate_frame_payload(payload: bytes) -> CoordinateFrameTransform:
-    if len(payload) != COORDINATE_FRAME.size:
-        raise NavigationProtocolError("SET_COORDINATE_FRAME payload has invalid length")
-    command_id, origin_x_cm, origin_y_cm, heading_raw = COORDINATE_FRAME.unpack(payload)
-    if command_id != COMMAND_SET_COORDINATE_FRAME:
-        raise NavigationProtocolError("payload is not SET_COORDINATE_FRAME")
-    if heading_raw >= 36000:
-        raise NavigationProtocolError("coordinate-frame heading is outside [0, 360)")
-    return CoordinateFrameTransform(
-        float(origin_x_cm),
-        float(origin_y_cm),
-        heading_raw / 100.0,
-    )
-
-
-def pack_coordinate_frame_command(
-    transform: CoordinateFrameTransform,
-    *,
-    session: int,
-    seq: int,
-    key: bytes,
-) -> bytes:
-    return pack_authenticated_frame(
-        MESSAGE_TYPE_COMMAND,
-        encode_coordinate_frame_payload(transform),
-        session=session,
-        seq=seq,
-        key=key,
-    )
-
-
 def pack_navigation_command(
     goal: NavigationGoal,
     *,
@@ -266,9 +204,6 @@ class GroundNavigationProtocol:
         key: bytes,
         on_goal: Callable[[NavigationGoal, NavigationCommandReceipt], None],
         on_stop: Callable[[NavigationCommandReceipt], None],
-        on_coordinate_frame: (
-            Callable[[CoordinateFrameTransform, NavigationCommandReceipt], None] | None
-        ) = None,
         cache_size: int = 256,
     ) -> None:
         if cache_size <= 0:
@@ -277,7 +212,6 @@ class GroundNavigationProtocol:
         self.key = bytes(key)
         self.on_goal = on_goal
         self.on_stop = on_stop
-        self.on_coordinate_frame = on_coordinate_frame
         self.cache_size = cache_size
         self._session = secrets.randbits(32)
         self._outbound_seq = 0
@@ -304,14 +238,6 @@ class GroundNavigationProtocol:
             if command_id == COMMAND_NAVIGATE_TO:
                 goal = decode_navigation_payload(frame.payload)
                 self.on_goal(goal, receipt)
-            elif command_id == COMMAND_SET_COORDINATE_FRAME:
-                if self.on_coordinate_frame is None:
-                    raise NavigationCommandRejected(
-                        RejectReason.UNKNOWN_COMMAND,
-                        "coordinate-frame synchronization is not supported",
-                    )
-                transform = decode_coordinate_frame_payload(frame.payload)
-                self.on_coordinate_frame(transform, receipt)
             elif command_id == COMMAND_STOP_MISSION:
                 if len(frame.payload) != 1:
                     raise NavigationProtocolError("STOP_MISSION payload must be one byte")

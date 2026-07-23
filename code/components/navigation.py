@@ -847,7 +847,7 @@ class PurePursuitConfig:
     min_lookahead_cm: float = 30.0
     max_lookahead_cm: float = 80.0
     slowdown_distance_cm: float = 80.0
-    max_path_deviation_cm: float = 35.0
+    max_path_deviation_cm: float = 20.0
     cross_track_gain: float = 0.35
     heading_gain: float = 0.65
     feedback_softening_speed_cm_s: float = 5.0
@@ -1122,13 +1122,20 @@ class NavigationConfig:
     replan_interval_s: float = 0.5
     gear_change_stop_s: float = 0.25
     max_steering_rate_rad_s: float = 1.2
-    deviation_replan_samples: int = 3
-    hard_path_deviation_cm: float = 60.0
+    deviation_replan_samples: int = 2
+    hard_path_deviation_cm: float = 30.0
     radar_error_slowdown_start_cm: float = 4.0
     radar_error_slowdown_stop_cm: float = 10.0
     minimum_radar_speed_scale: float = 0.40
     arrival_confirmation_samples: int = 3
     arrival_confirmation_s: float = 0.5
+    correction_failure_samples: int = 3
+    correction_failure_min_cross_track_cm: float = 12.0
+    correction_failure_min_heading_error_deg: float = 20.0
+    correction_failure_worsening_cm: float = 1.0
+    steering_saturation_ratio: float = 0.90
+    safety_prediction_horizon_s: float = 0.8
+    safety_prediction_step_s: float = 0.1
 
     def __post_init__(self) -> None:
         if (
@@ -1147,6 +1154,20 @@ class NavigationConfig:
             raise ValueError("minimum radar speed scale must be in (0, 1]")
         if self.arrival_confirmation_samples <= 0 or self.arrival_confirmation_s < 0:
             raise ValueError("invalid arrival confirmation configuration")
+        if (
+            self.correction_failure_samples <= 0
+            or self.correction_failure_min_cross_track_cm <= 0
+            or self.correction_failure_min_heading_error_deg <= 0
+            or self.correction_failure_worsening_cm < 0
+            or not 0 < self.steering_saturation_ratio <= 1
+        ):
+            raise ValueError("invalid correction-failure configuration")
+        if (
+            self.safety_prediction_horizon_s <= 0
+            or self.safety_prediction_step_s <= 0
+            or self.safety_prediction_step_s > self.safety_prediction_horizon_s
+        ):
+            raise ValueError("invalid motion-sweep safety configuration")
 
 
 class Navigation:
@@ -1208,6 +1229,10 @@ class Navigation:
         self._arrival_confirmation_count = 0
         self._last_arrival_pose_revision = -1
         self._arrival_confirmation_started_at: float | None = None
+        self._correction_failure_count = 0
+        self._last_correction_pose_revision = -1
+        self._last_correction_cross_track_cm: float | None = None
+        self._last_correction_goal_distance_cm: float | None = None
         self._last_direction: MotorDirection | None = None
         self._pending_direction: MotorDirection | None = None
         self._gear_change_ready_time = 0.0
@@ -1225,6 +1250,11 @@ class Navigation:
     def state_reason(self) -> str:
         with self._lock:
             return self._reason
+
+    @property
+    def active(self) -> bool:
+        with self._lock:
+            return self._active
 
     @property
     def path(self) -> NavigationPath | None:
@@ -1319,6 +1349,7 @@ class Navigation:
                 self._path = None
                 self._path_progress_index = 0
                 self._reset_deviation_tracking()
+                self._reset_correction_tracking()
             path_invalidated = previous_path is not None and self._path is None
         if path_invalidated:
             self._safe_stop()
@@ -1363,6 +1394,7 @@ class Navigation:
             self._path_progress_index = 0
             self._reset_deviation_tracking()
             self._reset_arrival_tracking()
+            self._reset_correction_tracking()
             self._active = False
             self._paused = False
             self._last_direction = None
@@ -1388,6 +1420,7 @@ class Navigation:
             self._path_progress_index = 0
             self._reset_deviation_tracking()
             self._reset_arrival_tracking()
+            self._reset_correction_tracking()
         self._control_wakeup.set()
 
     def pause(self) -> None:
@@ -1406,6 +1439,7 @@ class Navigation:
             self._path_progress_index = 0
             self._reset_deviation_tracking()
             self._reset_arrival_tracking()
+            self._reset_correction_tracking()
         self._control_wakeup.set()
 
     def cancel(self, *, reason: str = "navigation cancelled") -> None:
@@ -1421,10 +1455,34 @@ class Navigation:
             self._path_progress_index = 0
             self._reset_deviation_tracking()
             self._reset_arrival_tracking()
+            self._reset_correction_tracking()
             self._last_direction = None
             self._pending_direction = None
         self._safe_stop()
         self._set_state(NavigationState.IDLE, reason)
+
+    def fail_safe_stop(self, reason: str) -> None:
+        """Immediately stop and latch a terminal BLOCKED state.
+
+        This is used for safety evidence that must not wait for the normal
+        localization-staleness timeout, such as a fitted-field footprint
+        violation or an unsafe predicted stopping sweep.
+        """
+
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("fail-safe reason must be a non-empty string")
+        with self._lock:
+            self._active = False
+            self._paused = False
+            self._path = None
+            self._path_progress_index = 0
+            self._reset_deviation_tracking()
+            self._reset_arrival_tracking()
+            self._reset_correction_tracking()
+            self._last_direction = None
+            self._pending_direction = None
+        self._safe_stop()
+        self._set_state(NavigationState.BLOCKED, reason)
 
     def _run(self) -> None:
         period = 1.0 / self.config.control_hz
@@ -1523,6 +1581,7 @@ class Navigation:
                 self._path = path
                 self._path_progress_index = 0
                 self._reset_deviation_tracking()
+                self._reset_correction_tracking()
             LOG.debug(
                 "path planned revision=%d points=%d start=(%.2f,%.2f,%.2f) "
                 "end=(%.2f,%.2f,%.2f) goal=(%.2f,%.2f,%s) reverse_points=%d",
@@ -1571,6 +1630,11 @@ class Navigation:
                 self._path_progress_index,
                 command.nearest_path_index,
             )
+        if self._correction_is_failing(command, pose_revision):
+            self.fail_safe_stop(
+                "steering correction saturated while path/goal error worsened"
+            )
+            return
         if command.cross_track_error_cm > self.controller.config.max_path_deviation_cm:
             if pose_revision != self._last_deviation_pose_revision:
                 self._last_deviation_pose_revision = pose_revision
@@ -1614,6 +1678,17 @@ class Navigation:
             )
         if not path_is_current:
             self._safe_stop()
+            return
+        if not self._motion_sweep_is_free(
+            pose,
+            grid,
+            speed,
+            steering,
+            command.direction,
+        ):
+            self.fail_safe_stop(
+                "predicted stopping sweep intersects obstacle or field boundary"
+            )
             return
         try:
             motion_plan = self.drive.set_motion(
@@ -1703,6 +1778,7 @@ class Navigation:
             self._path_progress_index = 0
             self._reset_deviation_tracking()
             self._reset_arrival_tracking()
+            self._reset_correction_tracking()
             self._last_direction = None
             self._pending_direction = None
         self._set_state(NavigationState.ARRIVED, "goal position and heading reached")
@@ -1711,6 +1787,16 @@ class Navigation:
                 self.on_goal_reached(goal, pose)
             except BaseException:
                 pass
+
+    def _safe_stop(self) -> None:
+        with self._lock:
+            self._last_steering_angle_rad = 0.0
+            self._last_motion_time = None
+        try:
+            if self.drive.is_running:
+                self.drive.stop(center_steering=True)
+        except BaseException:
+            pass
 
     def _arrival_confirmed(self, pose_revision: int, now: float) -> bool:
         with self._lock:
@@ -1727,20 +1813,103 @@ class Navigation:
                 and now - started_at >= self.config.arrival_confirmation_s
             )
 
-    def _reset_arrival_tracking(self) -> None:
-        self._arrival_confirmation_count = 0
-        self._last_arrival_pose_revision = -1
-        self._arrival_confirmation_started_at = None
+    def _correction_is_failing(
+        self,
+        command: TrackerCommand,
+        pose_revision: int,
+    ) -> bool:
+        """Detect repeated saturated corrections that move farther off course."""
 
-    def _safe_stop(self) -> None:
         with self._lock:
-            self._last_steering_angle_rad = 0.0
-            self._last_motion_time = None
-        try:
-            if self.drive.is_running:
-                self.drive.stop(center_steering=True)
-        except BaseException:
-            pass
+            if pose_revision == self._last_correction_pose_revision:
+                return False
+            self._last_correction_pose_revision = pose_revision
+            previous_cross_track = self._last_correction_cross_track_cm
+            previous_goal_distance = self._last_correction_goal_distance_cm
+            self._last_correction_cross_track_cm = command.cross_track_error_cm
+            self._last_correction_goal_distance_cm = command.distance_to_goal_cm
+
+            steering_limit = (
+                self.geometry.max_left_steering_rad
+                if command.steering_angle_rad >= 0.0
+                else abs(self.geometry.min_right_steering_rad)
+            )
+            saturated = (
+                steering_limit > 0.0
+                and abs(command.steering_angle_rad)
+                >= steering_limit * self.config.steering_saturation_ratio
+            )
+            significant_error = (
+                command.cross_track_error_cm
+                >= self.config.correction_failure_min_cross_track_cm
+                or abs(command.heading_error_deg)
+                >= self.config.correction_failure_min_heading_error_deg
+            )
+            worsening = (
+                previous_cross_track is not None
+                and previous_goal_distance is not None
+                and command.cross_track_error_cm
+                >= previous_cross_track + self.config.correction_failure_worsening_cm
+                and command.distance_to_goal_cm
+                >= previous_goal_distance - self.config.correction_failure_worsening_cm
+            )
+            if saturated and significant_error and worsening:
+                self._correction_failure_count += 1
+            else:
+                self._correction_failure_count = 0
+            return (
+                self._correction_failure_count
+                >= self.config.correction_failure_samples
+            )
+
+    def _motion_sweep_is_free(
+        self,
+        pose: NavigationPose,
+        grid: OccupancyGrid,
+        speed_mm_s: float,
+        steering_angle_rad: float,
+        direction: MotorDirection,
+    ) -> bool:
+        """Check the commanded near-future footprint before touching hardware."""
+
+        checker = VehicleCollisionChecker(
+            grid,
+            self.geometry,
+            safety_margin_cm=self.planner.config.safety_margin_cm,
+        )
+        if not checker.is_pose_free(pose):
+            return False
+        signed_speed_cm_s = speed_mm_s * direction.value / 10.0
+        if abs(signed_speed_cm_s) < 1e-9:
+            return True
+        if abs(steering_angle_rad) < 1e-9:
+            curvature = 0.0
+        else:
+            radius_cm = (
+                self.geometry.wheelbase_cm / math.tan(steering_angle_rad)
+                - self.geometry.track_width_cm / 2.0
+            )
+            curvature = 1.0 / radius_cm
+        x_cm, y_cm, heading_deg = pose.x_cm, pose.y_cm, pose.heading_deg
+        elapsed = 0.0
+        while elapsed < self.config.safety_prediction_horizon_s - 1e-9:
+            step_s = min(
+                self.config.safety_prediction_step_s,
+                self.config.safety_prediction_horizon_s - elapsed,
+            )
+            x_cm, y_cm, heading_deg = _integrate_bicycle(
+                x_cm,
+                y_cm,
+                heading_deg,
+                signed_speed_cm_s * step_s,
+                curvature,
+            )
+            if not checker.is_pose_free(
+                NavigationPose(x_cm, y_cm, heading_deg, pose.timestamp_s)
+            ):
+                return False
+            elapsed += step_s
+        return True
 
     def _rate_limited_steering(self, requested_rad: float, now: float) -> float:
         with self._lock:
@@ -1816,6 +1985,17 @@ class Navigation:
     def _reset_deviation_tracking(self) -> None:
         self._deviation_count = 0
         self._last_deviation_pose_revision = -1
+
+    def _reset_arrival_tracking(self) -> None:
+        self._arrival_confirmation_count = 0
+        self._last_arrival_pose_revision = -1
+        self._arrival_confirmation_started_at = None
+
+    def _reset_correction_tracking(self) -> None:
+        self._correction_failure_count = 0
+        self._last_correction_pose_revision = -1
+        self._last_correction_cross_track_cm = None
+        self._last_correction_goal_distance_cm = None
 
     def _set_state(self, state: NavigationState, reason: str) -> None:
         callback = None

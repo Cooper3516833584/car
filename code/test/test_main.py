@@ -14,7 +14,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from components import (  # noqa: E402
     AckStatus,
-    CoordinateFrameTransform,
     DroneGlobalAlignment,
     ICPResult,
     NavigationCommandReceipt,
@@ -69,6 +68,12 @@ class FakeNavigation:
         self.goal: NavigationGoal | None = None
         self.started = False
         self.cancel_reasons: list[str] = []
+        self.grid = None
+
+    def set_map(self, grid) -> bool:
+        changed = grid != self.grid
+        self.grid = grid
+        return changed
 
     def set_goal(self, goal: NavigationGoal) -> None:
         self.goal = goal
@@ -103,7 +108,12 @@ class FakeLink:
 class MainCoordinatorTests(unittest.TestCase):
     def make_app(self) -> CarMainApplication:
         app = CarMainApplication(MainConfig(), hmac_key=KEY)
-        app._calibration = make_calibration()
+        calibration = make_calibration()
+        app._calibration = calibration
+        app._grid = app._build_grid([], calibration)
+        app.navigation.set_map(app._grid)
+        app._last_trusted_pose = Pose2D()
+        app._last_map_update = time.monotonic()
         app._ready = True
         return app
 
@@ -248,11 +258,14 @@ class MainCoordinatorTests(unittest.TestCase):
         self.assertEqual(
             app.navigation.drive.rear_motors.max_wheel_speed_mm_s,
             max(
-                NAVIGATION_CRUISE_SPEED_CM_S,
-                NAVIGATION_REVERSE_SPEED_CM_S,
-            )
-            * 10.0
-            * 1.20,
+                300.0,
+                max(
+                    NAVIGATION_CRUISE_SPEED_CM_S,
+                    NAVIGATION_REVERSE_SPEED_CM_S,
+                )
+                * 10.0
+                * 1.20,
+            ),
         )
 
     def test_top_level_reverse_switch_and_cli_override(self) -> None:
@@ -284,6 +297,25 @@ class MainCoordinatorTests(unittest.TestCase):
         self.assertEqual(rebased.local_to_global.pose_to_global(Pose2D()), Pose2D())
         self.assertAlmostEqual(rebased.wall_reference.wall_to_global.yaw_offset_cw_deg, -20.0)
         self.assertTrue(rebased.contains_point(0.0, 0.0))
+
+    def test_start_frame_rebase_preserves_all_four_wall_coordinates(self) -> None:
+        identity = DroneGlobalAlignment(0.0, 0.0, 0.0)
+        calibration = RectangleFieldCalibration(
+            identity,
+            RectangularWallReference(identity, -100.0, -50.0, 200.0, 150.0),
+            Pose2D(),
+            -100.0,
+            200.0,
+            -50.0,
+            150.0,
+            0.0,
+            4,
+        )
+
+        rebased = rebase_calibration_to_start_pose(calibration)
+
+        self.assertEqual(rebased.wall_reference.front_wall_x_cm, 200.0)
+        self.assertEqual(rebased.wall_reference.left_wall_y_cm, 150.0)
 
     def test_rotated_field_bbox_corners_remain_forbidden(self) -> None:
         edge_frame = DroneGlobalAlignment(0.0, 0.0, 20.0)
@@ -321,36 +353,6 @@ class MainCoordinatorTests(unittest.TestCase):
         self.assertEqual(fake_navigation.goal, NavigationGoal(120.0, 80.0, 275.5))
         self.assertTrue(fake_navigation.started)
         self.assertEqual(app._active_receipt, receipt)
-
-    def test_serial_coordinate_frame_moves_pose_map_and_field_together(self) -> None:
-        app = self.make_app()
-        app.radar.set_alignment(DroneGlobalAlignment(0.0, 0.0, 0.0))
-        app._last_trusted_pose = Pose2D(10.0, 0.0, 0.0)
-        app._trusted_map.add_points([(20.0, 30.0), (20.0, 30.0)])
-        app.radar.global_map.add_points([(20.0, 30.0)])
-
-        app._on_coordinate_frame_command(
-            CoordinateFrameTransform(100.0, 200.0, 90.0),
-            NavigationCommandReceipt(7, 8, 0x21),
-        )
-
-        self.assertTrue(app._coordinate_frame_synchronized)
-        self.assertAlmostEqual(app._last_trusted_pose.x_cm, 100.0)
-        self.assertAlmostEqual(app._last_trusted_pose.y_cm, 210.0)
-        self.assertAlmostEqual(app._last_trusted_pose.yaw_cw_deg, -90.0)
-        self.assertIsNotNone(app.navigation.pose)
-        assert app.navigation.pose is not None
-        self.assertAlmostEqual(app.navigation.pose.heading_deg, 90.0)
-        self.assertTrue(app._calibration.contains_point(100.0, 200.0))
-        transformed_cells = app._trusted_map.cells(min_hits=2)
-        self.assertEqual(len(transformed_cells), 1)
-        self.assertAlmostEqual(transformed_cells[0].x_cm, 70.0)
-        self.assertAlmostEqual(transformed_cells[0].y_cm, 220.0)
-        with self.assertRaises(NavigationCommandRejected):
-            app._on_coordinate_frame_command(
-                CoordinateFrameTransform(0.0, 0.0, 0.0),
-                NavigationCommandReceipt(7, 9, 0x21),
-            )
 
     def test_console_coordinate_and_optional_integer_heading(self) -> None:
         without_heading = parse_console_command("120 80")
@@ -403,6 +405,30 @@ class MainCoordinatorTests(unittest.TestCase):
                 NavigationGoal(201.0, 0.0),
                 NavigationCommandReceipt(1, 2, 0x20),
             )
+
+    def test_goal_center_inside_but_vehicle_footprint_outside_is_rejected(self) -> None:
+        app = self.make_app()
+        receipt = NavigationCommandReceipt(10, 11, 0x20)
+
+        with self.assertRaisesRegex(
+            NavigationCommandRejected,
+            "vehicle footprint",
+        ):
+            app._on_goal_command(NavigationGoal(195.0, 50.0, 0.0), receipt)
+
+        self.assertIsNone(app._active_receipt)
+
+    def test_field_footprint_violation_stops_active_navigation_immediately(self) -> None:
+        app = self.make_app()
+        app.navigation.on_state_changed = None
+        app.navigation._active = True
+        app._last_trusted_pose = Pose2D(180.0, 0.0, 0.0)
+
+        app._on_radar_update(self.make_radar_update(Pose2D(195.0, 0.0, 0.0)))
+
+        self.assertFalse(app.navigation.active)
+        self.assertIs(app.navigation.state, NavigationState.BLOCKED)
+        self.assertIn("field-boundary safety stop", app.navigation.state_reason)
 
     def test_immediate_completion_ack_follows_acceptance(self) -> None:
         app = self.make_app()

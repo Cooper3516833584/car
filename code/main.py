@@ -20,7 +20,6 @@ from components import (
     DEFAULT_D500_PORT,
     DEFAULT_HC14_PORT,
     AckStatus,
-    CoordinateFrameTransform,
     D500RadarComponent,
     DroneGlobalAlignment,
     DroneGlobalPointMap,
@@ -53,10 +52,10 @@ from components import (
 )
 
 
-# 自主导航巡航速度，单位 cm/s；50 cm/s = 0.5 m/s。
+# 自主导航巡航速度，单位 cm/s；定位调试阶段保持 10 cm/s = 0.1 m/s。
 # 允许范围为 0～100 cm/s。主程序会自动为阿克曼弯道外侧轮预留 20% 速度余量，
 # 以后只需修改这一处即可调整正常行驶速度。
-NAVIGATION_CRUISE_SPEED_CM_S = 50.0
+NAVIGATION_CRUISE_SPEED_CM_S = 10.0
 # Reverse cruise speed, in cm/s.  Keep this independent from the forward
 # cruise setting so it can be tuned safely at the top of this file.
 NAVIGATION_REVERSE_SPEED_CM_S = 10.0
@@ -248,51 +247,17 @@ def rebase_calibration_to_start_pose(
     )
 
 
-def transform_calibration(
-    calibration: RectangleFieldCalibration,
-    transform: DroneGlobalAlignment,
-) -> RectangleFieldCalibration:
-    """Move a complete calibration into another fixed coordinate frame."""
-
-    local_to_global = _compose_alignment(calibration.local_to_global, transform)
-    wall_to_global = _compose_alignment(
-        calibration.wall_reference.wall_to_global,
-        transform,
-    )
-    corners = tuple(
-        transform.point_to_global(point) for point in calibration.field_polygon_cm
-    )
-    return RectangleFieldCalibration(
-        local_to_global,
-        RectangularWallReference(
-            wall_to_global,
-            calibration.wall_reference.back_wall_x_cm,
-            calibration.wall_reference.right_wall_y_cm,
-            calibration.wall_reference.front_wall_x_cm,
-            calibration.wall_reference.left_wall_y_cm,
-        ),
-        transform.pose_to_global(calibration.initial_global_pose),
-        min(point[0] for point in corners),
-        max(point[0] for point in corners),
-        min(point[1] for point in corners),
-        max(point[1] for point in corners),
-        calibration.selected_edge_ccw_from_car_deg,
-        calibration.fitted_lines,
-        corners,
-    )
-
-
 @dataclass(frozen=True, slots=True)
 class MainConfig:
     radar_port: str = DEFAULT_D500_PORT
     link_port: str = DEFAULT_HC14_PORT
     radar_mount: RadarMount = RadarMount()
-    startup_scan_count: int = 3
+    startup_scan_count: int = 20
     calibration_timeout_s: float = 30.0
     allow_reverse: bool = NAVIGATION_ALLOW_REVERSE
     map_resolution_cm: float = 5.0
     map_margin_cm: float = 15.0
-    map_update_interval_s: float = 2.0
+    map_update_interval_s: float = 0.5
     map_min_hits: int = 2
     trusted_max_pose_step_cm: float = 25.0
     trusted_max_yaw_step_deg: float = 15.0
@@ -336,7 +301,6 @@ class CarMainApplication:
         self._post_command_acks: list[bytes] = []
         self._handling_link_frame = False
         self._console_mission_active = False
-        self._coordinate_frame_synchronized = False
         self._console_thread: threading.Thread | None = None
 
         LOG.debug(
@@ -370,9 +334,9 @@ class CarMainApplication:
             and abs(config.radar_mount.yaw_cw_deg) < 1e-9
         ):
             LOG.warning(
-                "radar mount is configured as (0,0,0); 5cm rear-axle accuracy requires "
-                "the D500 measurement origin to be exactly over the rear axle center and "
-                "its zero ray to align with the vehicle nose; otherwise set "
+                "radar mount is configured as (0,0,0); this is valid only when "
+                "the D500 measurement origin is at the rear-axle centre and its "
+                "zero angle is aligned with the vehicle front; otherwise set "
                 "--radar-x-cm/--radar-y-cm/--radar-yaw-cw-deg from measurements"
             )
 
@@ -411,6 +375,10 @@ class CarMainApplication:
             max_wheel_speed_mm_s=max_wheel_speed_mm_s,
             on_state_changed=self._on_navigation_state,
         )
+        self._vehicle_geometry = self.navigation.geometry
+        self._navigation_safety_margin_cm = (
+            self.navigation.planner.config.safety_margin_cm
+        )
         LOG.info(
             "navigation configured forward=%.1fcm/s reverse=%.1fcm/s max_wheel=%.1fcm/s allow_reverse=%s",
             NAVIGATION_CRUISE_SPEED_CM_S,
@@ -425,7 +393,6 @@ class CarMainApplication:
                 key=hmac_key,
                 on_goal=self._on_goal_command,
                 on_stop=self._on_stop_command,
-                on_coordinate_frame=self._on_coordinate_frame_command,
             )
             self.link = SerialCommunicationDriver(
                 port=config.link_port,
@@ -601,6 +568,13 @@ class CarMainApplication:
                 "radar trusted localization rejected reason=%s; navigation pose/map not refreshed",
                 rejection,
             )
+            if (
+                rejection.startswith("vehicle footprint outside fitted field")
+                and self.navigation.active
+            ):
+                self.navigation.fail_safe_stop(
+                    f"immediate field-boundary safety stop: {rejection}"
+                )
             return
 
         navigation_accepted = self.navigation.update_from_radar(update)
@@ -689,7 +663,7 @@ class CarMainApplication:
         return None
 
     def _vehicle_footprint_corners(self, pose: Pose2D) -> tuple[tuple[float, float], ...]:
-        geometry = self.navigation.geometry
+        geometry = self._vehicle_geometry
         clearance = self.config.footprint_clearance_cm
         centre_x_body = geometry.rear_axle_to_body_center_cm
         half_length = geometry.body_length_cm / 2.0 + clearance
@@ -718,7 +692,7 @@ class CarMainApplication:
     ) -> list[tuple[float, float]]:
         """Remove radar self-returns and stale hits under the physical car."""
 
-        geometry = self.navigation.geometry
+        geometry = self._vehicle_geometry
         clearance = self.config.footprint_clearance_cm
         half_length = geometry.body_length_cm / 2.0 + clearance
         half_width = geometry.body_width_cm / 2.0 + clearance
@@ -922,6 +896,11 @@ class CarMainApplication:
         if not calibration.contains_point(goal.x_cm, goal.y_cm):
             raise NavigationCommandRejected(RejectReason.BAD_PAYLOAD, "goal lies outside field")
         self._refresh_trusted_grid(force=True)
+        if not self._goal_has_safe_vehicle_footprint(goal):
+            raise NavigationCommandRejected(
+                RejectReason.BAD_PAYLOAD,
+                "goal vehicle footprint intersects an obstacle or fitted field boundary",
+            )
         with self._lock:
             self._active_receipt = receipt
         try:
@@ -938,107 +917,6 @@ class CarMainApplication:
             goal.y_cm,
             "none" if goal.final_heading_deg is None else f"{goal.final_heading_deg:.2f}",
         )
-
-    def _on_coordinate_frame_command(
-        self,
-        frame: CoordinateFrameTransform,
-        receipt: NavigationCommandReceipt,
-    ) -> None:
-        """Atomically move localization, map and Navigation into drone XY."""
-
-        with self._lock:
-            if not self._ready or self._calibration is None:
-                raise NavigationCommandRejected(
-                    RejectReason.TASK_BUSY,
-                    "startup calibration incomplete",
-                )
-            if self._active_receipt is not None or self._console_mission_active:
-                raise NavigationCommandRejected(
-                    RejectReason.TASK_BUSY,
-                    "cannot change coordinate frame during a mission",
-                )
-            if self._coordinate_frame_synchronized:
-                raise NavigationCommandRejected(
-                    RejectReason.TASK_BUSY,
-                    "coordinate frame is already synchronized; restart to recalibrate it",
-                )
-            calibration = self._calibration
-            old_pose = self._last_trusted_pose
-
-        # Quiesce the D500 processing thread so no scan can be written partly
-        # in the startup frame and partly in the shared frame.
-        radar_was_running = self.radar.serial.running
-        if radar_was_running:
-            self.radar.close()
-
-        # Wire headings are Navigation/CCW-positive.  Radar SE(2) uses
-        # clockwise-positive yaw, so the fixed frame rotation changes sign.
-        startup_to_drone = DroneGlobalAlignment(
-            frame.origin_x_cm,
-            frame.origin_y_cm,
-            -frame.startup_x_heading_ccw_deg,
-        )
-        transformed_calibration = transform_calibration(
-            calibration,
-            startup_to_drone,
-        )
-        current_alignment = self.radar.get_alignment()
-        if current_alignment is None:
-            raise NavigationCommandRejected(
-                RejectReason.BAD_PAYLOAD,
-                "radar alignment unavailable",
-            )
-        self.radar.set_alignment(
-            _compose_alignment(current_alignment, startup_to_drone)
-        )
-        self.radar.enable_wall_fusion(
-            transformed_calibration.wall_reference,
-            fusion_config=WallFusionConfig(),
-        )
-        self.radar.global_map.transform(startup_to_drone)
-        self._trusted_map.transform(startup_to_drone)
-
-        if old_pose is None:
-            local_pose = self.radar.odometry.pose
-            new_alignment = self.radar.get_alignment()
-            assert new_alignment is not None
-            transformed_pose = new_alignment.pose_to_global(local_pose)
-        else:
-            transformed_pose = startup_to_drone.pose_to_global(old_pose)
-        cells = self._trusted_map.cells(min_hits=self.config.map_min_hits)
-        points = [(cell.x_cm, cell.y_cm) for cell in cells]
-        grid = self._build_grid(points, transformed_calibration)
-        self.navigation.update_pose(
-            self._navigation_pose(
-                transformed_pose.x_cm,
-                transformed_pose.y_cm,
-                (-transformed_pose.yaw_cw_deg) % 360.0,
-            )
-        )
-        self.navigation.set_map(grid)
-        with self._lock:
-            self._calibration = transformed_calibration
-            self._grid = grid
-            self._last_trusted_pose = transformed_pose
-            self._last_trusted_pose_time = time.monotonic()
-            self._last_map_update = self._last_trusted_pose_time
-            self._coordinate_frame_synchronized = True
-        LOG.info(
-            "coordinate frame synchronized by session=%d seq=%d "
-            "startup_origin_drone=(%.2f,%.2f) startup_x_heading_ccw=%.2f "
-            "current_pose_drone=(%.2f,%.2f,%.2f_cw)",
-            receipt.session,
-            receipt.seq,
-            frame.origin_x_cm,
-            frame.origin_y_cm,
-            frame.startup_x_heading_ccw_deg,
-            transformed_pose.x_cm,
-            transformed_pose.y_cm,
-            transformed_pose.yaw_cw_deg,
-        )
-        if radar_was_running:
-            self.radar.assembler.reset()
-            self.radar.start()
 
     def _on_stop_command(self, receipt: NavigationCommandReceipt) -> None:
         self.navigation.cancel()
@@ -1291,6 +1169,11 @@ class CarMainApplication:
             self._console_mission_active = True
         try:
             self._refresh_trusted_grid(force=True)
+            if not self._goal_has_safe_vehicle_footprint(goal):
+                raise NavigationCommandRejected(
+                    RejectReason.BAD_PAYLOAD,
+                    "goal vehicle footprint intersects an obstacle or fitted field boundary",
+                )
             self.navigation.set_goal(goal)
             self.navigation.start_navigation()
         except BaseException:
@@ -1308,6 +1191,34 @@ class CarMainApplication:
             goal.y_cm,
             "none" if goal.final_heading_deg is None else f"{goal.final_heading_deg:.2f}",
         )
+
+    def _goal_has_safe_vehicle_footprint(self, goal: NavigationGoal) -> bool:
+        """Require at least one collision-free full-body pose at the goal."""
+
+        with self._lock:
+            calibration = self._calibration
+            grid = self._grid
+        if calibration is None or grid is None:
+            return False
+        checker = VehicleCollisionChecker(
+            grid,
+            self._vehicle_geometry,
+            safety_margin_cm=self._navigation_safety_margin_cm,
+        )
+        headings = (
+            (goal.final_heading_deg,)
+            if goal.final_heading_deg is not None
+            else tuple(float(value) for value in range(0, 360, 10))
+        )
+        for heading_deg in headings:
+            pose = NavigationPose(goal.x_cm, goal.y_cm, heading_deg, 0.0)
+            radar_pose = Pose2D(goal.x_cm, goal.y_cm, (-heading_deg) % 360.0)
+            if all(
+                calibration.contains_point(*corner)
+                for corner in self._vehicle_footprint_corners(radar_pose)
+            ) and checker.is_pose_free(pose):
+                return True
+        return False
 
     def _cancel_from_console(self) -> None:
         LOG.info("SSH requested navigation cancellation")
@@ -1333,7 +1244,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--radar-x-cm", type=float, default=0.0)
     parser.add_argument("--radar-y-cm", type=float, default=0.0)
     parser.add_argument("--radar-yaw-cw-deg", type=float, default=0.0)
-    parser.add_argument("--startup-scans", type=int, default=3)
+    parser.add_argument("--startup-scans", type=int, default=20)
     parser.add_argument("--calibration-timeout", type=float, default=30.0)
     reverse_group = parser.add_mutually_exclusive_group()
     reverse_group.add_argument(

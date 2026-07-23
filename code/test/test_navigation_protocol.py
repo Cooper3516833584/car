@@ -10,18 +10,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from components.navigation import NavigationGoal  # noqa: E402
 from components.navigation_protocol import (  # noqa: E402
-    COMMAND_SET_COORDINATE_FRAME,
     COMMAND_STOP_MISSION,
     AckStatus,
-    CoordinateFrameTransform,
     GroundNavigationProtocol,
     NavigationProtocolError,
-    decode_coordinate_frame_payload,
     decode_navigation_payload,
-    encode_coordinate_frame_payload,
     encode_navigation_payload,
     pack_authenticated_frame,
-    pack_coordinate_frame_command,
     pack_navigation_command,
     unpack_authenticated_frame,
 )
@@ -31,13 +26,6 @@ KEY = bytes.fromhex("00112233445566778899aabbccddeeff")
 
 
 class NavigationPayloadTests(unittest.TestCase):
-    def test_coordinate_frame_round_trip(self) -> None:
-        expected = CoordinateFrameTransform(325, -140, 271.25)
-        decoded = decode_coordinate_frame_payload(
-            encode_coordinate_frame_payload(expected)
-        )
-        self.assertEqual(decoded, expected)
-
     def test_goal_without_heading_round_trip(self) -> None:
         decoded = decode_navigation_payload(encode_navigation_payload(NavigationGoal(120, -35)))
         self.assertEqual(decoded.x_cm, 120)
@@ -62,26 +50,6 @@ class NavigationPayloadTests(unittest.TestCase):
 
 
 class GroundNavigationProtocolTests(unittest.TestCase):
-    def test_coordinate_frame_is_authenticated_and_idempotent(self) -> None:
-        frames = []
-        protocol = GroundNavigationProtocol(
-            key=KEY,
-            on_goal=lambda goal, receipt: None,
-            on_stop=lambda receipt: None,
-            on_coordinate_frame=lambda frame, receipt: frames.append((frame, receipt)),
-        )
-        command = pack_coordinate_frame_command(
-            CoordinateFrameTransform(100, 200, 90),
-            session=12,
-            seq=3,
-            key=KEY,
-        )
-        first = protocol.handle_frame(command)
-        second = protocol.handle_frame(command)
-        self.assertEqual(first, second)
-        self.assertEqual(len(frames), 1)
-        self.assertEqual(frames[0][1].command_id, COMMAND_SET_COORDINATE_FRAME)
-
     def test_valid_command_is_called_once_and_duplicate_is_idempotent(self) -> None:
         goals = []
         protocol = GroundNavigationProtocol(
@@ -121,6 +89,3 @@ class GroundNavigationProtocolTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-    decode_coordinate_frame_payload,
-    encode_coordinate_frame_payload,
-    pack_coordinate_frame_command,

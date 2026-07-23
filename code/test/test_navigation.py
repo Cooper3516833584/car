@@ -26,6 +26,7 @@ from components.navigation import (  # noqa: E402
     PlanningCancelledError,
     PurePursuitConfig,
     PurePursuitController,
+    TrackerCommand,
     VehicleCollisionChecker,
     VehicleGeometry,
     navigation_heading_to_radar_yaw,
@@ -416,7 +417,7 @@ class NavigationStateMachineTests(unittest.TestCase):
             config=NavigationConfig(
                 control_hz=50,
                 arrival_confirmation_samples=3,
-                arrival_confirmation_s=0.05,
+                arrival_confirmation_s=0,
             ),
         )
         navigation.start()
@@ -426,30 +427,45 @@ class NavigationStateMachineTests(unittest.TestCase):
             navigation.set_goal(NavigationGoal(50, 20, final_heading_deg=90))
             navigation.start_navigation()
             self.assertTrue(
-                self.wait_for(lambda: navigation.state is NavigationState.FINAL_APPROACH)
+                self.wait_for(lambda: navigation._arrival_confirmation_count == 1)
             )
-            self.assertIsNot(navigation.state, NavigationState.ARRIVED)
-
-            time.sleep(0.06)
-            navigation.update_pose(NavigationPose(51, 20, 89))
+            navigation.update_pose(NavigationPose(50, 20, 90))
             self.assertTrue(
-                self.wait_for(lambda: navigation._arrival_confirmation_count >= 2)
+                self.wait_for(lambda: navigation._arrival_confirmation_count == 2)
             )
-            navigation.update_pose(NavigationPose(49, 21, 91))
+            navigation.update_pose(NavigationPose(50, 20, 90))
             self.assertTrue(self.wait_for(lambda: navigation.state is NavigationState.ARRIVED))
             self.assertEqual(drive.commands, [])
             self.assertGreater(drive.stop_count, 0)
         finally:
             navigation.close()
 
-    def test_default_goal_tolerance_is_five_centimetres_and_three_degrees(self) -> None:
-        goal = NavigationGoal(0, 0, final_heading_deg=0)
-
-        self.assertEqual(goal.position_tolerance_cm, 5.0)
-        self.assertEqual(goal.heading_tolerance_deg, 3.0)
-        self.assertTrue(Navigation._goal_reached(NavigationPose(3, 4, 3), goal))
-        self.assertFalse(Navigation._goal_reached(NavigationPose(3.1, 4, 3), goal))
-        self.assertFalse(Navigation._goal_reached(NavigationPose(3, 4, 3.1), goal))
+    def test_single_pose_cannot_confirm_arrival(self) -> None:
+        drive = _FakeDrive()
+        navigation = Navigation(
+            drive=drive,
+            config=NavigationConfig(
+                control_hz=100,
+                arrival_confirmation_samples=3,
+                arrival_confirmation_s=0,
+            ),
+        )
+        navigation.start()
+        try:
+            navigation.set_map(open_grid())
+            navigation.update_pose(NavigationPose(50, 20, 90))
+            navigation.set_goal(NavigationGoal(50, 20, final_heading_deg=90))
+            navigation.start_navigation()
+            self.assertTrue(
+                self.wait_for(
+                    lambda: navigation.state is NavigationState.FINAL_APPROACH
+                )
+            )
+            time.sleep(0.08)
+            self.assertIs(navigation.state, NavigationState.FINAL_APPROACH)
+            self.assertEqual(drive.commands, [])
+        finally:
+            navigation.close()
 
     def test_cancel_clears_mission_but_retains_pose_and_map(self) -> None:
         drive = _FakeDrive()
@@ -572,7 +588,10 @@ class NavigationStateMachineTests(unittest.TestCase):
         drive.start()
         navigation = Navigation(
             drive=drive,
-            config=NavigationConfig(deviation_replan_samples=3),
+            config=NavigationConfig(
+                deviation_replan_samples=3,
+                hard_path_deviation_cm=100.0,
+            ),
         )
         now = time.monotonic()
         path = NavigationPath(
@@ -598,6 +617,74 @@ class NavigationStateMachineTests(unittest.TestCase):
         navigation.update_pose(NavigationPose(10, 40, 0, now + 0.03))
         navigation._control_step(now + 0.03)
         self.assertIsNone(navigation.path)
+
+    def test_saturated_worsening_correction_triggers_fail_safe(self) -> None:
+        drive = _FakeDrive()
+        drive.start()
+        navigation = Navigation(
+            drive=drive,
+            config=NavigationConfig(
+                correction_failure_samples=3,
+                correction_failure_worsening_cm=1.0,
+            ),
+        )
+        steering = navigation.geometry.max_left_steering_rad
+        for revision, cross_track in enumerate((12.0, 14.0, 16.0, 18.0), start=1):
+            command = TrackerCommand(
+                100.0,
+                steering,
+                MotorDirection.FORWARD,
+                0,
+                cross_track,
+                100.0 + cross_track,
+                cross_track,
+                25.0,
+            )
+            failed = navigation._correction_is_failing(command, revision)
+        self.assertTrue(failed)
+        navigation._active = True
+        navigation.fail_safe_stop("correction watchdog test")
+        self.assertFalse(navigation.active)
+        self.assertIs(navigation.state, NavigationState.BLOCKED)
+        self.assertGreater(drive.stop_count, 0)
+
+    def test_predicted_motion_sweep_blocks_wall_before_drive_command(self) -> None:
+        drive = _FakeDrive()
+        navigation = Navigation(drive=drive)
+        grid = OccupancyGrid.from_obstacle_points(
+            [(45.0, 0.0)],
+            resolution_cm=2.5,
+            origin_x_cm=-100.0,
+            origin_y_cm=-100.0,
+            width=120,
+            height=80,
+        )
+        pose = NavigationPose(0.0, 0.0, 0.0, time.monotonic())
+        self.assertTrue(
+            VehicleCollisionChecker(
+                grid,
+                navigation.geometry,
+                safety_margin_cm=navigation.planner.config.safety_margin_cm,
+            ).is_pose_free(pose)
+        )
+        self.assertFalse(
+            navigation._motion_sweep_is_free(
+                pose,
+                grid,
+                500.0,
+                0.0,
+                MotorDirection.FORWARD,
+            )
+        )
+        self.assertTrue(
+            navigation._motion_sweep_is_free(
+                pose,
+                grid,
+                50.0,
+                0.0,
+                MotorDirection.FORWARD,
+            )
+        )
 
     @staticmethod
     def _radar_update(

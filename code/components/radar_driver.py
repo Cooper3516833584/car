@@ -430,20 +430,22 @@ class WallLineLocalizer:
             return WallPoseObservation(None, None, None)
 
         provisional = self._points_in_wall(body_points, predicted_wall_pose, np)
-        back_fit = self._fit_wall(
+        x_fit = self._fit_nearest_wall(
             provisional,
             axis=0,
-            wall_coordinate=self.reference.back_wall_x_cm,
+            wall_coordinates=self._x_wall_coordinates(),
             expected_line_angle_deg=90.0,
             np=np,
         )
-        right_fit = self._fit_wall(
+        y_fit = self._fit_nearest_wall(
             provisional,
             axis=1,
-            wall_coordinate=self.reference.right_wall_y_cm,
+            wall_coordinates=self._y_wall_coordinates(),
             expected_line_angle_deg=0.0,
             np=np,
         )
+        back_fit = None if x_fit is None else x_fit[0]
+        right_fit = None if y_fit is None else y_fit[0]
 
         angle_deltas: list[tuple[float, int]] = []
         if back_fit is not None:
@@ -475,33 +477,37 @@ class WallLineLocalizer:
             observed_yaw_cw_deg,
         )
         corrected_points = self._points_in_wall(body_points, yaw_corrected_pose, np)
-        back_fit = self._fit_wall(
+        x_fit = self._fit_nearest_wall(
             corrected_points,
             axis=0,
-            wall_coordinate=self.reference.back_wall_x_cm,
+            wall_coordinates=self._x_wall_coordinates(),
             expected_line_angle_deg=90.0,
             np=np,
         )
-        right_fit = self._fit_wall(
+        y_fit = self._fit_nearest_wall(
             corrected_points,
             axis=1,
-            wall_coordinate=self.reference.right_wall_y_cm,
+            wall_coordinates=self._y_wall_coordinates(),
             expected_line_angle_deg=0.0,
             np=np,
         )
+        back_fit = None if x_fit is None else x_fit[0]
+        right_fit = None if y_fit is None else y_fit[0]
 
         observed_x = None
-        if back_fit is not None:
+        if x_fit is not None:
+            back_fit, x_wall_coordinate = x_fit
             observed_x = (
                 predicted_wall_pose.x_cm
-                + self.reference.back_wall_x_cm
+                + x_wall_coordinate
                 - back_fit.coordinate_cm
             )
         observed_y = None
-        if right_fit is not None:
+        if y_fit is not None:
+            right_fit, y_wall_coordinate = y_fit
             observed_y = (
                 predicted_wall_pose.y_cm
-                + self.reference.right_wall_y_cm
+                + y_wall_coordinate
                 - right_fit.coordinate_cm
             )
         return WallPoseObservation(
@@ -512,6 +518,49 @@ class WallLineLocalizer:
             0 if right_fit is None else right_fit.points,
             None if back_fit is None else back_fit.rms_cm,
             None if right_fit is None else right_fit.rms_cm,
+        )
+
+    def _x_wall_coordinates(self) -> tuple[float, ...]:
+        coordinates = [self.reference.back_wall_x_cm]
+        if self.reference.front_wall_x_cm is not None:
+            coordinates.append(self.reference.front_wall_x_cm)
+        return tuple(coordinates)
+
+    def _y_wall_coordinates(self) -> tuple[float, ...]:
+        coordinates = [self.reference.right_wall_y_cm]
+        if self.reference.left_wall_y_cm is not None:
+            coordinates.append(self.reference.left_wall_y_cm)
+        return tuple(coordinates)
+
+    def _fit_nearest_wall(
+        self,
+        points,
+        *,
+        axis: int,
+        wall_coordinates: Sequence[float],
+        expected_line_angle_deg: float,
+        np,
+    ) -> tuple[_WallFit, float] | None:
+        fits: list[tuple[_WallFit, float]] = []
+        for wall_coordinate in wall_coordinates:
+            fit = self._fit_wall(
+                points,
+                axis=axis,
+                wall_coordinate=wall_coordinate,
+                expected_line_angle_deg=expected_line_angle_deg,
+                np=np,
+            )
+            if fit is not None:
+                fits.append((fit, wall_coordinate))
+        if not fits:
+            return None
+        return min(
+            fits,
+            key=lambda item: (
+                abs(item[0].coordinate_cm - item[1]),
+                item[0].rms_cm,
+                -item[0].points,
+            ),
         )
 
     @staticmethod
@@ -667,17 +716,6 @@ class RectangleFieldCalibrator:
         mount: RadarMount = RadarMount(),
         config: RectangleCalibrationConfig = RectangleCalibrationConfig(),
     ) -> None:
-        if min(
-            max_step_cm,
-            max_step_yaw_deg,
-            max_mean_error_cm,
-            min_step_cm,
-            min_step_yaw_deg,
-            max_lateral_innovation_cm,
-        ) <= 0:
-            raise ValueError("radar odometry gates must be positive")
-        if min_step_cm >= max_step_cm or min_step_yaw_deg >= max_step_yaw_deg:
-            raise ValueError("radar odometry minimum gates must be below maximum gates")
         self.mount = mount
         self.config = config
 
@@ -1083,6 +1121,17 @@ class RadarOdometry:
         min_step_yaw_deg: float = 1.0,
         max_lateral_innovation_cm: float = 5.0,
     ) -> None:
+        if min(
+            max_step_cm,
+            max_step_yaw_deg,
+            max_mean_error_cm,
+            min_step_cm,
+            min_step_yaw_deg,
+            max_lateral_innovation_cm,
+        ) <= 0:
+            raise ValueError("radar odometry gates must be positive")
+        if min_step_cm >= max_step_cm or min_step_yaw_deg >= max_step_yaw_deg:
+            raise ValueError("radar odometry minimum gates must be below maximum gates")
         self.mount = mount
         self.matcher = matcher or ICPScanMatcher()
         self.max_step_cm = max_step_cm
@@ -1117,12 +1166,8 @@ class RadarOdometry:
             math.hypot(delta.x_cm, delta.y_cm) < self.min_step_cm
             and abs(delta.yaw_cw_deg) < self.min_step_yaw_deg
         ):
-            # Treat this as a fresh localization observation without integrating
-            # sub-threshold jitter.  Keep the existing keyframe: real low-speed
-            # motion then accumulates against that scan until it crosses a gate,
-            # while stationary noise remains bounded around the same keyframe.
-            # Advancing the reference here would discard every 1--2 cm motion
-            # increment near a goal and freeze odometry indefinitely.
+            # Preserve the keyframe so real low-speed motion accumulates while
+            # stationary sub-centimetre ICP jitter cannot walk the pose.
             return RadarOdometryUpdate(self.pose, True, True, result)
         if abs(delta.yaw_cw_deg) > self.max_step_yaw_deg:
             return RadarOdometryUpdate(self.pose, False, True, result, "yaw gate")
@@ -1175,22 +1220,6 @@ class DroneGlobalPointMap:
                 key = (round(x_cm / self.resolution_cm), round(y_cm / self.resolution_cm))
                 self._hits[key] = self._hits.get(key, 0) + 1
 
-    def transform(self, alignment: DroneGlobalAlignment) -> None:
-        """Move every accumulated cell through one fixed SE(2) transform."""
-
-        with self._lock:
-            transformed: dict[tuple[int, int], int] = {}
-            for (ix, iy), hits in self._hits.items():
-                x_cm, y_cm = alignment.point_to_global(
-                    (ix * self.resolution_cm, iy * self.resolution_cm)
-                )
-                key = (
-                    round(x_cm / self.resolution_cm),
-                    round(y_cm / self.resolution_cm),
-                )
-                transformed[key] = transformed.get(key, 0) + hits
-            self._hits = transformed
-
     def cells(self, *, min_hits: int = 1) -> list[MapCell]:
         with self._lock:
             return [
@@ -1241,10 +1270,6 @@ class D500SerialDriver:
     @property
     def connected(self) -> bool:
         return self._connected_event.is_set()
-
-    @property
-    def running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
 
     def wait_connected(self, timeout: float | None = None) -> bool:
         return self._connected_event.wait(timeout)

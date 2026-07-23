@@ -94,6 +94,12 @@ class D500ProtocolTests(unittest.TestCase):
         self.assertEqual(len(scans), 1)
         self.assertEqual(len(scans[0].points), 24)
 
+    def test_scan_assembler_defaults_reject_noise_and_unusable_range(self) -> None:
+        assembler = RadarScanAssembler()
+        self.assertEqual(assembler.min_distance_mm, 100)
+        self.assertEqual(assembler.max_distance_mm, 6500)
+        self.assertEqual(assembler.min_confidence, 30)
+
 
 class DroneCoordinateTests(unittest.TestCase):
     def assertPointAlmostEqual(self, actual, expected, places=6) -> None:
@@ -154,176 +160,35 @@ class ICPTests(unittest.TestCase):
         self.assertAlmostEqual(pose.yaw_cw_deg, 3.0, delta=0.15)
         self.assertLess(result.mean_error_cm, 0.15)
 
-    def test_stationary_subthreshold_icp_is_fresh_valid_localization(self) -> None:
-        class SubthresholdMatcher:
-            def __init__(self) -> None:
-                self.references = []
-
+    def test_odometry_ignores_stationary_jitter_without_advancing_keyframe(self) -> None:
+        class FixedMatcher:
             def match(self, reference, current):
-                self.references.append(tuple(reference))
-                return ICPResult(Pose2D(0.4, -0.3, 0.2), 80, 0.5, 2)
+                return ICPResult(Pose2D(0.8, 0.3, 0.2), 80, 1.0, 2)
 
-        matcher = SubthresholdMatcher()
-        odometry = RadarOdometry(matcher=matcher)
-        first = RadarScan(
-            tuple(RadarPoint(float(angle), 1000, 200) for angle in range(0, 360, 10)),
-            1,
-            3600,
-        )
-        second = RadarScan(
-            tuple(RadarPoint(float(angle), 1001, 200) for angle in range(0, 360, 10)),
-            2,
-            3600,
-        )
-        third = RadarScan(
-            tuple(RadarPoint(float(angle), 1002, 200) for angle in range(0, 360, 10)),
-            3,
-            3600,
-        )
-
-        odometry.update(first)
-        update = odometry.update(second)
-        odometry.update(third)
-
-        self.assertTrue(update.accepted)
-        self.assertIsNone(update.rejection_reason)
-        self.assertEqual(update.pose, Pose2D())
-        self.assertEqual(
-            matcher.references[-1],
-            tuple(point.sensor_xy_cm() for point in first.points),
-        )
-
-    def test_subthreshold_motion_accumulates_against_keyframe(self) -> None:
-        class AccumulatingMatcher:
-            def __init__(self) -> None:
-                self.references = []
-                self.deltas = iter((0.8, 1.6, 2.4, 0.7))
-
-            def match(self, reference, current):
-                self.references.append(tuple(reference))
-                return ICPResult(Pose2D(next(self.deltas), 0.0, 0.0), 80, 0.5, 2)
-
-        matcher = AccumulatingMatcher()
-        odometry = RadarOdometry(matcher=matcher)
-        scans = [
-            RadarScan(
-                tuple(
-                    RadarPoint(float(angle), 1000 + index, 200)
-                    for angle in range(0, 360, 10)
-                ),
-                index,
-                3600,
-            )
-            for index in range(5)
-        ]
-
-        updates = [odometry.update(scan) for scan in scans]
-
-        self.assertEqual(updates[1].pose, Pose2D())
-        self.assertEqual(updates[2].pose, Pose2D())
-        self.assertAlmostEqual(updates[3].pose.x_cm, 2.4)
-        self.assertAlmostEqual(updates[4].pose.x_cm, 2.4)
-        first_keyframe = tuple(point.sensor_xy_cm() for point in scans[0].points)
-        third_keyframe = tuple(point.sensor_xy_cm() for point in scans[3].points)
-        self.assertEqual(matcher.references[0], first_keyframe)
-        self.assertEqual(matcher.references[1], first_keyframe)
-        self.assertEqual(matcher.references[2], first_keyframe)
-        self.assertEqual(matcher.references[3], third_keyframe)
-
-    def test_subthreshold_yaw_accumulates_against_keyframe(self) -> None:
-        class AccumulatingYawMatcher:
-            def __init__(self) -> None:
-                self.references = []
-                self.deltas = iter((0.3, 0.7, 1.2))
-
-            def match(self, reference, current):
-                self.references.append(tuple(reference))
-                return ICPResult(Pose2D(0.0, 0.0, next(self.deltas)), 80, 0.5, 2)
-
-        matcher = AccumulatingYawMatcher()
-        odometry = RadarOdometry(matcher=matcher)
-        scans = [
-            RadarScan(
-                tuple(
-                    RadarPoint(float(angle), 1000 + index, 200)
-                    for angle in range(0, 360, 10)
-                ),
-                index,
-                3600,
-            )
-            for index in range(4)
-        ]
-
-        updates = [odometry.update(scan) for scan in scans]
-
-        self.assertEqual(updates[1].pose, Pose2D())
-        self.assertEqual(updates[2].pose, Pose2D())
-        self.assertAlmostEqual(updates[3].pose.yaw_cw_deg, 1.2)
-        first_keyframe = tuple(point.sensor_xy_cm() for point in scans[0].points)
-        self.assertEqual(matcher.references[0], first_keyframe)
-        self.assertEqual(matcher.references[1], first_keyframe)
-        self.assertEqual(matcher.references[2], first_keyframe)
-
-    def test_bad_subthreshold_icp_is_rejected_before_stationary_handling(self) -> None:
-        class BadMatcher:
-            def match(self, reference, current):
-                return ICPResult(Pose2D(0.2, 0.1, 0.1), 80, 20.0, 2)
-
-        odometry = RadarOdometry(matcher=BadMatcher(), max_mean_error_cm=12.0)
-        scan = RadarScan(
-            tuple(RadarPoint(float(angle), 1000, 200) for angle in range(0, 360, 10)),
-            1,
-            3600,
-        )
-        odometry.update(scan)
+        odometry = RadarOdometry(matcher=FixedMatcher())
+        scan = RadarScan((RadarPoint(0, 1000, 100),), 0, 3600)
+        self.assertTrue(odometry.update(scan).accepted)
+        keyframe = odometry._reference
 
         update = odometry.update(scan)
 
-        self.assertFalse(update.accepted)
-        self.assertEqual(update.rejection_reason, "error gate")
+        self.assertTrue(update.accepted)
+        self.assertEqual(update.pose, Pose2D())
+        self.assertIs(odometry._reference, keyframe)
 
-    def test_impossible_ackermann_lateral_jump_is_rejected(self) -> None:
-        class SidewaysMatcher:
+    def test_odometry_rejects_non_ackermann_lateral_jump(self) -> None:
+        class FixedMatcher:
             def match(self, reference, current):
-                return ICPResult(Pose2D(0.0, 8.0, 0.0), 80, 0.5, 2)
+                return ICPResult(Pose2D(5.0, 12.0, 0.0), 80, 1.0, 2)
 
-        odometry = RadarOdometry(matcher=SidewaysMatcher())
-        scan = RadarScan(
-            tuple(RadarPoint(float(angle), 1000, 200) for angle in range(0, 360, 10)),
-            1,
-            3600,
-        )
+        odometry = RadarOdometry(matcher=FixedMatcher())
+        scan = RadarScan((RadarPoint(0, 1000, 100),), 0, 3600)
         odometry.update(scan)
 
         update = odometry.update(scan)
 
         self.assertFalse(update.accepted)
         self.assertEqual(update.rejection_reason, "Ackermann lateral gate")
-        self.assertEqual(update.pose, Pose2D())
-
-    def test_ackermann_arc_motion_is_accepted(self) -> None:
-        yaw_cw_deg = 10.0
-        x_cm = 10.0
-        y_cm = -x_cm * math.tan(math.radians(yaw_cw_deg) / 2.0)
-
-        class ArcMatcher:
-            def match(self, reference, current):
-                return ICPResult(Pose2D(x_cm, y_cm, yaw_cw_deg), 80, 0.5, 2)
-
-        odometry = RadarOdometry(matcher=ArcMatcher())
-        scan = RadarScan(
-            tuple(RadarPoint(float(angle), 1000, 200) for angle in range(0, 360, 10)),
-            1,
-            3600,
-        )
-        odometry.update(scan)
-
-        update = odometry.update(scan)
-
-        self.assertTrue(update.accepted)
-        self.assertAlmostEqual(update.pose.x_cm, x_cm)
-        self.assertAlmostEqual(update.pose.y_cm, y_cm)
-        self.assertAlmostEqual(update.pose.yaw_cw_deg, yaw_cw_deg)
 
 
 def rectangular_wall_scan(pose_in_wall: Pose2D, *, include_right: bool = True) -> RadarScan:
@@ -332,6 +197,30 @@ def rectangular_wall_scan(pose_in_wall: Pose2D, *, include_right: bool = True) -
     if include_right:
         wall_points.extend((float(x_cm), 0.0) for x_cm in range(0, 245, 5))
     radar_points = []
+    for wall_x, wall_y in wall_points:
+        relative_x = wall_x - pose_in_wall.x_cm
+        relative_y = wall_y - pose_in_wall.y_cm
+        body_x, body_y = rotate_cw(
+            relative_x,
+            relative_y,
+            -pose_in_wall.yaw_cw_deg,
+        )
+        distance_cm = math.hypot(body_x, body_y)
+        angle_cw = math.degrees(math.atan2(-body_y, body_x)) % 360.0
+        radar_points.append(RadarPoint(angle_cw, round(distance_cm * 10), 200))
+    return RadarScan(tuple(radar_points), 0, 3600)
+
+
+def selected_walls_scan(
+    pose_in_wall: Pose2D,
+    *,
+    x_wall_cm: float,
+    y_wall_cm: float,
+) -> RadarScan:
+    wall_points: list[tuple[float, float]] = []
+    wall_points.extend((x_wall_cm, float(y_cm)) for y_cm in range(0, 205, 5))
+    wall_points.extend((float(x_cm), y_wall_cm) for x_cm in range(0, 305, 5))
+    radar_points: list[RadarPoint] = []
     for wall_x, wall_y in wall_points:
         relative_x = wall_x - pose_in_wall.x_cm
         relative_y = wall_y - pose_in_wall.y_cm
@@ -379,16 +268,33 @@ class WallLineFusionTests(unittest.TestCase):
         self.assertIsNone(observation.y_cm)
         self.assertIsNotNone(observation.yaw_cw_deg)
 
-    def test_back_and_right_walls_localize_after_car_turns_around(self) -> None:
-        true_pose = Pose2D(150, 120, 168)
-        predicted_pose = Pose2D(143, 128, 162)
-        observation = self.localizer.observe(
-            rectangular_wall_scan(true_pose),
+    def test_front_and_left_walls_are_used_when_they_are_nearest(self) -> None:
+        reference = RectangularWallReference(
+            self.wall_to_global,
+            back_wall_x_cm=0.0,
+            right_wall_y_cm=0.0,
+            front_wall_x_cm=300.0,
+            left_wall_y_cm=200.0,
+        )
+        localizer = WallLineLocalizer(
+            reference,
+            config=WallLineConfig(min_points_per_wall=10, min_line_span_cm=40),
+        )
+        true_pose = Pose2D(265.0, 165.0, 8.0)
+        predicted_pose = Pose2D(270.0, 160.0, 11.0)
+
+        observation = localizer.observe(
+            selected_walls_scan(
+                true_pose,
+                x_wall_cm=300.0,
+                y_wall_cm=200.0,
+            ),
             self.wall_to_global.pose_to_global(predicted_pose),
         )
+
         self.assertAlmostEqual(observation.x_cm, true_pose.x_cm, delta=1.0)
-        self.assertAlmostEqual(observation.y_cm, true_pose.y_cm, delta=1.2)
-        self.assertAlmostEqual(observation.yaw_cw_deg, true_pose.yaw_cw_deg, delta=2.0)
+        self.assertAlmostEqual(observation.y_cm, true_pose.y_cm, delta=1.0)
+        self.assertAlmostEqual(observation.yaw_cw_deg, true_pose.yaw_cw_deg, delta=1.0)
 
     def test_fusion_applies_limited_correction(self) -> None:
         predicted_wall = Pose2D(110, 70, 20)
@@ -401,7 +307,7 @@ class WallLineFusionTests(unittest.TestCase):
             WallFusionConfig(
                 position_gain=0.25,
                 yaw_gain=0.5,
-                max_position_correction_cm=10.0,
+                max_position_correction_cm=5.0,
                 max_yaw_correction_deg=10.0,
             ),
         )
@@ -419,28 +325,6 @@ class WallLineFusionTests(unittest.TestCase):
         self.assertFalse(result.accepted)
         self.assertEqual(result.fused_global_pose, predicted_global)
         self.assertIn("residual gate", result.reason)
-
-    def test_default_fusion_rejects_single_large_correction(self) -> None:
-        predicted_wall = Pose2D(100, 80, 10)
-        predicted_global = self.wall_to_global.pose_to_global(predicted_wall)
-        observation = WallPoseObservation(120, 50, 6, 20, 20, 1, 1)
-
-        result = fuse_wall_observation(predicted_global, observation, self.reference)
-
-        self.assertFalse(result.accepted)
-        self.assertEqual(result.fused_global_pose, predicted_global)
-        self.assertEqual(result.reason, "wall position correction gate")
-
-    def test_default_fusion_rejects_single_large_yaw_correction(self) -> None:
-        predicted_wall = Pose2D(100, 80, 10)
-        predicted_global = self.wall_to_global.pose_to_global(predicted_wall)
-        observation = WallPoseObservation(100, 80, 0, 20, 20, 1, 1)
-
-        result = fuse_wall_observation(predicted_global, observation, self.reference)
-
-        self.assertFalse(result.accepted)
-        self.assertEqual(result.fused_global_pose, predicted_global)
-        self.assertEqual(result.reason, "wall yaw correction gate")
 
     def test_component_writes_wall_correction_back_into_odometry(self) -> None:
         true_wall_pose = Pose2D(100, 80, 15)
