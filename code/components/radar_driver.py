@@ -1033,12 +1033,16 @@ class RadarOdometry:
         max_step_cm: float = 60.0,
         max_step_yaw_deg: float = 35.0,
         max_mean_error_cm: float = 12.0,
+        min_step_cm: float = 2.0,
+        min_step_yaw_deg: float = 1.0,
     ) -> None:
         self.mount = mount
         self.matcher = matcher or ICPScanMatcher()
         self.max_step_cm = max_step_cm
         self.max_step_yaw_deg = max_step_yaw_deg
         self.max_mean_error_cm = max_mean_error_cm
+        self.min_step_cm = min_step_cm
+        self.min_step_yaw_deg = min_step_yaw_deg
         self.pose = Pose2D()
         self._reference: list[tuple[float, float]] | None = None
 
@@ -1059,6 +1063,11 @@ class RadarOdometry:
         delta = result.transform_current_to_reference
         if math.hypot(delta.x_cm, delta.y_cm) > self.max_step_cm:
             return RadarOdometryUpdate(self.pose, False, True, result, "translation gate")
+        if (
+            math.hypot(delta.x_cm, delta.y_cm) < self.min_step_cm
+            and abs(delta.yaw_cw_deg) < self.min_step_yaw_deg
+        ):
+            return RadarOdometryUpdate(self.pose, False, True, result, "below min step")
         if abs(delta.yaw_cw_deg) > self.max_step_yaw_deg:
             return RadarOdometryUpdate(self.pose, False, True, result, "yaw gate")
         if result.mean_error_cm > self.max_mean_error_cm:
