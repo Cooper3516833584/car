@@ -1196,6 +1196,7 @@ class Navigation:
         on_state_changed: Callable[[NavigationState, str], None] | None = None,
         on_path_updated: Callable[[NavigationPath], None] | None = None,
         on_goal_reached: Callable[[NavigationGoal, NavigationPose], None] | None = None,
+        on_motion_changed: Callable[[bool], None] | None = None,
     ) -> None:
         self.geometry = geometry
         self.config = config
@@ -1217,6 +1218,7 @@ class Navigation:
         self.on_state_changed = on_state_changed
         self.on_path_updated = on_path_updated
         self.on_goal_reached = on_goal_reached
+        self.on_motion_changed = on_motion_changed
 
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -1590,10 +1592,14 @@ class Navigation:
             else:
                 with self._lock:
                     count = self._arrival_confirmation_count
+                    started_at = self._arrival_confirmation_started_at
+                elapsed = 0.0 if started_at is None else max(0.0, now - started_at)
                 self._set_state(
                     NavigationState.FINAL_APPROACH,
-                    f"confirming goal arrival {count}/"
-                    f"{self.config.arrival_confirmation_samples}",
+                    "confirming goal arrival "
+                    f"samples={min(count, self.config.arrival_confirmation_samples)}/"
+                    f"{self.config.arrival_confirmation_samples} "
+                    f"elapsed={elapsed:.2f}/{self.config.arrival_confirmation_s:.2f}s",
                 )
             return
         with self._lock:
@@ -1787,6 +1793,11 @@ class Navigation:
             raise
         with self._lock:
             self._last_motion_plan = motion_plan
+        if self.on_motion_changed is not None:
+            try:
+                self.on_motion_changed(speed > 1e-6)
+            except BaseException:
+                LOG.exception("motion-state callback failed")
         if motion_plan is not None:
             LOG.debug(
                 "control pose=(%.3f,%.3f,%.3f) path_index=%d/%d "
@@ -1867,6 +1878,11 @@ class Navigation:
                 self.drive.stop(center_steering=True)
         except BaseException:
             pass
+        if self.on_motion_changed is not None:
+            try:
+                self.on_motion_changed(False)
+            except BaseException:
+                LOG.exception("motion-state callback failed")
 
     def _arrival_confirmed(self, pose_revision: int, now: float) -> bool:
         with self._lock:

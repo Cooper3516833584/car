@@ -16,6 +16,7 @@ from components.radar_driver import (  # noqa: E402
     RadarOdometryUpdate,
     RadarPacket,
     RadarScan,
+    RectangularWallReference,
     WallFusionConfig,
     WallFusionResult,
     WallPoseObservation,
@@ -39,10 +40,12 @@ class _FixedOdometry:
 
 
 class _WallLocalizer:
-    reference = object()
+    reference = RectangularWallReference(
+        DroneGlobalAlignment(0.0, 0.0, 0.0)
+    )
 
     def observe(self, _scan: RadarScan, _predicted_global_pose: Pose2D):
-        return WallPoseObservation(10.0, 5.0, 2.0)
+        return WallPoseObservation(10.0, 5.0, 2.0, 30, 30, 1.0, 1.0)
 
 
 def _packet() -> RadarPacket:

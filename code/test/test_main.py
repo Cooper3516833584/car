@@ -26,6 +26,7 @@ from components import (  # noqa: E402
     RectangularWallReference,
     RectangleFieldCalibration,
     WallFusionResult,
+    WallFusionStatus,
     pack_navigation_command,
     unpack_authenticated_frame,
 )
@@ -227,6 +228,34 @@ class MainCoordinatorTests(unittest.TestCase):
 
         self.assertEqual(app.navigation.pose.x_cm if app.navigation.pose else None, 2.0)
         self.assertEqual(app._trusted_map.cells(), [])
+
+    def test_pending_wall_consensus_keeps_trusted_icp_map_updates(self) -> None:
+        app = self.make_app()
+        app._last_trusted_pose = Pose2D()
+        app._last_map_update = time.monotonic()
+        pose = Pose2D(2.0, 0.0, 0.0)
+        wall = WallFusionResult(
+            True,
+            False,
+            None,
+            pose,
+            "wall residual consensus pending x=2/3 y=0/3 yaw=2/3",
+            status=WallFusionStatus.PENDING,
+        )
+
+        app._on_radar_update(
+            self.make_radar_update(
+                pose,
+                points=((50.0, 20.0),),
+                wall_fusion=wall,
+            )
+        )
+
+        self.assertNotEqual(app._trusted_map.cells(), [])
+
+    def test_main_initializes_radar_as_stationary(self) -> None:
+        app = self.make_app()
+        self.assertFalse(app.radar.odometry._vehicle_moving)
 
     def test_default_and_detailed_log_file(self) -> None:
         previous = os.environ.pop("CAR_LOG_DIR", None)

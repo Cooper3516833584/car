@@ -46,6 +46,7 @@ from components import (
     RejectReason,
     SerialCommunicationDriver,
     WallFusionConfig,
+    WallFusionStatus,
     VehicleCollisionChecker,
     load_navigation_hmac_key,
     scan_points_in_drone_global,
@@ -350,6 +351,7 @@ class CarMainApplication:
             on_connected=lambda: LOG.info("D500 connected on %s", config.radar_port),
             on_disconnected=lambda error: LOG.warning("D500 disconnected: %s", error),
         )
+        self.radar.set_motion_hint(False)
         if not 0.0 < NAVIGATION_CRUISE_SPEED_CM_S <= _MAX_NAVIGATION_CRUISE_SPEED_CM_S:
             raise ValueError(
                 "NAVIGATION_CRUISE_SPEED_CM_S must be in (0, 100] cm/s"
@@ -379,6 +381,7 @@ class CarMainApplication:
             controller=PurePursuitController(config=pursuit_config),
             max_wheel_speed_mm_s=max_wheel_speed_mm_s,
             on_state_changed=self._on_navigation_state,
+            on_motion_changed=self.radar.set_motion_hint,
         )
         self._vehicle_geometry = self.navigation.geometry
         self._navigation_safety_margin_cm = (
@@ -593,17 +596,23 @@ class CarMainApplication:
             self._last_trusted_rejection = None
 
         wall = update.wall_fusion
-        wall_rejected = (
+        wall_hard_rejected = (
             wall is not None
             and wall.attempted
             and not wall.accepted
-            and wall.reason != "no valid wall axes"
+            and (
+                wall.status is WallFusionStatus.HARD_REJECTED
+                or (
+                    wall.status is WallFusionStatus.NOT_ATTEMPTED
+                    and wall.reason != "no valid wall axes"
+                )
+            )
         )
         filtered_points = self._filter_vehicle_footprint_points(
             update.global_points_cm,
             update.global_pose,
         )
-        if wall_rejected:
+        if wall_hard_rejected:
             LOG.warning(
                 "trusted map scan skipped because wall correction was rejected reason=%r",
                 wall.reason,
@@ -611,10 +620,12 @@ class CarMainApplication:
         else:
             self._trusted_map.add_points(filtered_points)
         LOG.debug(
-            "trusted map scan accepted raw_points=%d retained_points=%d wall_rejected=%s",
+            "trusted map scan accepted raw_points=%d retained_points=%d "
+            "wall_status=%s hard_rejected=%s",
             len(update.global_points_cm),
             len(filtered_points),
-            wall_rejected,
+            "none" if wall is None else wall.status.value,
+            wall_hard_rejected,
         )
         self._refresh_trusted_grid(now=now)
 
@@ -771,9 +782,10 @@ class CarMainApplication:
             "odometry_accepted=%s initialized=%s rejection=%r "
             "local_pose=(%.3f,%.3f,%.3f) global_pose=%s "
             "icp=(matched=%d,error_cm=%.4f,iterations=%d,delta=%.3f,%.3f,%.3f) "
-            "wall=(attempted=%s,accepted=%s,reason=%r,"
+            "wall=(attempted=%s,accepted=%s,status=%s,reason=%r,"
             "observation=%s,residual=%.3f,%.3f,%.3f,"
-            "correction=%.3f,%.3f,%.3f) global_points=%d",
+            "correction=%.3f,%.3f,%.3f,"
+            "consensus=%d,%d,%d,spread=%.3f,%.3f,%.3f) global_points=%d",
             phase,
             update.scan.timestamp_ms,
             len(update.scan.points),
@@ -791,6 +803,7 @@ class CarMainApplication:
             *icp_values,
             False if wall is None else wall.attempted,
             False if wall is None else wall.accepted,
+            "none" if wall is None else wall.status.value,
             None if wall is None else wall.reason,
             "none"
             if observation is None
@@ -804,6 +817,12 @@ class CarMainApplication:
             0.0 if wall is None else wall.correction_x_cm,
             0.0 if wall is None else wall.correction_y_cm,
             0.0 if wall is None else wall.correction_yaw_deg,
+            0 if wall is None else wall.x_consensus_samples,
+            0 if wall is None else wall.y_consensus_samples,
+            0 if wall is None else wall.yaw_consensus_samples,
+            math.inf if wall is None else wall.x_residual_spread_cm,
+            math.inf if wall is None else wall.y_residual_spread_cm,
+            math.inf if wall is None else wall.yaw_residual_spread_deg,
             len(update.global_points_cm),
         )
 

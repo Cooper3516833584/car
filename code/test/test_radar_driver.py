@@ -27,6 +27,7 @@ from components.radar_driver import (  # noqa: E402
     RectangleFieldCalibrator,
     RectangularWallReference,
     WallFusionConfig,
+    WallFusionStatus,
     WallLineConfig,
     WallLineLocalizer,
     WallPoseObservation,
@@ -189,6 +190,43 @@ class ICPTests(unittest.TestCase):
 
         self.assertFalse(update.accepted)
         self.assertEqual(update.rejection_reason, "Ackermann lateral gate")
+
+    def test_stationary_motion_hint_freezes_large_icp_step(self) -> None:
+        class FixedMatcher:
+            def match(self, reference, current):
+                return ICPResult(Pose2D(2.5, 0.0, 0.0), 80, 1.0, 2)
+
+        odometry = RadarOdometry(matcher=FixedMatcher())
+        scan = RadarScan((RadarPoint(0, 1000, 100),), 0, 3600)
+        odometry.update(scan)
+        odometry.set_motion_state(False)
+
+        stationary = odometry.update(scan)
+
+        self.assertTrue(stationary.accepted)
+        self.assertEqual(stationary.pose, Pose2D())
+        odometry.set_motion_state(True)
+        moving = odometry.update(scan)
+        self.assertAlmostEqual(moving.pose.x_cm, 2.5)
+
+    def test_repeated_stationary_hint_does_not_prevent_reference_refresh(self) -> None:
+        class SmallMatcher:
+            def match(self, reference, current):
+                return ICPResult(Pose2D(0.1, 0.0, 0.0), 80, 1.0, 2)
+
+        odometry = RadarOdometry(matcher=SmallMatcher())
+        first = RadarScan((RadarPoint(0, 1000, 100),), 0, 3600)
+        odometry.update(first)
+        initial_reference = list(odometry._reference)
+        odometry.set_motion_state(False)
+
+        for timestamp in (1, 2, 3):
+            odometry.set_motion_state(False)
+            odometry.update(
+                RadarScan((RadarPoint(timestamp, 1000, 100),), timestamp, 3600)
+            )
+
+        self.assertNotEqual(odometry._reference, initial_reference)
 
 
 def rectangular_wall_scan(pose_in_wall: Pose2D, *, include_right: bool = True) -> RadarScan:
@@ -431,6 +469,111 @@ class WallLineFusionTests(unittest.TestCase):
         self.assertFalse(first.wall_fusion.accepted)
         self.assertFalse(second.wall_fusion.accepted)
         self.assertTrue(third.wall_fusion.accepted)
+
+    def test_moving_absolute_observations_accept_stable_residual(self) -> None:
+        identity = DroneGlobalAlignment(0.0, 0.0, 0.0)
+        reference = RectangularWallReference(identity)
+        scan = RadarScan((), 0, 0)
+
+        class OneScanAssembler:
+            def feed(self, packet):
+                return [scan]
+
+        class MovingOdometry:
+            def __init__(self):
+                self.pose = Pose2D()
+                self._poses = iter((Pose2D(0, 0, 0), Pose2D(3, 0, 0), Pose2D(6, 0, 0)))
+
+            def update(self, incoming_scan):
+                self.pose = next(self._poses)
+                return RadarOdometryUpdate(self.pose, True, True)
+
+        class MovingWallLocalizer:
+            def __init__(self):
+                self.reference = reference
+                self._observations = iter(
+                    (
+                        WallPoseObservation(5, None, 0, 30, 0, 1.0, None),
+                        WallPoseObservation(8, None, 0, 30, 0, 1.0, None),
+                        WallPoseObservation(11, None, 0, 30, 0, 1.0, None),
+                    )
+                )
+
+            def observe(self, incoming_scan, predicted_global_pose):
+                return next(self._observations)
+
+        component = D500RadarComponent(
+            alignment=identity,
+            assembler=OneScanAssembler(),
+            odometry=MovingOdometry(),
+            wall_localizer=MovingWallLocalizer(),
+            wall_fusion_config=WallFusionConfig(
+                update_every_scans=1,
+                consistency_samples=3,
+                position_gain=1.0,
+                max_position_correction_cm=20.0,
+                max_yaw_correction_deg=10.0,
+            ),
+        )
+        packet = RadarPacket(3600, 0, 1, 0, ())
+
+        first = component.process_packet(packet)[0]
+        second = component.process_packet(packet)[0]
+        third = component.process_packet(packet)[0]
+
+        self.assertIs(first.wall_fusion.status, WallFusionStatus.PENDING)
+        self.assertIs(second.wall_fusion.status, WallFusionStatus.PENDING)
+        self.assertTrue(third.wall_fusion.accepted)
+        self.assertAlmostEqual(third.wall_fusion.residual_x_cm, 5.0)
+        self.assertAlmostEqual(third.global_pose.x_cm, 11.0)
+
+    def test_missing_y_axis_does_not_reset_x_residual_consensus(self) -> None:
+        identity = DroneGlobalAlignment(0.0, 0.0, 0.0)
+        reference = RectangularWallReference(identity)
+        component = D500RadarComponent(
+            alignment=identity,
+            wall_fusion_config=WallFusionConfig(consistency_samples=3),
+        )
+        observations = (
+            (Pose2D(0, 0, 0), WallPoseObservation(5, 4, 0, 30, 30, 1, 1)),
+            (Pose2D(3, 0, 0), WallPoseObservation(8, None, 0, 30, 0, 1, None)),
+            (Pose2D(6, 0, 0), WallPoseObservation(11, 4, 0, 30, 30, 1, 1)),
+        )
+
+        result = None
+        for predicted, observation in observations:
+            consensus, diagnostic = component._wall_residual_consensus_observation(
+                observation,
+                predicted,
+                reference,
+                component.wall_fusion_config,
+            )
+            result = (consensus, diagnostic)
+
+        consensus, diagnostic = result
+        self.assertIsNotNone(consensus)
+        self.assertAlmostEqual(consensus.x_cm, 11.0)
+        self.assertIsNone(consensus.y_cm)
+        self.assertEqual(diagnostic.x_consensus_samples, 3)
+        self.assertEqual(diagnostic.y_consensus_samples, 2)
+
+    def test_weak_twelve_point_wall_is_not_used_for_correction(self) -> None:
+        identity = DroneGlobalAlignment(0.0, 0.0, 0.0)
+        reference = RectangularWallReference(identity)
+        component = D500RadarComponent(
+            alignment=identity,
+            wall_fusion_config=WallFusionConfig(consistency_samples=1),
+        )
+
+        consensus, diagnostic = component._wall_residual_consensus_observation(
+            WallPoseObservation(None, -14.5, 0, 0, 12, None, 0.5),
+            Pose2D(),
+            reference,
+            component.wall_fusion_config,
+        )
+
+        self.assertIsNone(consensus)
+        self.assertIs(diagnostic.status, WallFusionStatus.NO_OBSERVATION)
 
 
 class RectangleStartupCalibrationTests(unittest.TestCase):

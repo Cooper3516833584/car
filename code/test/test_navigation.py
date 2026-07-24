@@ -441,6 +441,26 @@ class NavigationStateMachineTests(unittest.TestCase):
         finally:
             navigation.close()
 
+    def test_motion_callback_tracks_drive_and_safe_stop(self) -> None:
+        drive = _FakeDrive()
+        motion_states: list[bool] = []
+        navigation = Navigation(
+            drive=drive,
+            config=NavigationConfig(control_hz=50),
+            on_motion_changed=motion_states.append,
+        )
+        navigation.start()
+        try:
+            navigation.set_map(open_grid())
+            navigation.update_pose(NavigationPose(0, 0, 0))
+            navigation.set_goal(NavigationGoal(100, 0))
+            navigation.start_navigation()
+            self.assertTrue(self.wait_for(lambda: True in motion_states))
+            navigation.cancel()
+            self.assertFalse(motion_states[-1])
+        finally:
+            navigation.close()
+
     def test_single_pose_cannot_confirm_arrival(self) -> None:
         drive = _FakeDrive()
         navigation = Navigation(
