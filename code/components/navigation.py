@@ -58,6 +58,7 @@ class NavigationState(Enum):
     PLANNING = "planning"
     FOLLOWING = "following"
     FINAL_APPROACH = "final_approach"
+    RELOCALIZING = "relocalizing"
     GEAR_CHANGE = "gear_change"
     ARRIVED = "arrived"
     PAUSED = "paused"
@@ -111,8 +112,8 @@ class NavigationGoal:
     x_cm: float
     y_cm: float
     final_heading_deg: float | None = None
-    position_tolerance_cm: float = 5.0
-    heading_tolerance_deg: float = 3.0
+    position_tolerance_cm: float = 10.0
+    heading_tolerance_deg: float = 8.0
 
     def __post_init__(self) -> None:
         if not math.isfinite(float(self.x_cm)) or not math.isfinite(float(self.y_cm)):
@@ -1096,21 +1097,12 @@ class PurePursuitController:
                 last_dy = segment_dy
             current_x, current_y = candidate.x_cm, candidate.y_cm
 
-        # Hybrid A* intentionally stops as soon as a node enters the goal
-        # tolerance.  Consequently, the stored path normally ends several
-        # centimetres before the requested coordinate.  Returning that final
-        # point as the pursuit target makes the chord collapse during the last
-        # approach; a small radar heading error can then demand full steering
-        # even on a straight path.  Extend the final path tangent only for the
-        # lookahead calculation.  Goal arrival is still checked against the
-        # real coordinate before every drive command, so this virtual segment
-        # cannot make the vehicle drive past the configured goal tolerance.
-        tangent_length = math.hypot(last_dx, last_dy)
-        if remaining > 0.0 and tangent_length > 1e-9:
-            return (
-                current_x + remaining * last_dx / tangent_length,
-                current_y + remaining * last_dy / tangent_length,
-            )
+        # Never extend the virtual pursuit target beyond the requested
+        # coordinate.  If position is reached but final heading is not, the
+        # navigation state machine stops and replans an Ackermann manoeuvre
+        # instead of driving through the goal along an infinite tangent.
+        if remaining > 0.0:
+            return path.goal.x_cm, path.goal.y_cm
         return current_x, current_y
 
 
@@ -1136,6 +1128,12 @@ class NavigationConfig:
     steering_saturation_ratio: float = 0.90
     safety_prediction_horizon_s: float = 0.8
     safety_prediction_step_s: float = 0.1
+    terminal_overshoot_margin_cm: float = 2.0
+    terminal_overshoot_samples: int = 2
+    max_recovery_replans: int = 3
+    wall_relocalization_enter_cm: float = 15.0
+    wall_relocalization_exit_cm: float = 5.0
+    wall_relocalization_release_samples: int = 2
 
     def __post_init__(self) -> None:
         if (
@@ -1168,6 +1166,19 @@ class NavigationConfig:
             or self.safety_prediction_step_s > self.safety_prediction_horizon_s
         ):
             raise ValueError("invalid motion-sweep safety configuration")
+        if (
+            self.terminal_overshoot_margin_cm < 0
+            or self.terminal_overshoot_samples <= 0
+            or self.max_recovery_replans <= 0
+        ):
+            raise ValueError("invalid terminal recovery configuration")
+        if (
+            self.wall_relocalization_exit_cm <= 0
+            or self.wall_relocalization_enter_cm
+            <= self.wall_relocalization_exit_cm
+            or self.wall_relocalization_release_samples <= 0
+        ):
+            raise ValueError("invalid wall relocalization configuration")
 
 
 class Navigation:
@@ -1240,6 +1251,11 @@ class Navigation:
         self._last_motion_time: float | None = None
         self._last_tracker_command: TrackerCommand | None = None
         self._last_motion_plan: AckermannMotionPlan | None = None
+        self._terminal_overshoot_count = 0
+        self._last_terminal_overshoot_pose_revision = -1
+        self._recovery_replan_count = 0
+        self._wall_relocalization_hold = False
+        self._wall_relocalization_release_count = 0
 
     @property
     def state(self) -> NavigationState:
@@ -1382,6 +1398,31 @@ class Navigation:
             self._pose = pose
             self._pose_revision += 1
             self._localization_speed_scale = speed_scale
+            wall = update.wall_fusion
+            if wall is not None and wall.accepted:
+                wall_residual_cm = math.hypot(
+                    wall.residual_x_cm,
+                    wall.residual_y_cm,
+                )
+                if wall_residual_cm >= self.config.wall_relocalization_enter_cm:
+                    self._wall_relocalization_hold = True
+                    self._wall_relocalization_release_count = 0
+                    self._path = None
+                    self._path_progress_index = 0
+                elif self._wall_relocalization_hold:
+                    if wall_residual_cm <= self.config.wall_relocalization_exit_cm:
+                        self._wall_relocalization_release_count += 1
+                    else:
+                        self._wall_relocalization_release_count = 0
+                    if (
+                        self._wall_relocalization_release_count
+                        >= self.config.wall_relocalization_release_samples
+                    ):
+                        self._wall_relocalization_hold = False
+                        self._wall_relocalization_release_count = 0
+                        self._path = None
+                        self._path_progress_index = 0
+                        self._last_plan_time = 0.0
         self._control_wakeup.set()
         return True
 
@@ -1403,6 +1444,7 @@ class Navigation:
             self._last_motion_time = None
             self._last_tracker_command = None
             self._last_motion_plan = None
+            self._reset_terminal_recovery_tracking()
         self._safe_stop()
         self._set_state(NavigationState.IDLE, "goal loaded; call start_navigation")
 
@@ -1421,6 +1463,7 @@ class Navigation:
             self._reset_deviation_tracking()
             self._reset_arrival_tracking()
             self._reset_correction_tracking()
+            self._reset_terminal_recovery_tracking()
         self._control_wakeup.set()
 
     def pause(self) -> None:
@@ -1440,6 +1483,7 @@ class Navigation:
             self._reset_deviation_tracking()
             self._reset_arrival_tracking()
             self._reset_correction_tracking()
+            self._reset_terminal_recovery_tracking()
         self._control_wakeup.set()
 
     def cancel(self, *, reason: str = "navigation cancelled") -> None:
@@ -1458,6 +1502,7 @@ class Navigation:
             self._reset_correction_tracking()
             self._last_direction = None
             self._pending_direction = None
+            self._reset_terminal_recovery_tracking()
         self._safe_stop()
         self._set_state(NavigationState.IDLE, reason)
 
@@ -1510,6 +1555,7 @@ class Navigation:
             pose_revision = self._pose_revision
             localization_speed_scale = self._localization_speed_scale
             path_progress_index = self._path_progress_index
+            wall_relocalization_hold = self._wall_relocalization_hold
         if not active:
             return
         if paused:
@@ -1529,6 +1575,13 @@ class Navigation:
             return
         if goal is None:
             self.cancel()
+            return
+        if wall_relocalization_hold:
+            self._safe_stop()
+            self._set_state(
+                NavigationState.RELOCALIZING,
+                "stationary wall correction is converging",
+            )
             return
         if self._goal_reached(pose, goal):
             self._safe_stop()
@@ -1630,6 +1683,16 @@ class Navigation:
                 self._path_progress_index,
                 command.nearest_path_index,
             )
+        if self._terminal_path_was_passed(
+            pose,
+            path,
+            command,
+            pose_revision,
+        ):
+            if self._request_replan("goal was passed; returning to the same coordinate"):
+                return
+            self.fail_safe_stop("goal recovery retry limit exceeded")
+            return
         if self._correction_is_failing(command, pose_revision):
             self.fail_safe_stop(
                 "steering correction saturated while path/goal error worsened"
@@ -1686,9 +1749,16 @@ class Navigation:
             steering,
             command.direction,
         ):
-            self.fail_safe_stop(
-                "predicted stopping sweep intersects obstacle or field boundary"
-            )
+            if not self._current_pose_is_free(pose, grid):
+                self.fail_safe_stop(
+                    "current vehicle footprint intersects obstacle or field boundary"
+                )
+                return
+            if self._request_replan(
+                "predicted stopping sweep blocked; trying another path"
+            ):
+                return
+            self.fail_safe_stop("safe-path recovery retry limit exceeded")
             return
         try:
             motion_plan = self.drive.set_motion(
@@ -1862,6 +1932,80 @@ class Navigation:
                 >= self.config.correction_failure_samples
             )
 
+    def _terminal_path_was_passed(
+        self,
+        pose: NavigationPose,
+        path: NavigationPath,
+        command: TrackerCommand,
+        pose_revision: int,
+    ) -> bool:
+        """Confirm that the rear axle crossed beyond the requested coordinate."""
+
+        if pose_revision == self._last_terminal_overshoot_pose_revision:
+            return False
+        self._last_terminal_overshoot_pose_revision = pose_revision
+        if command.nearest_path_index < len(path.points) - 2:
+            self._terminal_overshoot_count = 0
+            return False
+        first, second = path.points[-2], path.points[-1]
+        tangent_x = second.x_cm - first.x_cm
+        tangent_y = second.y_cm - first.y_cm
+        tangent_length = math.hypot(tangent_x, tangent_y)
+        if tangent_length <= 1e-9:
+            self._terminal_overshoot_count = 0
+            return False
+        beyond_goal_cm = (
+            (pose.x_cm - path.goal.x_cm) * tangent_x
+            + (pose.y_cm - path.goal.y_cm) * tangent_y
+        ) / tangent_length
+        if beyond_goal_cm >= self.config.terminal_overshoot_margin_cm:
+            self._terminal_overshoot_count += 1
+        else:
+            self._terminal_overshoot_count = 0
+        return (
+            self._terminal_overshoot_count
+            >= self.config.terminal_overshoot_samples
+        )
+
+    def _request_replan(self, reason: str) -> bool:
+        """Stop, retain the mission goal and plan again from the latest pose."""
+
+        with self._lock:
+            if not self._active or self._goal is None:
+                return False
+            if self._recovery_replan_count >= self.config.max_recovery_replans:
+                return False
+            self._recovery_replan_count += 1
+            attempt = self._recovery_replan_count
+            self._path = None
+            self._path_progress_index = 0
+            self._last_plan_time = 0.0
+            self._last_direction = None
+            self._pending_direction = None
+            self._reset_deviation_tracking()
+            self._reset_arrival_tracking()
+            self._reset_correction_tracking()
+            self._terminal_overshoot_count = 0
+            self._last_terminal_overshoot_pose_revision = -1
+        self._safe_stop()
+        self._set_state(
+            NavigationState.PLANNING,
+            f"{reason} (recovery {attempt}/{self.config.max_recovery_replans})",
+        )
+        self._control_wakeup.set()
+        return True
+
+    def _current_pose_is_free(
+        self,
+        pose: NavigationPose,
+        grid: OccupancyGrid,
+    ) -> bool:
+        return VehicleCollisionChecker(
+            grid,
+            self.geometry,
+            safety_margin_cm=self.planner.config.safety_margin_cm,
+        ).is_pose_free(pose)
+
     def _motion_sweep_is_free(
         self,
         pose: NavigationPose,
@@ -1996,6 +2140,11 @@ class Navigation:
         self._last_correction_pose_revision = -1
         self._last_correction_cross_track_cm = None
         self._last_correction_goal_distance_cm = None
+
+    def _reset_terminal_recovery_tracking(self) -> None:
+        self._terminal_overshoot_count = 0
+        self._last_terminal_overshoot_pose_revision = -1
+        self._recovery_replan_count = 0
 
     def _set_state(self, state: NavigationState, reason: str) -> None:
         callback = None

@@ -18,6 +18,7 @@ from components.radar_driver import (  # noqa: E402
     RadarScan,
     WallFusionConfig,
     WallFusionResult,
+    WallPoseObservation,
 )
 
 
@@ -41,7 +42,7 @@ class _WallLocalizer:
     reference = object()
 
     def observe(self, _scan: RadarScan, _predicted_global_pose: Pose2D):
-        return object()
+        return WallPoseObservation(10.0, 5.0, 2.0)
 
 
 def _packet() -> RadarPacket:
@@ -65,7 +66,10 @@ class GlobalCorrectionModeTests(unittest.TestCase):
             odometry=_FixedOdometry(raw_pose),
             alignment=DroneGlobalAlignment.from_reference(Pose2D(), Pose2D(100.0, 0.0, 0.0)),
             wall_localizer=_WallLocalizer(),
-            wall_fusion_config=WallFusionConfig(update_every_scans=1),
+            wall_fusion_config=WallFusionConfig(
+                update_every_scans=1,
+                consistency_samples=1,
+            ),
             global_correction_mode=mode,
         )
 

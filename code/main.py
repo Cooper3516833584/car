@@ -55,10 +55,12 @@ from components import (
 # 自主导航巡航速度，单位 cm/s；定位调试阶段保持 10 cm/s = 0.1 m/s。
 # 允许范围为 0～100 cm/s。主程序会自动为阿克曼弯道外侧轮预留 20% 速度余量，
 # 以后只需修改这一处即可调整正常行驶速度。
-NAVIGATION_CRUISE_SPEED_CM_S = 10.0
+# Production forward cruise speed.  Curves, localization degradation and the
+# final 60 cm use lower safety-controlled speeds.
+NAVIGATION_CRUISE_SPEED_CM_S = 30.0
 # Reverse cruise speed, in cm/s.  Keep this independent from the forward
 # cruise setting so it can be tuned safely at the top of this file.
-NAVIGATION_REVERSE_SPEED_CM_S = 10.0
+NAVIGATION_REVERSE_SPEED_CM_S = 15.0
 # 自主导航倒车开关；True 允许规划倒车和前进/倒车换挡，False 只允许前进。
 NAVIGATION_ALLOW_REVERSE = True
 _MAX_NAVIGATION_CRUISE_SPEED_CM_S = 100.0
@@ -366,8 +368,11 @@ class CarMainApplication:
         pursuit_config = PurePursuitConfig(
             cruise_speed_mm_s=cruise_speed_mm_s,
             max_speed_mm_s=max(150.0, highest_command_speed_mm_s),
-            approach_speed_mm_s=min(50.0, highest_command_speed_mm_s),
+            approach_speed_mm_s=min(80.0, highest_command_speed_mm_s),
             reverse_speed_mm_s=reverse_speed_mm_s,
+            min_lookahead_cm=20.0,
+            max_lookahead_cm=50.0,
+            slowdown_distance_cm=60.0,
         )
         self.navigation = Navigation(
             config=NavigationConfig(allow_reverse=config.allow_reverse),
@@ -767,7 +772,8 @@ class CarMainApplication:
             "local_pose=(%.3f,%.3f,%.3f) global_pose=%s "
             "icp=(matched=%d,error_cm=%.4f,iterations=%d,delta=%.3f,%.3f,%.3f) "
             "wall=(attempted=%s,accepted=%s,reason=%r,"
-            "observation=%s,correction=%.3f,%.3f,%.3f) global_points=%d",
+            "observation=%s,residual=%.3f,%.3f,%.3f,"
+            "correction=%.3f,%.3f,%.3f) global_points=%d",
             phase,
             update.scan.timestamp_ms,
             len(update.scan.points),
@@ -792,6 +798,9 @@ class CarMainApplication:
             f"{observation.yaw_cw_deg};points="
             f"{observation.back_wall_points},{observation.right_wall_points};"
             f"rms={observation.back_wall_rms_cm},{observation.right_wall_rms_cm})",
+            0.0 if wall is None else wall.residual_x_cm,
+            0.0 if wall is None else wall.residual_y_cm,
+            0.0 if wall is None else wall.residual_yaw_deg,
             0.0 if wall is None else wall.correction_x_cm,
             0.0 if wall is None else wall.correction_y_cm,
             0.0 if wall is None else wall.correction_yaw_deg,

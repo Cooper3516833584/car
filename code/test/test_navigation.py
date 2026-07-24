@@ -40,6 +40,7 @@ from components.radar_driver import (  # noqa: E402
     RadarLocalizationUpdate,
     RadarOdometryUpdate,
     RadarScan,
+    WallFusionResult,
 )
 from components.rear_motor import MotorDirection  # noqa: E402
 
@@ -331,7 +332,7 @@ class PurePursuitTests(unittest.TestCase):
                     geometry.min_turn_radius_cm * 10.0,
                 )
 
-    def test_final_path_tangent_is_extended_for_stable_straight_approach(self) -> None:
+    def test_final_lookahead_stops_at_requested_coordinate(self) -> None:
         controller = PurePursuitController()
         path = NavigationPath(
             tuple(PathPoint(float(x), 0.0, 0.0) for x in range(0, 91, 10)),
@@ -347,7 +348,7 @@ class PurePursuitTests(unittest.TestCase):
         )
         command = controller.compute(NavigationPose(75.0, 1.0, 356.0), path)
 
-        self.assertEqual(target, (135.0, 0.0))
+        self.assertEqual(target, (100.0, 0.0))
         self.assertEqual(
             controller._lookahead_target(
                 path,
@@ -356,7 +357,7 @@ class PurePursuitTests(unittest.TestCase):
                 direction=MotorDirection.FORWARD,
                 lookahead_cm=60.0,
             ),
-            (150.0, 0.0),
+            (100.0, 0.0),
         )
         self.assertLess(abs(command.steering_angle_rad), 0.12)
 
@@ -685,6 +686,87 @@ class NavigationStateMachineTests(unittest.TestCase):
                 MotorDirection.FORWARD,
             )
         )
+
+    def test_terminal_overshoot_replans_without_clearing_goal(self) -> None:
+        drive = _FakeDrive()
+        drive.start()
+        navigation = Navigation(
+            drive=drive,
+            config=NavigationConfig(
+                terminal_overshoot_samples=2,
+                terminal_overshoot_margin_cm=2.0,
+            ),
+        )
+        goal = NavigationGoal(100.0, 0.0, final_heading_deg=0.0)
+        path = NavigationPath(
+            (
+                PathPoint(0.0, 0.0, 0.0),
+                PathPoint(90.0, 0.0, 0.0),
+                PathPoint(100.0, 0.0, 0.0),
+            ),
+            goal,
+            map_revision=1,
+        )
+        command = TrackerCommand(
+            50.0,
+            0.0,
+            MotorDirection.FORWARD,
+            1,
+            0.0,
+            3.0,
+        )
+        navigation._active = True
+        navigation._goal = goal
+        navigation._path = path
+
+        self.assertFalse(
+            navigation._terminal_path_was_passed(
+                NavigationPose(103.0, 0.0, 10.0),
+                path,
+                command,
+                1,
+            )
+        )
+        self.assertTrue(
+            navigation._terminal_path_was_passed(
+                NavigationPose(104.0, 0.0, 10.0),
+                path,
+                command,
+                2,
+            )
+        )
+        self.assertTrue(navigation._request_replan("unit-test overshoot"))
+        self.assertTrue(navigation.active)
+        self.assertIs(navigation._goal, goal)
+        self.assertIsNone(navigation.path)
+        self.assertEqual(navigation._recovery_replan_count, 1)
+        self.assertGreater(drive.stop_count, 0)
+
+    def test_large_wall_residual_holds_then_releases_navigation(self) -> None:
+        navigation = Navigation(drive=_FakeDrive())
+
+        def radar_update(residual_x_cm: float) -> RadarLocalizationUpdate:
+            wall = WallFusionResult(
+                True,
+                True,
+                None,
+                Pose2D(),
+                residual_x_cm=residual_x_cm,
+            )
+            return RadarLocalizationUpdate(
+                RadarScan((), 0, 0),
+                RadarOdometryUpdate(Pose2D(), True, True),
+                Pose2D(),
+                (),
+                wall,
+            )
+
+        navigation.update_from_radar(radar_update(20.0))
+        self.assertTrue(navigation._wall_relocalization_hold)
+        navigation.update_from_radar(radar_update(4.0))
+        self.assertTrue(navigation._wall_relocalization_hold)
+        navigation.update_from_radar(radar_update(4.0))
+        self.assertFalse(navigation._wall_relocalization_hold)
 
     @staticmethod
     def _radar_update(

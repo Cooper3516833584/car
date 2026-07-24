@@ -15,6 +15,7 @@ translation to both poses and map points.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 import math
@@ -875,17 +876,20 @@ class RectangleFieldCalibrator:
 
 @dataclass(frozen=True, slots=True)
 class WallFusionConfig:
-    update_every_scans: int = 5
+    update_every_scans: int = 1
     position_gain: float = 0.20
     yaw_gain: float = 0.15
     max_position_residual_cm: float = 60.0
     max_yaw_residual_deg: float = 20.0
     max_position_correction_cm: float = 2.0
     max_yaw_correction_deg: float = 0.5
+    consistency_samples: int = 3
+    max_position_spread_cm: float = 3.0
+    max_yaw_spread_deg: float = 1.5
 
     def __post_init__(self) -> None:
-        if self.update_every_scans <= 0:
-            raise ValueError("update_every_scans must be positive")
+        if self.update_every_scans <= 0 or self.consistency_samples <= 0:
+            raise ValueError("wall update and consistency sample counts must be positive")
         if not 0.0 < self.position_gain <= 1.0 or not 0.0 < self.yaw_gain <= 1.0:
             raise ValueError("wall fusion gains must be in (0, 1]")
         if min(
@@ -893,6 +897,8 @@ class WallFusionConfig:
             self.max_yaw_residual_deg,
             self.max_position_correction_cm,
             self.max_yaw_correction_deg,
+            self.max_position_spread_cm,
+            self.max_yaw_spread_deg,
         ) <= 0:
             raise ValueError("wall fusion residual gates must be positive")
 
@@ -907,6 +913,9 @@ class WallFusionResult:
     correction_x_cm: float = 0.0
     correction_y_cm: float = 0.0
     correction_yaw_deg: float = 0.0
+    residual_x_cm: float = 0.0
+    residual_y_cm: float = 0.0
+    residual_yaw_deg: float = 0.0
 
 
 def fuse_wall_observation(
@@ -933,28 +942,21 @@ def fuse_wall_observation(
             return WallFusionResult(True, False, observation, predicted_global_pose, "wall Y residual gate")
     correction_x = x_residual * config.position_gain
     correction_y = y_residual * config.position_gain
-    if math.hypot(correction_x, correction_y) > config.max_position_correction_cm:
-        return WallFusionResult(
-            True,
-            False,
-            observation,
-            predicted_global_pose,
-            "wall position correction gate",
-        )
+    correction_norm = math.hypot(correction_x, correction_y)
+    if correction_norm > config.max_position_correction_cm:
+        scale = config.max_position_correction_cm / correction_norm
+        correction_x *= scale
+        correction_y *= scale
     yaw_residual = normalize_yaw_cw_deg(
         observation.yaw_cw_deg - predicted_wall.yaw_cw_deg
     )
     if abs(yaw_residual) > config.max_yaw_residual_deg:
         return WallFusionResult(True, False, observation, predicted_global_pose, "wall yaw residual gate")
     yaw_correction = yaw_residual * config.yaw_gain
-    if abs(yaw_correction) > config.max_yaw_correction_deg:
-        return WallFusionResult(
-            True,
-            False,
-            observation,
-            predicted_global_pose,
-            "wall yaw correction gate",
-        )
+    yaw_correction = max(
+        -config.max_yaw_correction_deg,
+        min(config.max_yaw_correction_deg, yaw_correction),
+    )
     fused_wall = Pose2D(
         predicted_wall.x_cm + correction_x,
         predicted_wall.y_cm + correction_y,
@@ -968,6 +970,9 @@ def fuse_wall_observation(
         correction_x_cm=correction_x,
         correction_y_cm=correction_y,
         correction_yaw_deg=yaw_correction,
+        residual_x_cm=x_residual,
+        residual_y_cm=y_residual,
+        residual_yaw_deg=yaw_residual,
     )
 
 
@@ -1388,6 +1393,9 @@ class D500RadarComponent:
         self.global_correction_mode = global_correction_mode
         self._state_lock = threading.RLock()
         self._wall_scan_count = 0
+        self._wall_observation_history: deque[WallPoseObservation] = deque(
+            maxlen=wall_fusion_config.consistency_samples
+        )
         self.serial = D500SerialDriver(
             port=port,
             on_packet=self.process_packet,
@@ -1443,12 +1451,58 @@ class D500RadarComponent:
             )
             self.wall_fusion_config = fusion_config
             self._wall_scan_count = 0
+            self._wall_observation_history = deque(
+                maxlen=fusion_config.consistency_samples
+            )
             return self.wall_localizer
 
     def disable_wall_fusion(self) -> None:
         with self._state_lock:
             self.wall_localizer = None
             self._wall_scan_count = 0
+            self._wall_observation_history.clear()
+
+    def _wall_observation_is_consistent(
+        self,
+        observation: WallPoseObservation,
+        config: WallFusionConfig,
+    ) -> bool:
+        """Require repeated absolute observations before correcting odometry.
+
+        Rectangular rooms contain several parallel walls.  A single erroneous
+        association must therefore never move the vehicle pose.  Once the
+        absolute observations agree, large *valid* residuals are recovered by
+        the per-scan correction clamps in :func:`fuse_wall_observation`.
+        """
+
+        if observation.observed_axes == 0 or observation.yaw_cw_deg is None:
+            self._wall_observation_history.clear()
+            return False
+        signature = (observation.x_cm is not None, observation.y_cm is not None)
+        if self._wall_observation_history:
+            previous = self._wall_observation_history[-1]
+            previous_signature = (previous.x_cm is not None, previous.y_cm is not None)
+            if previous_signature != signature:
+                self._wall_observation_history.clear()
+        self._wall_observation_history.append(observation)
+        if len(self._wall_observation_history) < config.consistency_samples:
+            return False
+
+        history = tuple(self._wall_observation_history)
+        for attribute in ("x_cm", "y_cm"):
+            values = [
+                float(value)
+                for value in (getattr(item, attribute) for item in history)
+                if value is not None
+            ]
+            if values and max(values) - min(values) > config.max_position_spread_cm:
+                return False
+        reference_yaw = float(history[0].yaw_cw_deg)
+        yaw_deltas = [
+            normalize_yaw_cw_deg(float(item.yaw_cw_deg) - reference_yaw)
+            for item in history
+        ]
+        return max(yaw_deltas) - min(yaw_deltas) <= config.max_yaw_spread_deg
 
     def start(self) -> "D500RadarComponent":
         self.serial.start()
@@ -1489,12 +1543,28 @@ class D500RadarComponent:
                     if try_wall_fusion:
                         try:
                             observation = wall_localizer.observe(scan, global_pose)
-                            wall_fusion = fuse_wall_observation(
-                                global_pose,
-                                observation,
-                                wall_localizer.reference,
-                                wall_fusion_config,
-                            )
+                            with self._state_lock:
+                                consistent = self._wall_observation_is_consistent(
+                                    observation,
+                                    wall_fusion_config,
+                                )
+                                consensus_count = len(self._wall_observation_history)
+                            if consistent:
+                                wall_fusion = fuse_wall_observation(
+                                    global_pose,
+                                    observation,
+                                    wall_localizer.reference,
+                                    wall_fusion_config,
+                                )
+                            else:
+                                wall_fusion = WallFusionResult(
+                                    True,
+                                    False,
+                                    observation,
+                                    global_pose,
+                                    "wall observation consensus "
+                                    f"{consensus_count}/{wall_fusion_config.consistency_samples}",
+                                )
                         except (RadarDriverError, ValueError) as exc:
                             wall_fusion = WallFusionResult(
                                 True,

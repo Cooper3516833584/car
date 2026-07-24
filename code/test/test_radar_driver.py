@@ -326,6 +326,32 @@ class WallLineFusionTests(unittest.TestCase):
         self.assertEqual(result.fused_global_pose, predicted_global)
         self.assertIn("residual gate", result.reason)
 
+    def test_large_valid_correction_is_clamped_instead_of_rejected(self) -> None:
+        predicted_wall = Pose2D(130, 110, 18)
+        predicted_global = self.wall_to_global.pose_to_global(predicted_wall)
+        observation = WallPoseObservation(100, 80, 10, 30, 30, 1, 1)
+
+        result = fuse_wall_observation(
+            predicted_global,
+            observation,
+            self.reference,
+            WallFusionConfig(
+                position_gain=0.20,
+                yaw_gain=0.15,
+                max_position_correction_cm=2.0,
+                max_yaw_correction_deg=0.5,
+            ),
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertAlmostEqual(
+            math.hypot(result.correction_x_cm, result.correction_y_cm),
+            2.0,
+        )
+        self.assertAlmostEqual(abs(result.correction_yaw_deg), 0.5)
+        self.assertAlmostEqual(result.residual_x_cm, -30.0)
+        self.assertAlmostEqual(result.residual_y_cm, -30.0)
+
     def test_component_writes_wall_correction_back_into_odometry(self) -> None:
         true_wall_pose = Pose2D(100, 80, 15)
         predicted_wall_pose = Pose2D(108, 73, 20)
@@ -354,6 +380,7 @@ class WallLineFusionTests(unittest.TestCase):
                 yaw_gain=1.0,
                 max_position_correction_cm=20.0,
                 max_yaw_correction_deg=10.0,
+                consistency_samples=1,
             ),
         )
         dummy_packet = RadarPacket(3600, 0, 1, 0, ())
@@ -366,6 +393,44 @@ class WallLineFusionTests(unittest.TestCase):
         self.assertAlmostEqual(corrected_wall.yaw_cw_deg, true_wall_pose.yaw_cw_deg, delta=1.0)
         self.assertEqual(odometry.pose, update.odometry.pose)
         self.assertGreater(len(update.global_points_cm), 0)
+
+    def test_component_requires_repeated_consistent_wall_observations(self) -> None:
+        true_wall_pose = Pose2D(100, 80, 15)
+        predicted_wall_pose = Pose2D(108, 73, 20)
+        scan = rectangular_wall_scan(true_wall_pose)
+
+        class OneScanAssembler:
+            def feed(self, packet):
+                return [scan]
+
+        class FixedOdometry:
+            def __init__(self):
+                self.pose = predicted_wall_pose
+
+            def update(self, incoming_scan):
+                return RadarOdometryUpdate(self.pose, True, True)
+
+        component = D500RadarComponent(
+            alignment=self.wall_to_global,
+            assembler=OneScanAssembler(),
+            odometry=FixedOdometry(),
+            wall_localizer=self.localizer,
+            wall_fusion_config=WallFusionConfig(
+                update_every_scans=1,
+                consistency_samples=3,
+                max_position_correction_cm=20.0,
+                max_yaw_correction_deg=10.0,
+            ),
+        )
+        packet = RadarPacket(3600, 0, 1, 0, ())
+
+        first = component.process_packet(packet)[0]
+        second = component.process_packet(packet)[0]
+        third = component.process_packet(packet)[0]
+
+        self.assertFalse(first.wall_fusion.accepted)
+        self.assertFalse(second.wall_fusion.accepted)
+        self.assertTrue(third.wall_fusion.accepted)
 
 
 class RectangleStartupCalibrationTests(unittest.TestCase):

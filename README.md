@@ -288,12 +288,18 @@ wall_to_global = DroneGlobalAlignment.from_reference(
 radar.enable_wall_fusion(
     RectangularWallReference(wall_to_global),
     fusion_config=WallFusionConfig(
-        update_every_scans=5,  # 约每 5 个完整圆周尝试一次
+        update_every_scans=1,  # 每个完整圆周都尝试一次
         position_gain=0.20,    # 每次只修正 20% 位置残差
         yaw_gain=0.15,         # 每次只修正 15% 航向残差
+        consistency_samples=3, # 连续三次绝对观测一致后才允许回写
     ),
 )
 ```
+
+墙线修正不会因为增益计算结果超过单圈限幅而整次丢弃。绝对观测连续一致后，
+位置每圈最多修正 `2 cm`、航向每圈最多修正 `0.5°`。墙线与 ICP 的位置残差达到
+`15 cm` 时 Navigation 进入 `RELOCALIZING` 并保持停车；残差连续两次回到 `5 cm`
+以内后，保留原目标并从修正后的当前位置重新规划。
 
 每个完整圆周仍先由 ICP 推进连续位姿。到达配置周期后，墙线定位器使用 ICP 预测把
 点云转换到墙体坐标系，对后墙和右墙分别做候选距离筛选、离群点剔除和 PCA 直线拟合；
@@ -467,10 +473,19 @@ SVD-ICP 与墙线有限增益纠漂提供。
 Hybrid A* 规划倒车；前进/倒车切换仍会先停车至少 `0.25 s`。临时启动时可用
 `--no-reverse` 禁止倒车，`--allow-reverse` 可显式开启。
 
-倒车巡航速度也独立放在 `main.py` 顶部：`NAVIGATION_REVERSE_SPEED_CM_S = 10.0`，
+倒车巡航速度也独立放在 `main.py` 顶部：`NAVIGATION_REVERSE_SPEED_CM_S = 15.0`，
 单位和允许范围与前进巡航速度相同。该值是实际倒车速度上限，即使设置得低于接近目标
 速度也不会被控制器重新抬高；正式 main 的单轮限幅会按前进/倒车两者中较大的速度预留
 20% 阿克曼外侧轮余量。
+
+当前正式 main 的前进巡航速度为 `30 cm/s`。距离目标 `60 cm` 内开始分段减速，
+接近速度下限为 `8 cm/s`；倒车恢复上限为 `15 cm/s`。Pure Pursuit 的前视距离为
+`20～50 cm`，终点前视目标不会再沿末段切线延伸到目标坐标之外。
+
+如果车辆越过目标，Navigation 会连续两个雷达位姿确认越点，先停车并保留同一个
+`NavigationGoal`，然后清除旧路径、从当前位置重新规划；允许倒车时规划器可以选择
+倒车返回。预测前方轨迹被墙体或场地边界阻断、但当前车身仍处于安全位置时也采用同一
+恢复流程。单次任务最多自动恢复三次，超过次数或当前车身已经碰撞才进入 `BLOCKED`。
 
 启动阶段车辆必须保持静止。主程序先只打开 D500，收集完整圆周点云并用 RANSAC/PCA
 拟合矩形场地的四条边。拟合成功后，会把点云、矩形边界、墙线纠漂参考和后续 ICP
