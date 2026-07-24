@@ -51,6 +51,16 @@ from components import (
     load_navigation_hmac_key,
     scan_points_in_drone_global,
 )
+from components.fleet_car_node import FleetCarNode
+from components.fleet_models import (
+    AckReason as FleetAckReason,
+    AckStatus as FleetAckStatus,
+    CarFleetState,
+    CarNavigateCommand,
+    CommandResult as FleetCommandResult,
+    CoordinateFrameCommand,
+    NodeFlags as FleetNodeFlags,
+)
 
 
 # 自主导航巡航速度，单位 cm/s；定位调试阶段保持 10 cm/s = 0.1 m/s。
@@ -286,7 +296,15 @@ class MainConfig:
 class CarMainApplication:
     """Own all long-lived components and their safe startup/shutdown order."""
 
-    def __init__(self, config: MainConfig, *, hmac_key: bytes | None) -> None:
+    def __init__(
+        self,
+        config: MainConfig,
+        *,
+        hmac_key: bytes | None,
+        fleet_bus: bool = False,
+    ) -> None:
+        if fleet_bus and hmac_key is not None:
+            raise ValueError("FleetBus and legacy HMAC mode cannot run together")
         self.config = config
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -305,6 +323,8 @@ class CarMainApplication:
         self._handling_link_frame = False
         self._console_mission_active = False
         self._console_thread: threading.Thread | None = None
+        self._started_at = time.monotonic()
+        self._fleet_alignment: DroneGlobalAlignment | None = None
 
         LOG.debug(
             "application config radar_port=%s link_port=%s radar_mount=(%.2f,%.2f,%.2f) "
@@ -401,7 +421,29 @@ class CarMainApplication:
         )
         self.protocol = None
         self.link = None
-        if hmac_key is not None:
+        self.fleet_node = None
+        if fleet_bus:
+            self.link = SerialCommunicationDriver(
+                port=config.link_port,
+                on_bytes=self._on_fleet_frame,
+                on_connected=lambda: LOG.info(
+                    "FleetBus HC-14 connected on %s", config.link_port
+                ),
+                on_disconnected=lambda error: LOG.warning(
+                    "FleetBus HC-14 disconnected: %s", error
+                ),
+                on_callback_error=lambda error: LOG.error(
+                    "FleetBus HC-14 callback failed: %s", error
+                ),
+            )
+            self.fleet_node = FleetCarNode(
+                writer=self.link.write,
+                state_provider=self._fleet_state,
+                on_set_coordinate_frame=self._fleet_set_coordinate_frame,
+                on_navigate=self._fleet_navigate,
+                on_stop=self._fleet_stop,
+            )
+        elif hmac_key is not None:
             self.protocol = GroundNavigationProtocol(
                 key=hmac_key,
                 on_goal=self._on_goal_command,
@@ -507,8 +549,13 @@ class CarMainApplication:
         )
         self.radar.start()
         if self.link is not None:
+            if self.fleet_node is not None:
+                self.fleet_node.start()
             self.link.start()
-            LOG.info("HC-14 authenticated NAVIGATE_TO input enabled")
+            LOG.info(
+                "HC-14 %s command input enabled",
+                "FleetBus" if self.fleet_node is not None else "authenticated legacy",
+            )
         self._print_map_ready(calibration)
         self._start_console_if_available()
         self._stop_event.wait()
@@ -522,6 +569,8 @@ class CarMainApplication:
         with self._lock:
             self._ready = False
         try:
+            if self.fleet_node is not None:
+                self.fleet_node.close()
             if self.link is not None:
                 self.link.close()
         finally:
@@ -1098,6 +1147,162 @@ class CarMainApplication:
                 return
         self._send_frame(frame)
 
+    def _on_fleet_frame(self, frame: bytes) -> None:
+        if self.fleet_node is not None:
+            self.fleet_node.feed_frame(frame)
+
+    def _fleet_state(self) -> CarFleetState:
+        with self._lock:
+            alignment = self._fleet_alignment
+            calibration = self._calibration
+            ready = self._ready
+        pose = self.navigation.pose
+        pose_valid = (
+            pose is not None
+            and ready
+            and time.monotonic() - pose.timestamp_s
+            <= self.navigation.config.localization_timeout_s
+        )
+        x_cm = y_cm = heading_cdeg = 0
+        if pose is not None:
+            radar_pose = Pose2D(
+                pose.x_cm, pose.y_cm, (-pose.heading_deg) % 360.0
+            )
+            if alignment is not None:
+                radar_pose = alignment.pose_to_global(radar_pose)
+            x_cm = round(radar_pose.x_cm)
+            y_cm = round(radar_pose.y_cm)
+            heading_cdeg = round(((-radar_pose.yaw_cw_deg) % 360.0) * 100) % 36000
+        flags = 0
+        if pose_valid:
+            flags |= int(FleetNodeFlags.POSE_VALID)
+        if ready:
+            flags |= int(FleetNodeFlags.READY | FleetNodeFlags.MAP_READY)
+        if alignment is not None:
+            flags |= int(FleetNodeFlags.COORDINATE_FRAME_SYNCED)
+        if self.navigation.state not in (
+            NavigationState.IDLE,
+            NavigationState.ARRIVED,
+            NavigationState.FAILED,
+            NavigationState.BLOCKED,
+        ):
+            flags |= int(FleetNodeFlags.BUSY | FleetNodeFlags.ARMED_OR_MOTOR_ACTIVE)
+        corners = ()
+        if calibration is not None:
+            corners = tuple(
+                (round(x_cm), round(y_cm))
+                if alignment is None
+                else tuple(round(value) for value in alignment.point_to_global((x_cm, y_cm)))
+                for x_cm, y_cm in calibration.field_polygon_cm
+            )
+        path = self.navigation.path
+        path_points = ()
+        if path is not None:
+            local_points = tuple(
+                (round(point.x_cm), round(point.y_cm)) for point in path.points
+            )
+            path_points = (
+                local_points
+                if alignment is None
+                else tuple(
+                    tuple(round(value) for value in alignment.point_to_global(point))
+                    for point in local_points
+                )
+            )
+        states = list(NavigationState)
+        return CarFleetState(
+            flags,
+            round((time.monotonic() - self._started_at) * 1000) & 0xFFFFFFFF,
+            x_cm,
+            y_cm,
+            heading_cdeg,
+            operation_state=states.index(self.navigation.state),
+            pose_quality=3 if pose_valid else 0,
+            map_revision=self.navigation.map_revision,
+            field_corners=corners,
+            path_revision=self.navigation.map_revision,
+            path_points=path_points,
+        )
+
+    def _fleet_set_coordinate_frame(
+        self, command: CoordinateFrameCommand
+    ) -> FleetCommandResult:
+        with self._lock:
+            if not self._ready or self._calibration is None:
+                return FleetCommandResult(
+                    FleetAckStatus.REJECTED, FleetAckReason.NOT_READY
+                )
+            if self._fleet_alignment is not None:
+                return FleetCommandResult(
+                    FleetAckStatus.REJECTED,
+                    FleetAckReason.ALREADY_SYNCHRONIZED,
+                )
+            if self.navigation.state not in (
+                NavigationState.IDLE,
+                NavigationState.ARRIVED,
+                NavigationState.FAILED,
+                NavigationState.BLOCKED,
+            ):
+                return FleetCommandResult(
+                    FleetAckStatus.REJECTED, FleetAckReason.BUSY
+                )
+            self._fleet_alignment = DroneGlobalAlignment(
+                float(command.origin_x_cm),
+                float(command.origin_y_cm),
+                (-command.startup_x_heading_cdeg / 100.0) % 360.0,
+            )
+        LOG.info(
+            "FleetBus world frame synchronized origin=(%d,%d) heading_ccw=%.2f",
+            command.origin_x_cm,
+            command.origin_y_cm,
+            command.startup_x_heading_cdeg / 100.0,
+        )
+        return FleetCommandResult(FleetAckStatus.COMPLETED)
+
+    def _fleet_navigate(
+        self, command: CarNavigateCommand
+    ) -> FleetCommandResult:
+        with self._lock:
+            alignment = self._fleet_alignment
+        if alignment is None:
+            return FleetCommandResult(
+                FleetAckStatus.REJECTED, FleetAckReason.NOT_READY
+            )
+        local_x, local_y = alignment.point_to_local(
+            (float(command.x_cm), float(command.y_cm))
+        )
+        local_heading = None
+        if command.heading_cdeg is not None:
+            world_yaw_cw = (-command.heading_cdeg / 100.0) % 360.0
+            local_yaw_cw = (
+                world_yaw_cw - alignment.yaw_offset_cw_deg
+            ) % 360.0
+            local_heading = (-local_yaw_cw) % 360.0
+        try:
+            self._submit_console_goal(
+                NavigationGoal(local_x, local_y, local_heading)
+            )
+        except NavigationCommandRejected as exc:
+            reason = (
+                FleetAckReason.OUTSIDE_FIELD
+                if "场地外" in str(exc) or "boundary" in str(exc)
+                else FleetAckReason.BUSY
+            )
+            return FleetCommandResult(
+                FleetAckStatus.REJECTED, reason, str(exc)
+            )
+        except (NavigationError, ValueError) as exc:
+            return FleetCommandResult(
+                FleetAckStatus.REJECTED,
+                FleetAckReason.LOCALIZATION_INVALID,
+                str(exc),
+            )
+        return FleetCommandResult(FleetAckStatus.ACCEPTED)
+
+    def _fleet_stop(self) -> FleetCommandResult:
+        self._cancel_from_console()
+        return FleetCommandResult(FleetAckStatus.COMPLETED)
+
     def _send_frame(self, frame: bytes) -> None:
         if self.link is None:
             return
@@ -1294,6 +1499,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--radar-port", default=DEFAULT_D500_PORT)
     parser.add_argument("--link-port", default=DEFAULT_HC14_PORT)
+    parser.add_argument(
+        "--fleet-bus",
+        action="store_true",
+        help="use FleetBus V1 instead of legacy authenticated HC-14 commands",
+    )
     parser.add_argument("--radar-x-cm", type=float, default=0.0)
     parser.add_argument("--radar-y-cm", type=float, default=0.0)
     parser.add_argument("--radar-yaw-cw-deg", type=float, default=0.0)
@@ -1334,7 +1544,9 @@ def main(argv: list[str] | None = None) -> int:
     app: CarMainApplication | None = None
     try:
         key = None
-        if os.environ.get("GROUND_STATION_HMAC_KEY_HEX", "").strip():
+        if args.fleet_bus:
+            LOG.info("FleetBus mode selected; legacy HMAC protocol is disabled")
+        elif os.environ.get("GROUND_STATION_HMAC_KEY_HEX", "").strip():
             try:
                 key = load_navigation_hmac_key()
             except NavigationProtocolError as exc:
@@ -1358,7 +1570,7 @@ def main(argv: list[str] | None = None) -> int:
             allow_reverse=args.allow_reverse,
             console_enabled=not args.no_console,
         )
-        app = CarMainApplication(config, hmac_key=key)
+        app = CarMainApplication(config, hmac_key=key, fleet_bus=args.fleet_bus)
 
         def stop_handler(signum, frame) -> None:
             LOG.info("received signal %s; stopping", signum)
