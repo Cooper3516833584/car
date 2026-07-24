@@ -146,6 +146,22 @@ class HybridAStarTests(unittest.TestCase):
             all(point.direction is MotorDirection.FORWARD for point in path.points)
         )
 
+    def test_position_only_u_turn_uses_fast_analytic_connection(self) -> None:
+        goal = NavigationGoal(200.0, 0.0)
+        started = time.monotonic()
+
+        path = HybridAStarPlanner().plan(
+            NavigationPose(3.6, 4.86, 238.51, 0.0),
+            goal,
+            open_grid(),
+            allow_reverse=True,
+        )
+
+        self.assertLess(time.monotonic() - started, 1.0)
+        end = path.points[-1]
+        self.assertAlmostEqual(end.x_cm, goal.x_cm, places=3)
+        self.assertAlmostEqual(end.y_cm, goal.y_cm, places=3)
+
     def test_planner_honours_cancellation_before_search(self) -> None:
         with self.assertRaises(PlanningCancelledError):
             HybridAStarPlanner().plan(

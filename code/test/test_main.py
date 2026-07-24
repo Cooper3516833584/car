@@ -211,6 +211,17 @@ class MainCoordinatorTests(unittest.TestCase):
         self.assertFalse(grid.is_occupied(*grid.world_to_cell(50.0, 20.0)))
         self.assertTrue(grid.is_occupied(*grid.world_to_cell(80.0, 20.0)))
 
+    def test_rotated_self_return_cell_is_purged_with_grid_padding(self) -> None:
+        app = self.make_app()
+        pose = Pose2D(197.50, 193.09, -57.16)
+        self_return = (202.5, 182.5)
+        app._trusted_map.add_points((self_return, self_return))
+
+        removed = app._purge_trusted_vehicle_footprint(pose)
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(app._trusted_map.cells(), [])
+
     def test_rejected_wall_correction_scan_does_not_pollute_trusted_map(self) -> None:
         app = self.make_app()
         app._last_trusted_pose = Pose2D()

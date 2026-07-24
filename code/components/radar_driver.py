@@ -1199,6 +1199,8 @@ class RadarOdometry:
         min_step_cm: float = 2.0,
         min_step_yaw_deg: float = 1.0,
         max_lateral_innovation_cm: float = 5.0,
+        stationary_grace_s: float = 1.0,
+        stationary_rebase_rejections: int = 3,
     ) -> None:
         if min(
             max_step_cm,
@@ -1211,6 +1213,8 @@ class RadarOdometry:
             raise ValueError("radar odometry gates must be positive")
         if min_step_cm >= max_step_cm or min_step_yaw_deg >= max_step_yaw_deg:
             raise ValueError("radar odometry minimum gates must be below maximum gates")
+        if stationary_grace_s < 0 or stationary_rebase_rejections <= 0:
+            raise ValueError("invalid stationary odometry recovery configuration")
         self.mount = mount
         self.matcher = matcher or ICPScanMatcher()
         self.max_step_cm = max_step_cm
@@ -1219,23 +1223,55 @@ class RadarOdometry:
         self.min_step_cm = min_step_cm
         self.min_step_yaw_deg = min_step_yaw_deg
         self.max_lateral_innovation_cm = max_lateral_innovation_cm
+        self.stationary_grace_s = stationary_grace_s
+        self.stationary_rebase_rejections = stationary_rebase_rejections
         self.pose = Pose2D()
         self._reference: list[tuple[float, float]] | None = None
         self._vehicle_moving = True
-        self._stationary_reference_count = 0
+        self._stationary_since: float | None = None
+        self._stationary_rejection_count = 0
 
     def reset(self, pose: Pose2D = Pose2D()) -> None:
         self.pose = pose
         self._reference = None
-        self._stationary_reference_count = 0
+        self._stationary_rejection_count = 0
 
     def set_motion_state(self, moving: bool) -> None:
-        """Tell odometry whether drive output can physically move the car."""
+        """Update the drive hint without discarding physical braking coast."""
 
         moving = bool(moving)
         if moving != self._vehicle_moving:
             self._vehicle_moving = moving
-            self._stationary_reference_count = 0
+            self._stationary_since = None if moving else time.monotonic()
+            self._stationary_rejection_count = 0
+
+    def _stationary_freeze_active(self) -> bool:
+        return (
+            not self._vehicle_moving
+            and self._stationary_since is not None
+            and time.monotonic() - self._stationary_since >= self.stationary_grace_s
+        )
+
+    def _rejected_update(
+        self,
+        current: list[tuple[float, float]],
+        result: ICPResult | None,
+        reason: str,
+        *,
+        stationary_freeze: bool,
+    ) -> RadarOdometryUpdate:
+        if stationary_freeze:
+            self._stationary_rejection_count += 1
+            if (
+                self._stationary_rejection_count
+                >= self.stationary_rebase_rejections
+            ):
+                # The stopped vehicle pose must not jump, but a damaged/stale
+                # keyframe must not reject every later scan forever.
+                self._reference = current
+                self._stationary_rejection_count = 0
+                reason = f"{reason}; stationary ICP reference rebased"
+        return RadarOdometryUpdate(self.pose, False, True, result, reason)
 
     def update(self, scan: RadarScan) -> RadarOdometryUpdate:
         current = scan_points_in_body(scan, self.mount)
@@ -1245,28 +1281,42 @@ class RadarOdometry:
         try:
             result = self.matcher.match(self._reference, current)
         except (RadarDriverError, ValueError) as exc:
-            return RadarOdometryUpdate(self.pose, False, True, rejection_reason=str(exc))
+            return self._rejected_update(
+                current,
+                None,
+                str(exc),
+                stationary_freeze=self._stationary_freeze_active(),
+            )
 
         delta = result.transform_current_to_reference
+        stationary_freeze = self._stationary_freeze_active()
         if math.hypot(delta.x_cm, delta.y_cm) > self.max_step_cm:
-            return RadarOdometryUpdate(self.pose, False, True, result, "translation gate")
+            return self._rejected_update(
+                current,
+                result,
+                "translation gate",
+                stationary_freeze=stationary_freeze,
+            )
         if result.mean_error_cm > self.max_mean_error_cm:
-            return RadarOdometryUpdate(self.pose, False, True, result, "error gate")
-        if not self._vehicle_moving:
-            # Scan-to-scan ICP occasionally reports a 2-3 cm step even while
-            # the motors are stopped.  Never integrate that jitter.  Refresh
-            # the stationary keyframe only after three genuinely small,
-            # consecutive transforms so environmental noise cannot accumulate.
-            if (
-                math.hypot(delta.x_cm, delta.y_cm) < self.min_step_cm
-                and abs(delta.yaw_cw_deg) < self.min_step_yaw_deg
-            ):
-                self._stationary_reference_count += 1
-                if self._stationary_reference_count >= 3:
-                    self._reference = current
-                    self._stationary_reference_count = 0
-            else:
-                self._stationary_reference_count = 0
+            return self._rejected_update(
+                current,
+                result,
+                "error gate",
+                stationary_freeze=stationary_freeze,
+            )
+        if abs(delta.yaw_cw_deg) > self.max_step_yaw_deg:
+            return self._rejected_update(
+                current,
+                result,
+                "yaw gate",
+                stationary_freeze=stationary_freeze,
+            )
+        if stationary_freeze:
+            # Do not integrate a stopped scan, but always advance a
+            # quality-gated keyframe.  This prevents small scan noise from
+            # accumulating against one old frame until a hard gate trips.
+            self._reference = current
+            self._stationary_rejection_count = 0
             return RadarOdometryUpdate(self.pose, True, True, result)
         if (
             math.hypot(delta.x_cm, delta.y_cm) < self.min_step_cm
@@ -1275,18 +1325,15 @@ class RadarOdometry:
             # Preserve the keyframe so real low-speed motion accumulates while
             # stationary sub-centimetre ICP jitter cannot walk the pose.
             return RadarOdometryUpdate(self.pose, True, True, result)
-        if abs(delta.yaw_cw_deg) > self.max_step_yaw_deg:
-            return RadarOdometryUpdate(self.pose, False, True, result, "yaw gate")
         expected_lateral_cm = -delta.x_cm * math.tan(
             math.radians(delta.yaw_cw_deg) / 2.0
         )
         if abs(delta.y_cm - expected_lateral_cm) > self.max_lateral_innovation_cm:
-            return RadarOdometryUpdate(
-                self.pose,
-                False,
-                True,
+            return self._rejected_update(
+                current,
                 result,
                 "Ackermann lateral gate",
+                stationary_freeze=False,
             )
 
         delta_x, delta_y = rotate_cw(delta.x_cm, delta.y_cm, self.pose.yaw_cw_deg)
@@ -1295,7 +1342,7 @@ class RadarOdometry:
             self.pose.y_cm + delta_y,
             normalize_yaw_cw_deg(self.pose.yaw_cw_deg + delta.yaw_cw_deg),
         )
-        self._stationary_reference_count = 0
+        self._stationary_rejection_count = 0
         self._reference = current
         return RadarOdometryUpdate(self.pose, True, True, result)
 
@@ -1334,6 +1381,22 @@ class DroneGlobalPointMap:
                 for (ix, iy), hits in sorted(self._hits.items())
                 if hits >= min_hits
             ]
+
+    def remove_cells(self, predicate: Callable[[float, float], bool]) -> int:
+        """Remove accumulated cells selected in global centimetre coordinates."""
+
+        with self._lock:
+            selected = [
+                key
+                for key in self._hits
+                if predicate(
+                    key[0] * self.resolution_cm,
+                    key[1] * self.resolution_cm,
+                )
+            ]
+            for key in selected:
+                del self._hits[key]
+            return len(selected)
 
 
 @dataclass(frozen=True, slots=True)

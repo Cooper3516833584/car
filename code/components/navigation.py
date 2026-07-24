@@ -501,6 +501,10 @@ class HybridAStarPlanner:
             if node.cost > best_cost.get(key, math.inf) + 1e-9:
                 continue
             expansions += 1
+            if expansions % 64 == 0:
+                # Hybrid A* is CPU-bound Python.  Explicitly yield so the D500
+                # thread can publish its 10 Hz pose stream while planning.
+                time.sleep(0)
             if self._goal_reached(node, goal):
                 LOG.debug(
                     "Hybrid A* reached goal expansions=%d elapsed_s=%.3f",
@@ -508,10 +512,10 @@ class HybridAStarPlanner:
                     time.monotonic() - started,
                 )
                 return self._reconstruct(node, goal, map_revision)
-            if (
-                goal.final_heading_deg is not None
-                and (expansions == 1 or expansions % self.config.analytic_expansion_interval == 0)
-            ):
+            analytic_interval = self.config.analytic_expansion_interval * (
+                1 if goal.final_heading_deg is not None else 4
+            )
+            if expansions == 1 or expansions % analytic_interval == 0:
                 analytic_tail = self._dubins_tail(node, goal, checker)
                 if analytic_tail is not None:
                     LOG.debug(
@@ -585,24 +589,75 @@ class HybridAStarPlanner:
         steering and therefore every generated arc is realizable.
         """
 
-        if goal.final_heading_deg is None:
-            return None
         radius_cm = max(
             self.geometry.left_min_turn_radius_cm,
             self.geometry.right_min_turn_radius_cm,
         )
-        word = self._shortest_dubins_word(
-            node.x_cm,
-            node.y_cm,
-            math.radians(node.heading_deg),
-            goal.x_cm,
-            goal.y_cm,
-            math.radians(goal.final_heading_deg),
-            radius_cm,
-        )
-        if word is None:
-            return None
+        if goal.final_heading_deg is not None:
+            candidate_headings = (goal.final_heading_deg,)
+        else:
+            bearing_deg = normalize_heading_deg(
+                math.degrees(
+                    math.atan2(goal.y_cm - node.y_cm, goal.x_cm - node.x_cm)
+                )
+            )
+            # A position-only task may arrive with any heading.  Sampling the
+            # terminal heading makes open-field U-turns deterministic instead
+            # of forcing Hybrid A* to explore tens of thousands of states.
+            candidate_headings = tuple(
+                dict.fromkeys(
+                    [bearing_deg]
+                    + [float(heading) for heading in range(0, 360, 15)]
+                )
+            )
 
+        candidates: list[
+            tuple[float, float, tuple[tuple[str, float], ...]]
+        ] = []
+        for candidate_heading in candidate_headings:
+            word = self._shortest_dubins_word(
+                node.x_cm,
+                node.y_cm,
+                math.radians(node.heading_deg),
+                goal.x_cm,
+                goal.y_cm,
+                math.radians(candidate_heading),
+                radius_cm,
+            )
+            if word is not None:
+                candidates.append(
+                    (
+                        sum(length for _, length in word),
+                        candidate_heading,
+                        word,
+                    )
+                )
+
+        for _, candidate_heading, word in sorted(candidates):
+            points = self._sample_dubins_word(node, word, radius_cm, checker)
+            if not points:
+                continue
+            final = points[-1]
+            if math.hypot(final.x_cm - goal.x_cm, final.y_cm - goal.y_cm) > 1e-3:
+                continue
+            if (
+                goal.final_heading_deg is not None
+                and abs(
+                    signed_heading_error_deg(candidate_heading, final.heading_deg)
+                )
+                > 1e-3
+            ):
+                continue
+            return points
+        return None
+
+    def _sample_dubins_word(
+        self,
+        node: _SearchNode,
+        word: tuple[tuple[str, float], ...],
+        radius_cm: float,
+        checker: VehicleCollisionChecker,
+    ) -> tuple[PathPoint, ...] | None:
         x_cm = node.x_cm
         y_cm = node.y_cm
         heading_deg = node.heading_deg
@@ -635,18 +690,7 @@ class HybridAStarPlanner:
                 points.append(
                     PathPoint(x_cm, y_cm, heading_deg, MotorDirection.FORWARD)
                 )
-        if not points:
-            return None
-        final = points[-1]
-        if (
-            math.hypot(final.x_cm - goal.x_cm, final.y_cm - goal.y_cm) > 1e-3
-            or abs(
-                signed_heading_error_deg(goal.final_heading_deg, final.heading_deg)
-            )
-            > 1e-3
-        ):
-            return None
-        return tuple(points)
+        return tuple(points) if points else None
 
     @staticmethod
     def _shortest_dubins_word(

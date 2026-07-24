@@ -387,6 +387,11 @@ class CarMainApplication:
         self._navigation_safety_margin_cm = (
             self.navigation.planner.config.safety_margin_cm
         )
+        self._self_return_clearance_cm = max(
+            config.footprint_clearance_cm,
+            self._navigation_safety_margin_cm
+            + config.map_resolution_cm / math.sqrt(2.0),
+        )
         LOG.info(
             "navigation configured forward=%.1fcm/s reverse=%.1fcm/s max_wheel=%.1fcm/s allow_reverse=%s",
             NAVIGATION_CRUISE_SPEED_CM_S,
@@ -612,6 +617,7 @@ class CarMainApplication:
             update.global_points_cm,
             update.global_pose,
         )
+        purged_cells = self._purge_trusted_vehicle_footprint(update.global_pose)
         if wall_hard_rejected:
             LOG.warning(
                 "trusted map scan skipped because wall correction was rejected reason=%r",
@@ -621,11 +627,12 @@ class CarMainApplication:
             self._trusted_map.add_points(filtered_points)
         LOG.debug(
             "trusted map scan accepted raw_points=%d retained_points=%d "
-            "wall_status=%s hard_rejected=%s",
+            "wall_status=%s hard_rejected=%s purged_self_cells=%d",
             len(update.global_points_cm),
             len(filtered_points),
             "none" if wall is None else wall.status.value,
             wall_hard_rejected,
+            purged_cells,
         )
         self._refresh_trusted_grid(now=now)
 
@@ -708,24 +715,42 @@ class CarMainApplication:
     ) -> list[tuple[float, float]]:
         """Remove radar self-returns and stale hits under the physical car."""
 
+        return [
+            (point_x, point_y)
+            for point_x, point_y in points
+            if not self._point_inside_vehicle_clearance(point_x, point_y, pose)
+        ]
+
+    def _point_inside_vehicle_clearance(
+        self,
+        point_x: float,
+        point_y: float,
+        pose: Pose2D,
+    ) -> bool:
         geometry = self._vehicle_geometry
-        clearance = self.config.footprint_clearance_cm
+        clearance = self._self_return_clearance_cm
         half_length = geometry.body_length_cm / 2.0 + clearance
         half_width = geometry.body_width_cm / 2.0 + clearance
         yaw = math.radians(pose.yaw_cw_deg)
         cosine, sine = math.cos(yaw), math.sin(yaw)
-        retained: list[tuple[float, float]] = []
-        for point_x, point_y in points:
-            dx, dy = point_x - pose.x_cm, point_y - pose.y_cm
-            body_x = cosine * dx - sine * dy
-            body_y = sine * dx + cosine * dy
-            inside = (
-                abs(body_x - geometry.rear_axle_to_body_center_cm) <= half_length
-                and abs(body_y) <= half_width
+        dx, dy = point_x - pose.x_cm, point_y - pose.y_cm
+        body_x = cosine * dx - sine * dy
+        body_y = sine * dx + cosine * dy
+        return (
+            abs(body_x - geometry.rear_axle_to_body_center_cm) <= half_length
+            and abs(body_y) <= half_width
+        )
+
+    def _purge_trusted_vehicle_footprint(self, pose: Pose2D) -> int:
+        """Erase historical self-return cells while the car occupies them."""
+
+        return self._trusted_map.remove_cells(
+            lambda point_x, point_y: self._point_inside_vehicle_clearance(
+                point_x,
+                point_y,
+                pose,
             )
-            if not inside:
-                retained.append((point_x, point_y))
-        return retained
+        )
 
     def _refresh_trusted_grid(self, *, now: float | None = None, force: bool = False) -> bool:
         timestamp = time.monotonic() if now is None else now

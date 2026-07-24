@@ -196,7 +196,10 @@ class ICPTests(unittest.TestCase):
             def match(self, reference, current):
                 return ICPResult(Pose2D(2.5, 0.0, 0.0), 80, 1.0, 2)
 
-        odometry = RadarOdometry(matcher=FixedMatcher())
+        odometry = RadarOdometry(
+            matcher=FixedMatcher(),
+            stationary_grace_s=0.0,
+        )
         scan = RadarScan((RadarPoint(0, 1000, 100),), 0, 3600)
         odometry.update(scan)
         odometry.set_motion_state(False)
@@ -214,7 +217,7 @@ class ICPTests(unittest.TestCase):
             def match(self, reference, current):
                 return ICPResult(Pose2D(0.1, 0.0, 0.0), 80, 1.0, 2)
 
-        odometry = RadarOdometry(matcher=SmallMatcher())
+        odometry = RadarOdometry(matcher=SmallMatcher(), stationary_grace_s=0.0)
         first = RadarScan((RadarPoint(0, 1000, 100),), 0, 3600)
         odometry.update(first)
         initial_reference = list(odometry._reference)
@@ -227,6 +230,60 @@ class ICPTests(unittest.TestCase):
             )
 
         self.assertNotEqual(odometry._reference, initial_reference)
+
+    def test_stop_grace_integrates_braking_coast(self) -> None:
+        class FixedMatcher:
+            def match(self, reference, current):
+                return ICPResult(Pose2D(2.5, 0.0, 0.0), 80, 1.0, 2)
+
+        odometry = RadarOdometry(
+            matcher=FixedMatcher(),
+            stationary_grace_s=60.0,
+        )
+        scan = RadarScan((RadarPoint(0, 1000, 100),), 0, 3600)
+        odometry.update(scan)
+        odometry.set_motion_state(False)
+
+        coast = odometry.update(scan)
+
+        self.assertTrue(coast.accepted)
+        self.assertAlmostEqual(coast.pose.x_cm, 2.5)
+
+    def test_stationary_repeated_gate_rebases_reference_without_pose_jump(self) -> None:
+        class SequencedMatcher:
+            def __init__(self):
+                self.results = iter(
+                    (
+                        ICPResult(Pose2D(20.0, 0.0, 0.0), 80, 1.0, 2),
+                        ICPResult(Pose2D(20.0, 0.0, 0.0), 80, 1.0, 2),
+                        ICPResult(Pose2D(20.0, 0.0, 0.0), 80, 1.0, 2),
+                        ICPResult(Pose2D(0.1, 0.0, 0.0), 80, 1.0, 2),
+                    )
+                )
+
+            def match(self, reference, current):
+                return next(self.results)
+
+        odometry = RadarOdometry(
+            matcher=SequencedMatcher(),
+            stationary_grace_s=0.0,
+            stationary_rebase_rejections=3,
+        )
+        scan = RadarScan((RadarPoint(0, 1000, 100),), 0, 3600)
+        odometry.update(scan)
+        odometry.set_motion_state(False)
+
+        first = odometry.update(scan)
+        second = odometry.update(scan)
+        rebased = odometry.update(scan)
+        recovered = odometry.update(scan)
+
+        self.assertFalse(first.accepted)
+        self.assertFalse(second.accepted)
+        self.assertFalse(rebased.accepted)
+        self.assertIn("stationary ICP reference rebased", rebased.rejection_reason)
+        self.assertTrue(recovered.accepted)
+        self.assertEqual(recovered.pose, Pose2D())
 
 
 def rectangular_wall_scan(pose_in_wall: Pose2D, *, include_right: bool = True) -> RadarScan:
