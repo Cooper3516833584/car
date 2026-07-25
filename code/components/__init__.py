@@ -64,8 +64,10 @@ from .radar_driver import (
     WallLineLocalizer,
     WallPoseObservation,
     calculate_d500_crc8,
+    compose_alignment,
     fuse_wall_observation,
     normalize_yaw_cw_deg,
+    rebase_calibration_to_start_pose,
     scan_points_in_drone_global,
 )
 from .navigation import (
@@ -97,6 +99,17 @@ from .navigation import (
     normalize_heading_deg,
     radar_yaw_to_navigation_heading,
     signed_heading_error_deg,
+)
+from .trusted_navigation_map import (
+    TrustedMapIngestResult,
+    TrustedNavigationMap,
+    TrustedNavigationMapConfig,
+)
+from .coordinate_navigation import (
+    CoordinateGoalRejected,
+    CoordinateGoalRejectReason,
+    CoordinateNavigation,
+    CoordinateNavigationConfig,
 )
 
 __all__ = [
@@ -155,8 +168,10 @@ __all__ = [
     "WallLineLocalizer",
     "WallPoseObservation",
     "calculate_d500_crc8",
+    "compose_alignment",
     "fuse_wall_observation",
     "normalize_yaw_cw_deg",
+    "rebase_calibration_to_start_pose",
     "scan_points_in_drone_global",
     "DEFAULT_BODY_LENGTH_MM",
     "DEFAULT_BODY_WIDTH_MM",
@@ -186,6 +201,13 @@ __all__ = [
     "normalize_heading_deg",
     "radar_yaw_to_navigation_heading",
     "signed_heading_error_deg",
+    "TrustedMapIngestResult",
+    "TrustedNavigationMap",
+    "TrustedNavigationMapConfig",
+    "CoordinateGoalRejected",
+    "CoordinateGoalRejectReason",
+    "CoordinateNavigation",
+    "CoordinateNavigationConfig",
 ]
 
 from .navigation_protocol import (

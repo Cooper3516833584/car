@@ -348,6 +348,7 @@ class WallLineConfig:
     max_line_rms_cm: float = 3.5
     max_axis_error_deg: float = 18.0
     max_wall_angle_disagreement_deg: float = 5.0
+    rotation_adaptation: bool = True
 
     def __post_init__(self) -> None:
         if min(
@@ -398,9 +399,11 @@ class WallLineLocalizer:
     """Absolute rectangular-wall observer inspired by ``radar_resolve_rt_pose``.
 
     Unlike the former image/Hough helper, association is guided by the current
-    ICP prediction.  Robust PCA fits the known back (constant X) and right
-    (constant Y) walls and returns an observation in the wall frame.  It does
-    not update odometry by itself.
+    ICP prediction.  With rotation adaptation enabled, the predicted vehicle
+    yaw first rotates the scan into the wall frame, matching the drone driver's
+    ``rotation_adapt`` behaviour.  Robust PCA then fits the nearest known walls
+    and returns an absolute pose observation.  It does not update odometry by
+    itself.
     """
 
     def __init__(
@@ -431,7 +434,17 @@ class WallLineLocalizer:
         if len(body_points) < self.config.min_points_per_wall:
             return WallPoseObservation(None, None, None)
 
-        provisional = self._points_in_wall(body_points, predicted_wall_pose, np)
+        rotation_yaw_cw_deg = (
+            predicted_wall_pose.yaw_cw_deg
+            if self.config.rotation_adaptation
+            else 0.0
+        )
+        rotation_adapted_pose = Pose2D(
+            predicted_wall_pose.x_cm,
+            predicted_wall_pose.y_cm,
+            rotation_yaw_cw_deg,
+        )
+        provisional = self._points_in_wall(body_points, rotation_adapted_pose, np)
         x_fit = self._fit_nearest_wall(
             provisional,
             axis=0,
@@ -468,7 +481,7 @@ class WallLineLocalizer:
         total_weight = sum(weight for _, weight in angle_deltas)
         yaw_delta_ccw_deg = sum(delta * weight for delta, weight in angle_deltas) / total_weight
         observed_yaw_cw_deg = normalize_yaw_cw_deg(
-            predicted_wall_pose.yaw_cw_deg + yaw_delta_ccw_deg
+            rotation_yaw_cw_deg + yaw_delta_ccw_deg
         )
 
         # Refit after correcting yaw so wall coordinates are not biased by the
@@ -587,32 +600,89 @@ class WallLineLocalizer:
         if len(candidates) < self.config.min_points_per_wall:
             return None
 
-        median_coordinate = float(np.median(candidates[:, axis]))
-        inliers = candidates[
-            np.abs(candidates[:, axis] - median_coordinate) <= self.config.inlier_gate_cm
+        # The association band can contain several parallel structures (for
+        # example the real field wall plus a shelf edge 15--20 cm inboard).
+        # Taking one median over the whole band lets the denser interior line
+        # displace the absolute pose by exactly that amount.  Discover the
+        # separate 1-D coordinate modes first, then accept the valid line mode
+        # nearest the calibrated wall coordinate.
+        axis_values = candidates[:, axis]
+        cluster_centers: list[float] = []
+        seed_gate_cm = self.config.inlier_gate_cm * 0.5
+        neighbour_counts = (
+            np.abs(axis_values[:, None] - axis_values[None, :]) <= seed_gate_cm
+        ).sum(axis=1)
+        eligible_seeds = axis_values[
+            neighbour_counts >= self.config.min_points_per_wall
         ]
-        if len(inliers) < self.config.min_points_per_wall:
+        eligible_seeds = sorted(
+            (float(seed) for seed in eligible_seeds),
+            key=lambda seed: abs(seed - wall_coordinate),
+        )
+        for seed in eligible_seeds:
+            if any(
+                abs(seed - existing) <= self.config.inlier_gate_cm
+                for existing in cluster_centers
+            ):
+                continue
+            seed_inliers = candidates[
+                np.abs(axis_values - seed) <= seed_gate_cm
+            ]
+            center = float(np.median(seed_inliers[:, axis]))
+            cluster_centers.append(center)
+
+        fits: list[_WallFit] = []
+        for cluster_center in cluster_centers:
+            inliers = candidates[
+                np.abs(axis_values - cluster_center) <= self.config.inlier_gate_cm
+            ]
+            if len(inliers) < self.config.min_points_per_wall:
+                continue
+            median_coordinate = float(np.median(inliers[:, axis]))
+            inliers = candidates[
+                np.abs(axis_values - median_coordinate) <= self.config.inlier_gate_cm
+            ]
+            if len(inliers) < self.config.min_points_per_wall:
+                continue
+            centered = inliers - inliers.mean(axis=0)
+            _, _, vt_matrix = np.linalg.svd(centered, full_matrices=False)
+            direction = vt_matrix[0]
+            line_angle = math.degrees(
+                math.atan2(float(direction[1]), float(direction[0]))
+            )
+            axis_error = abs(
+                _line_angle_delta_deg(line_angle, expected_line_angle_deg)
+            )
+            if axis_error > self.config.max_axis_error_deg:
+                continue
+            projections = centered @ direction
+            if (
+                float(projections.max() - projections.min())
+                < self.config.min_line_span_cm
+            ):
+                continue
+            normal = np.array([-direction[1], direction[0]])
+            perpendicular = centered @ normal
+            rms = float(np.sqrt(np.mean(perpendicular**2)))
+            if rms > self.config.max_line_rms_cm:
+                continue
+            fits.append(
+                _WallFit(
+                    len(inliers),
+                    line_angle,
+                    float(np.median(inliers[:, axis])),
+                    rms,
+                )
+            )
+        if not fits:
             return None
-        centered = inliers - inliers.mean(axis=0)
-        _, _, vt_matrix = np.linalg.svd(centered, full_matrices=False)
-        direction = vt_matrix[0]
-        line_angle = math.degrees(math.atan2(float(direction[1]), float(direction[0])))
-        axis_error = abs(_line_angle_delta_deg(line_angle, expected_line_angle_deg))
-        if axis_error > self.config.max_axis_error_deg:
-            return None
-        projections = centered @ direction
-        if float(projections.max() - projections.min()) < self.config.min_line_span_cm:
-            return None
-        normal = np.array([-direction[1], direction[0]])
-        perpendicular = centered @ normal
-        rms = float(np.sqrt(np.mean(perpendicular**2)))
-        if rms > self.config.max_line_rms_cm:
-            return None
-        return _WallFit(
-            len(inliers),
-            line_angle,
-            float(np.median(inliers[:, axis])),
-            rms,
+        return min(
+            fits,
+            key=lambda fit: (
+                abs(fit.coordinate_cm - wall_coordinate),
+                fit.rms_cm,
+                -fit.points,
+            ),
         )
 
 
@@ -692,6 +762,61 @@ class RectangleFieldCalibration:
             elif sign != expected_sign:
                 return False
         return True
+
+
+def compose_alignment(
+    first: DroneGlobalAlignment,
+    second: DroneGlobalAlignment,
+) -> DroneGlobalAlignment:
+    """Compose local-to-middle ``first`` with middle-to-global ``second``."""
+
+    x_cm, y_cm = second.point_to_global(first.point_to_global((0.0, 0.0)))
+    return DroneGlobalAlignment(
+        x_cm,
+        y_cm,
+        first.yaw_offset_cw_deg + second.yaw_offset_cw_deg,
+    )
+
+
+def rebase_calibration_to_start_pose(
+    calibration: RectangleFieldCalibration,
+) -> RectangleFieldCalibration:
+    """Make the startup rear axle and vehicle heading the navigation origin."""
+
+    old_global_to_start = DroneGlobalAlignment.from_reference(
+        calibration.initial_global_pose,
+        Pose2D(),
+    )
+    local_to_start = compose_alignment(
+        calibration.local_to_global,
+        old_global_to_start,
+    )
+    wall_to_start = compose_alignment(
+        calibration.wall_reference.wall_to_global,
+        old_global_to_start,
+    )
+    corners = tuple(
+        old_global_to_start.point_to_global(point)
+        for point in calibration.field_polygon_cm
+    )
+    return RectangleFieldCalibration(
+        local_to_start,
+        RectangularWallReference(
+            wall_to_start,
+            calibration.wall_reference.back_wall_x_cm,
+            calibration.wall_reference.right_wall_y_cm,
+            calibration.wall_reference.front_wall_x_cm,
+            calibration.wall_reference.left_wall_y_cm,
+        ),
+        Pose2D(),
+        min(point[0] for point in corners),
+        max(point[0] for point in corners),
+        min(point[1] for point in corners),
+        max(point[1] for point in corners),
+        calibration.selected_edge_ccw_from_car_deg,
+        calibration.fitted_lines,
+        corners,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -908,6 +1033,43 @@ class WallFusionConfig:
     min_x_wall_points: int = 25
     min_y_wall_points: int = 25
     max_axis_rms_cm: float = 3.5
+
+    @classmethod
+    def drone_absolute(
+        cls,
+        *,
+        low_pass_ratio: float = 0.60,
+    ) -> "WallFusionConfig":
+        """Return the drone-style absolute-wall localization profile.
+
+        The drone resolves an absolute wall pose on each usable map update and
+        low-pass filters every observed axis.  The car keeps that behaviour,
+        while retaining residual and per-update correction gates so a false
+        wall association cannot command an unbounded pose jump.
+        """
+
+        if not 0.0 < low_pass_ratio <= 1.0:
+            raise ValueError("low_pass_ratio must be in (0, 1]")
+        return cls(
+            update_every_scans=1,
+            position_gain=low_pass_ratio,
+            yaw_gain=low_pass_ratio,
+            # The drone assumes an open rectangular room.  A ground car can
+            # see shelving, curbs or its own body as strong parallel lines, so
+            # never let one such line produce a double-digit-centimetre jump.
+            max_position_residual_cm=12.0,
+            max_yaw_residual_deg=8.0,
+            max_position_correction_cm=5.0,
+            max_yaw_correction_deg=2.0,
+            consistency_samples=3,
+            consistency_history_size=5,
+            consistency_max_gap_scans=5,
+            max_position_spread_cm=3.0,
+            max_yaw_spread_deg=1.5,
+            min_x_wall_points=25,
+            min_y_wall_points=25,
+            max_axis_rms_cm=3.5,
+        )
 
     def __post_init__(self) -> None:
         if (

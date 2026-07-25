@@ -1090,7 +1090,19 @@ class PurePursuitController:
             length = math.sqrt(length_sq)
             signed_error = (segment_x * offset_y - segment_y * offset_x) / length
             candidate = (distance_sq, index, ratio, projected_x, projected_y, signed_error)
-            if best is None or candidate[0] < best[0]:
+            # Consecutive segments share an endpoint.  At a forward/reverse
+            # cusp both projections therefore have exactly the same distance.
+            # Prefer the later segment on that tie so the state machine sees
+            # the requested gear change instead of following the old segment
+            # indefinitely beyond its endpoint.
+            if (
+                best is None
+                or candidate[0] < best[0] - 1e-9
+                or (
+                    abs(candidate[0] - best[0]) <= 1e-9
+                    and candidate[1] > best[1]
+                )
+            ):
                 best = candidate
         if best is None:
             raise NavigationError("navigation path contains no usable segment")
@@ -1170,6 +1182,7 @@ class NavigationConfig:
     correction_failure_min_heading_error_deg: float = 20.0
     correction_failure_worsening_cm: float = 1.0
     steering_saturation_ratio: float = 0.90
+    max_unprogressed_goal_increase_cm: float = 20.0
     safety_prediction_horizon_s: float = 0.8
     safety_prediction_step_s: float = 0.1
     terminal_overshoot_margin_cm: float = 2.0
@@ -1202,6 +1215,7 @@ class NavigationConfig:
             or self.correction_failure_min_heading_error_deg <= 0
             or self.correction_failure_worsening_cm < 0
             or not 0 < self.steering_saturation_ratio <= 1
+            or self.max_unprogressed_goal_increase_cm <= 0
         ):
             raise ValueError("invalid correction-failure configuration")
         if (
@@ -1237,6 +1251,7 @@ class Navigation:
         planner: HybridAStarPlanner | None = None,
         controller: PurePursuitController | None = None,
         max_wheel_speed_mm_s: float = 300.0,
+        allow_in_place_rotation: bool = False,
         on_state_changed: Callable[[NavigationState, str], None] | None = None,
         on_path_updated: Callable[[NavigationPath], None] | None = None,
         on_goal_reached: Callable[[NavigationGoal, NavigationPose], None] | None = None,
@@ -1256,6 +1271,7 @@ class Navigation:
             wheelbase_mm=geometry.wheelbase_cm * 10.0,
             track_width_mm=geometry.track_width_cm * 10.0,
             max_wheel_speed_mm_s=max_wheel_speed_mm_s,
+            allow_in_place_rotation=allow_in_place_rotation,
         )
         self.planner = planner or HybridAStarPlanner(geometry)
         self.controller = controller or PurePursuitController(geometry)
@@ -1290,6 +1306,9 @@ class Navigation:
         self._last_correction_pose_revision = -1
         self._last_correction_cross_track_cm: float | None = None
         self._last_correction_goal_distance_cm: float | None = None
+        self._last_progress_guard_pose_revision = -1
+        self._progress_guard_path_index = 0
+        self._progress_guard_min_goal_distance_cm: float | None = None
         self._last_direction: MotorDirection | None = None
         self._pending_direction: MotorDirection | None = None
         self._gear_change_ready_time = 0.0
@@ -1511,6 +1530,37 @@ class Navigation:
             self._reset_correction_tracking()
             self._reset_terminal_recovery_tracking()
         self._control_wakeup.set()
+
+    def navigate_to(
+        self,
+        x_cm: float,
+        y_cm: float,
+        final_heading_deg: float | None = None,
+        *,
+        position_tolerance_cm: float = 10.0,
+        heading_tolerance_deg: float = 8.0,
+    ) -> NavigationGoal:
+        """Load and start one goal expressed in the startup navigation frame.
+
+        ``+X`` is the vehicle's startup heading, ``+Y`` is to its left and the
+        optional final heading is counter-clockwise from the startup heading.
+        The method is the reusable coordinate-level entry point; localization,
+        map and component startup must already have been supplied by the caller.
+        """
+
+        with self._lock:
+            if self._active:
+                raise NavigationError("navigation already active")
+        goal = NavigationGoal(
+            x_cm,
+            y_cm,
+            final_heading_deg,
+            position_tolerance_cm,
+            heading_tolerance_deg,
+        )
+        self.set_goal(goal)
+        self.start_navigation()
+        return goal
 
     def pause(self) -> None:
         with self._lock:
@@ -1746,6 +1796,16 @@ class Navigation:
         if self._correction_is_failing(command, pose_revision):
             self.fail_safe_stop(
                 "steering correction saturated while path/goal error worsened"
+            )
+            return
+        stalled_goal_increase = self._unprogressed_goal_increase(
+            command,
+            pose_revision,
+        )
+        if stalled_goal_increase is not None:
+            self.fail_safe_stop(
+                "goal distance increased "
+                f"{stalled_goal_increase:.1f}cm without path progress"
             )
             return
         if command.cross_track_error_cm > self.controller.config.max_path_deviation_cm:
@@ -1992,6 +2052,31 @@ class Navigation:
                 >= self.config.correction_failure_samples
             )
 
+    def _unprogressed_goal_increase(
+        self,
+        command: TrackerCommand,
+        pose_revision: int,
+    ) -> float | None:
+        """Stop a stale path segment from driving persistently away from its goal."""
+
+        with self._lock:
+            if pose_revision == self._last_progress_guard_pose_revision:
+                return None
+            self._last_progress_guard_pose_revision = pose_revision
+            progress_index = self._path_progress_index
+            if progress_index != self._progress_guard_path_index:
+                self._progress_guard_path_index = progress_index
+                self._progress_guard_min_goal_distance_cm = command.distance_to_goal_cm
+                return None
+            minimum = self._progress_guard_min_goal_distance_cm
+            if minimum is None or command.distance_to_goal_cm < minimum:
+                self._progress_guard_min_goal_distance_cm = command.distance_to_goal_cm
+                return None
+            increase = command.distance_to_goal_cm - minimum
+            if increase > self.config.max_unprogressed_goal_increase_cm:
+                return increase
+            return None
+
     def _terminal_path_was_passed(
         self,
         pose: NavigationPose,
@@ -2200,6 +2285,9 @@ class Navigation:
         self._last_correction_pose_revision = -1
         self._last_correction_cross_track_cm = None
         self._last_correction_goal_distance_cm = None
+        self._last_progress_guard_pose_revision = -1
+        self._progress_guard_path_index = self._path_progress_index
+        self._progress_guard_min_goal_distance_cm = None
 
     def _reset_terminal_recovery_tracking(self) -> None:
         self._terminal_overshoot_count = 0

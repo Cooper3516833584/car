@@ -20,36 +20,25 @@ from components import (
     DEFAULT_D500_PORT,
     DEFAULT_HC14_PORT,
     AckStatus,
-    D500RadarComponent,
+    CoordinateGoalRejected,
+    CoordinateGoalRejectReason,
+    CoordinateNavigation,
+    CoordinateNavigationConfig,
     DroneGlobalAlignment,
-    DroneGlobalPointMap,
     GroundNavigationProtocol,
-    Navigation,
     NavigationCommandReceipt,
     NavigationCommandRejected,
-    NavigationConfig,
     NavigationError,
     NavigationGoal,
-    NavigationPose,
     NavigationProtocolError,
     NavigationState,
-    OccupancyGrid,
     Pose2D,
-    PurePursuitConfig,
-    PurePursuitController,
-    RadarLocalizationUpdate,
     RadarMount,
-    RadarScan,
-    RectangularWallReference,
     RectangleFieldCalibration,
-    RectangleFieldCalibrator,
     RejectReason,
     SerialCommunicationDriver,
-    WallFusionConfig,
-    WallFusionStatus,
     VehicleCollisionChecker,
     load_navigation_hmac_key,
-    scan_points_in_drone_global,
 )
 from components.fleet_car_node import FleetCarNode
 from components.fleet_models import (
@@ -74,6 +63,9 @@ NAVIGATION_CRUISE_SPEED_CM_S = 30.0
 NAVIGATION_REVERSE_SPEED_CM_S = 15.0
 # 自主导航倒车开关；True 允许规划倒车和前进/倒车换挡，False 只允许前进。
 NAVIGATION_ALLOW_REVERSE = True
+# Match the drone's default absolute-wall pose filter.  The car additionally
+# keeps wall quality, residual and maximum-jump gates in WallFusionConfig.
+RADAR_ABSOLUTE_WALL_LOW_PASS_RATIO = 0.60
 _MAX_NAVIGATION_CRUISE_SPEED_CM_S = 100.0
 _WHEEL_SPEED_HEADROOM = 1.20
 
@@ -94,7 +86,12 @@ def default_log_dir() -> Path:
 
 
 def configure_logging(log_dir: str | os.PathLike[str], console_level: str) -> Path:
-    """Install asynchronous console plus detailed rotating UTF-8 file logging."""
+    """Install detailed file logging and optional, explicitly enabled console logs.
+
+    The SSH console is also the operator command input. Keeping normal runtime
+    logging off that stream prevents asynchronous radar/control diagnostics from
+    overwriting a partially typed coordinate command.
+    """
 
     global _LOG_LISTENER
     shutdown_logging()
@@ -107,9 +104,6 @@ def configure_logging(log_dir: str | os.PathLike[str], console_level: str) -> Pa
         "%(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    console = logging.StreamHandler()
-    console.setLevel(getattr(logging, console_level))
-    console.setFormatter(formatter)
     detailed_file = RotatingFileHandler(
         log_path,
         maxBytes=LOG_MAX_BYTES,
@@ -124,12 +118,13 @@ def configure_logging(log_dir: str | os.PathLike[str], console_level: str) -> Pa
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
     root.addHandler(queued)
-    _LOG_LISTENER = QueueListener(
-        log_queue,
-        console,
-        detailed_file,
-        respect_handler_level=True,
-    )
+    handlers: list[logging.Handler] = [detailed_file]
+    if console_level != "OFF":
+        console = logging.StreamHandler()
+        console.setLevel(getattr(logging, console_level))
+        console.setFormatter(formatter)
+        handlers.insert(0, console)
+    _LOG_LISTENER = QueueListener(log_queue, *handlers, respect_handler_level=True)
     _LOG_LISTENER.start()
     logging.captureWarnings(True)
     LOG.info(
@@ -201,65 +196,6 @@ def parse_console_command(text: str) -> ConsoleCommand:
     return ConsoleCommand("navigate", NavigationGoal(x_cm, y_cm, heading))
 
 
-def _compose_alignment(
-    first: DroneGlobalAlignment,
-    second: DroneGlobalAlignment,
-) -> DroneGlobalAlignment:
-    """Compose local->middle ``first`` with middle->global ``second``."""
-
-    x_cm, y_cm = second.point_to_global(first.point_to_global((0.0, 0.0)))
-    return DroneGlobalAlignment(
-        x_cm,
-        y_cm,
-        first.yaw_offset_cw_deg + second.yaw_offset_cw_deg,
-    )
-
-
-def rebase_calibration_to_start_pose(
-    calibration: RectangleFieldCalibration,
-) -> RectangleFieldCalibration:
-    """Rebase an edge-aligned rectangle so startup rear axle/heading is 0/0/0."""
-
-    old_global_to_start = DroneGlobalAlignment.from_reference(
-        calibration.initial_global_pose,
-        Pose2D(),
-    )
-    local_to_start = _compose_alignment(
-        calibration.local_to_global,
-        old_global_to_start,
-    )
-    wall_to_start = _compose_alignment(
-        calibration.wall_reference.wall_to_global,
-        old_global_to_start,
-    )
-    corners = tuple(
-        old_global_to_start.point_to_global(point)
-        for point in calibration.field_polygon_cm
-    )
-    min_x = min(point[0] for point in corners)
-    max_x = max(point[0] for point in corners)
-    min_y = min(point[1] for point in corners)
-    max_y = max(point[1] for point in corners)
-    return RectangleFieldCalibration(
-        local_to_start,
-        RectangularWallReference(
-            wall_to_start,
-            calibration.wall_reference.back_wall_x_cm,
-            calibration.wall_reference.right_wall_y_cm,
-            calibration.wall_reference.front_wall_x_cm,
-            calibration.wall_reference.left_wall_y_cm,
-        ),
-        Pose2D(),
-        min_x,
-        max_x,
-        min_y,
-        max_y,
-        calibration.selected_edge_ccw_from_car_deg,
-        calibration.fitted_lines,
-        corners,
-    )
-
-
 @dataclass(frozen=True, slots=True)
 class MainConfig:
     radar_port: str = DEFAULT_D500_PORT
@@ -268,6 +204,7 @@ class MainConfig:
     startup_scan_count: int = 20
     calibration_timeout_s: float = 30.0
     allow_reverse: bool = NAVIGATION_ALLOW_REVERSE
+    allow_in_place_rotation: bool = False
     map_resolution_cm: float = 5.0
     map_margin_cm: float = 15.0
     map_update_interval_s: float = 0.5
@@ -276,6 +213,8 @@ class MainConfig:
     trusted_max_yaw_step_deg: float = 15.0
     trusted_max_icp_error_cm: float = 10.0
     footprint_clearance_cm: float = 2.0
+    wall_rotation_adaptation: bool = True
+    wall_low_pass_ratio: float = RADAR_ABSOLUTE_WALL_LOW_PASS_RATIO
     console_enabled: bool = True
 
     def __post_init__(self) -> None:
@@ -291,6 +230,8 @@ class MainConfig:
             self.trusted_max_icp_error_cm,
         ) <= 0 or self.footprint_clearance_cm < 0:
             raise ValueError("invalid trusted localization configuration")
+        if not 0.0 < self.wall_low_pass_ratio <= 1.0:
+            raise ValueError("wall_low_pass_ratio must be in (0, 1]")
 
 
 class CarMainApplication:
@@ -308,16 +249,7 @@ class CarMainApplication:
         self.config = config
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
-        self._scan_event = threading.Event()
-        self._startup_scans: list[RadarScan] = []
-        self._calibration: RectangleFieldCalibration | None = None
-        self._grid: OccupancyGrid | None = None
-        self._trusted_map = DroneGlobalPointMap(resolution_cm=config.map_resolution_cm)
-        self._last_trusted_pose: Pose2D | None = None
-        self._last_trusted_pose_time = 0.0
-        self._last_trusted_rejection: str | None = None
         self._ready = False
-        self._last_map_update = 0.0
         self._active_receipt: NavigationCommandReceipt | None = None
         self._post_command_acks: list[bytes] = []
         self._handling_link_frame = False
@@ -331,7 +263,8 @@ class CarMainApplication:
             "startup_scans=%d calibration_timeout_s=%.1f allow_reverse=%s "
             "map_resolution_cm=%.1f map_margin_cm=%.1f map_update_interval_s=%.1f "
             "map_min_hits=%d trusted_gates=(%.1fcm,%.1fdeg,%.1fcm_icp) "
-            "footprint_clearance_cm=%.1f console_enabled=%s hmac_enabled=%s",
+            "footprint_clearance_cm=%.1f wall_rotation_adaptation=%s "
+            "wall_low_pass_ratio=%.2f console_enabled=%s hmac_enabled=%s",
             config.radar_port,
             config.link_port,
             config.radar_mount.x_forward_cm,
@@ -348,77 +281,41 @@ class CarMainApplication:
             config.trusted_max_yaw_step_deg,
             config.trusted_max_icp_error_cm,
             config.footprint_clearance_cm,
+            config.wall_rotation_adaptation,
+            config.wall_low_pass_ratio,
             config.console_enabled,
             hmac_key is not None,
         )
-        if (
-            abs(config.radar_mount.x_forward_cm) < 1e-9
-            and abs(config.radar_mount.y_left_cm) < 1e-9
-            and abs(config.radar_mount.yaw_cw_deg) < 1e-9
-        ):
-            LOG.warning(
-                "radar mount is configured as (0,0,0); this is valid only when "
-                "the D500 measurement origin is at the rear-axle centre and its "
-                "zero angle is aligned with the vehicle front; otherwise set "
-                "--radar-x-cm/--radar-y-cm/--radar-yaw-cw-deg from measurements"
-            )
-
-        self.calibrator = RectangleFieldCalibrator(mount=config.radar_mount)
-        self.radar = D500RadarComponent(
-            port=config.radar_port,
-            mount=config.radar_mount,
-            on_update=self._on_radar_update,
-            on_connected=lambda: LOG.info("D500 connected on %s", config.radar_port),
-            on_disconnected=lambda error: LOG.warning("D500 disconnected: %s", error),
-        )
-        self.radar.set_motion_hint(False)
-        if not 0.0 < NAVIGATION_CRUISE_SPEED_CM_S <= _MAX_NAVIGATION_CRUISE_SPEED_CM_S:
-            raise ValueError(
-                "NAVIGATION_CRUISE_SPEED_CM_S must be in (0, 100] cm/s"
-            )
-        if not 0.0 < NAVIGATION_REVERSE_SPEED_CM_S <= _MAX_NAVIGATION_CRUISE_SPEED_CM_S:
-            raise ValueError(
-                "NAVIGATION_REVERSE_SPEED_CM_S must be in (0, 100] cm/s"
-            )
-        cruise_speed_mm_s = NAVIGATION_CRUISE_SPEED_CM_S * 10.0
-        reverse_speed_mm_s = NAVIGATION_REVERSE_SPEED_CM_S * 10.0
-        highest_command_speed_mm_s = max(cruise_speed_mm_s, reverse_speed_mm_s)
-        max_wheel_speed_mm_s = max(
-            300.0,
-            highest_command_speed_mm_s * _WHEEL_SPEED_HEADROOM,
-        )
-        pursuit_config = PurePursuitConfig(
-            cruise_speed_mm_s=cruise_speed_mm_s,
-            max_speed_mm_s=max(150.0, highest_command_speed_mm_s),
-            approach_speed_mm_s=min(80.0, highest_command_speed_mm_s),
-            reverse_speed_mm_s=reverse_speed_mm_s,
-            min_lookahead_cm=20.0,
-            max_lookahead_cm=50.0,
-            slowdown_distance_cm=60.0,
-        )
-        self.navigation = Navigation(
-            config=NavigationConfig(allow_reverse=config.allow_reverse),
-            controller=PurePursuitController(config=pursuit_config),
-            max_wheel_speed_mm_s=max_wheel_speed_mm_s,
+        self.coordinate_navigation = CoordinateNavigation(
+            CoordinateNavigationConfig(
+                radar_port=config.radar_port,
+                radar_mount=config.radar_mount,
+                startup_scan_count=config.startup_scan_count,
+                calibration_timeout_s=config.calibration_timeout_s,
+                allow_reverse=config.allow_reverse,
+                allow_in_place_rotation=config.allow_in_place_rotation,
+                cruise_speed_cm_s=NAVIGATION_CRUISE_SPEED_CM_S,
+                reverse_speed_cm_s=NAVIGATION_REVERSE_SPEED_CM_S,
+                max_cruise_speed_cm_s=_MAX_NAVIGATION_CRUISE_SPEED_CM_S,
+                wheel_speed_headroom=_WHEEL_SPEED_HEADROOM,
+                map_resolution_cm=config.map_resolution_cm,
+                map_margin_cm=config.map_margin_cm,
+                map_update_interval_s=config.map_update_interval_s,
+                map_min_hits=config.map_min_hits,
+                trusted_max_pose_step_cm=config.trusted_max_pose_step_cm,
+                trusted_max_yaw_step_deg=config.trusted_max_yaw_step_deg,
+                trusted_max_icp_error_cm=config.trusted_max_icp_error_cm,
+                footprint_clearance_cm=config.footprint_clearance_cm,
+                wall_rotation_adaptation=config.wall_rotation_adaptation,
+                wall_low_pass_ratio=config.wall_low_pass_ratio,
+            ),
             on_state_changed=self._on_navigation_state,
-            on_motion_changed=self.radar.set_motion_hint,
         )
-        self._vehicle_geometry = self.navigation.geometry
-        self._navigation_safety_margin_cm = (
-            self.navigation.planner.config.safety_margin_cm
-        )
-        self._self_return_clearance_cm = max(
-            config.footprint_clearance_cm,
-            self._navigation_safety_margin_cm
-            + config.map_resolution_cm / math.sqrt(2.0),
-        )
-        LOG.info(
-            "navigation configured forward=%.1fcm/s reverse=%.1fcm/s max_wheel=%.1fcm/s allow_reverse=%s",
-            NAVIGATION_CRUISE_SPEED_CM_S,
-            NAVIGATION_REVERSE_SPEED_CM_S,
-            max_wheel_speed_mm_s / 10.0,
-            config.allow_reverse,
-        )
+        # Stable public aliases retained for status/reporting and task-specific
+        # map overlays.  Navigation work itself is owned by the component.
+        self.calibrator = self.coordinate_navigation.calibrator
+        self.radar = self.coordinate_navigation.radar
+        self.trusted_map = self.coordinate_navigation.trusted_map
         self.protocol = None
         self.link = None
         self.fleet_node = None
@@ -462,6 +359,14 @@ class CarMainApplication:
         with self._lock:
             return self._ready
 
+    @property
+    def navigation(self):
+        return self.coordinate_navigation.navigation
+
+    @navigation.setter
+    def navigation(self, value) -> None:
+        self.coordinate_navigation.navigation = value
+
     def run(self) -> None:
         """Calibrate while stationary, then start navigation and command link."""
 
@@ -471,83 +376,9 @@ class CarMainApplication:
             os.getpid(),
             sys.version.split()[0],
         )
-        self.radar.start()
-        if not self.radar.serial.wait_connected(min(3.0, self.config.calibration_timeout_s)):
-            raise RuntimeError(
-                f"D500 UART {self.config.radar_port} could not be opened; "
-                "verify rk3588-uart6-m1 overlay, Pin 21 RX wiring and dialout permission"
-            )
-        fitted_calibration, scans = self._wait_for_rectangle_calibration()
-        calibration = rebase_calibration_to_start_pose(fitted_calibration)
-        LOG.debug(
-            "rectangle fitted scans=%d points=%d lines=%d edge_ccw_deg=%.3f "
-            "original_bounds=(%.2f,%.2f,%.2f,%.2f) rebased_corners=%s",
-            len(scans),
-            sum(len(scan.points) for scan in scans),
-            fitted_calibration.fitted_lines,
-            fitted_calibration.selected_edge_ccw_from_car_deg,
-            fitted_calibration.min_x_cm,
-            fitted_calibration.max_x_cm,
-            fitted_calibration.min_y_cm,
-            fitted_calibration.max_y_cm,
-            " ".join(
-                f"({x_cm:.2f},{y_cm:.2f})"
-                for x_cm, y_cm in calibration.field_polygon_cm
-            ),
-        )
-
-        # Stop the reader before changing the odometry origin and alignment.
-        self.radar.close()
-        self.radar.assembler.reset()
-        self.radar.odometry.reset(Pose2D())
-        self.radar.global_map.clear()
-        self.radar.alignment = calibration.local_to_global
-        self.radar.enable_wall_fusion(
-            calibration.wall_reference,
-            fusion_config=WallFusionConfig(),
-        )
-
-        startup_points: list[tuple[float, float]] = []
-        for scan in scans:
-            startup_points.extend(
-                scan_points_in_drone_global(
-                    scan,
-                    Pose2D(),
-                    self.config.radar_mount,
-                    calibration.local_to_global,
-                )
-            )
-        self.radar.global_map.add_points(startup_points)
-        trusted_startup_points = self._filter_vehicle_footprint_points(
-            startup_points,
-            Pose2D(),
-        )
-        self._trusted_map.clear()
-        self._trusted_map.add_points(trusted_startup_points)
-        grid = self._build_grid(trusted_startup_points, calibration)
-        self.navigation.update_pose(self._navigation_pose(0.0, 0.0, 0.0))
-        self.navigation.set_map(grid)
-        self.navigation.start()
-
+        calibration = self.coordinate_navigation.start()
         with self._lock:
-            self._calibration = calibration
-            self._grid = grid
             self._ready = True
-            self._last_map_update = time.monotonic()
-            self._last_trusted_pose = Pose2D()
-            self._last_trusted_pose_time = self._last_map_update
-            self._last_trusted_rejection = None
-
-        LOG.info(
-            "map complete: startup rear axle=(0,0)cm, startup heading=0deg, "
-            "nearest field edge=%.2fdeg CCW, bounds x=[%.1f,%.1f] y=[%.1f,%.1f]cm",
-            calibration.selected_edge_ccw_from_car_deg,
-            calibration.min_x_cm,
-            calibration.max_x_cm,
-            calibration.min_y_cm,
-            calibration.max_y_cm,
-        )
-        self.radar.start()
         if self.link is not None:
             if self.fleet_node is not None:
                 self.fleet_node.start()
@@ -562,6 +393,7 @@ class CarMainApplication:
 
     def request_stop(self) -> None:
         LOG.info("application stop requested")
+        self.coordinate_navigation.request_stop()
         self._stop_event.set()
 
     def close(self) -> None:
@@ -574,393 +406,15 @@ class CarMainApplication:
             if self.link is not None:
                 self.link.close()
         finally:
-            try:
-                self.navigation.close()
-            finally:
-                self.radar.close()
+            self.coordinate_navigation.close()
         LOG.info("application closed; hardware outputs are safe")
 
-    def _wait_for_rectangle_calibration(
-        self,
-    ) -> tuple[RectangleFieldCalibration, tuple[RadarScan, ...]]:
-        deadline = time.monotonic() + self.config.calibration_timeout_s
-        last_error = (
-            f"D500 UART {self.config.radar_port} is open but no complete scan arrived; "
-            "verify D500 TX -> Pin 21, 230400 baud, power and common ground"
-        )
-        while not self._stop_event.is_set() and time.monotonic() < deadline:
-            self._scan_event.wait(0.5)
-            self._scan_event.clear()
-            with self._lock:
-                scans = tuple(self._startup_scans[-self.config.startup_scan_count :])
-            if len(scans) < self.config.startup_scan_count:
-                continue
-            try:
-                return self.calibrator.calibrate(scans), scans
-            except (ValueError, RuntimeError) as exc:
-                message = str(exc)
-                if message != last_error:
-                    LOG.warning("rectangle calibration retry: %s", message)
-                    last_error = message
-        raise RuntimeError(f"rectangle field calibration timed out: {last_error}")
-
-    def _on_radar_update(self, update: RadarLocalizationUpdate) -> None:
-        with self._lock:
-            ready = self._ready
-        self._log_radar_update(update, phase="navigation" if ready else "calibration")
-        with self._lock:
-            if not ready:
-                self._startup_scans.append(update.scan)
-                limit = max(self.config.startup_scan_count * 2, self.config.startup_scan_count)
-                del self._startup_scans[:-limit]
-                LOG.debug(
-                    "calibration scan buffered count=%d required=%d",
-                    len(self._startup_scans),
-                    self.config.startup_scan_count,
-                )
-                self._scan_event.set()
-                return
-
-        now = time.monotonic()
-        rejection = self._trusted_localization_rejection(update)
-        if rejection is not None:
-            with self._lock:
-                self._last_trusted_rejection = rejection
-            LOG.warning(
-                "radar trusted localization rejected reason=%s; navigation pose/map not refreshed",
-                rejection,
-            )
-            if (
-                rejection.startswith("vehicle footprint outside fitted field")
-                and self.navigation.active
-            ):
-                self.navigation.fail_safe_stop(
-                    f"immediate field-boundary safety stop: {rejection}"
-                )
-            return
-
-        navigation_accepted = self.navigation.update_from_radar(update)
-        LOG.debug("radar trusted navigation pose accepted=%s", navigation_accepted)
-        if not navigation_accepted or update.global_pose is None:
-            return
-
-        with self._lock:
-            self._last_trusted_pose = update.global_pose
-            self._last_trusted_pose_time = now
-            self._last_trusted_rejection = None
-
-        wall = update.wall_fusion
-        wall_hard_rejected = (
-            wall is not None
-            and wall.attempted
-            and not wall.accepted
-            and (
-                wall.status is WallFusionStatus.HARD_REJECTED
-                or (
-                    wall.status is WallFusionStatus.NOT_ATTEMPTED
-                    and wall.reason != "no valid wall axes"
-                )
-            )
-        )
-        filtered_points = self._filter_vehicle_footprint_points(
-            update.global_points_cm,
-            update.global_pose,
-        )
-        purged_cells = self._purge_trusted_vehicle_footprint(update.global_pose)
-        if wall_hard_rejected:
-            LOG.warning(
-                "trusted map scan skipped because wall correction was rejected reason=%r",
-                wall.reason,
-            )
-        else:
-            self._trusted_map.add_points(filtered_points)
-        LOG.debug(
-            "trusted map scan accepted raw_points=%d retained_points=%d "
-            "wall_status=%s hard_rejected=%s purged_self_cells=%d",
-            len(update.global_points_cm),
-            len(filtered_points),
-            "none" if wall is None else wall.status.value,
-            wall_hard_rejected,
-            purged_cells,
-        )
-        self._refresh_trusted_grid(now=now)
-
-    def _trusted_localization_rejection(
-        self,
-        update: RadarLocalizationUpdate,
-    ) -> str | None:
-        """Return why a radar pose cannot safely update Navigation, or None."""
-
-        pose = update.global_pose
-        if pose is None:
-            return "global alignment unavailable"
-        if not update.odometry.accepted:
-            return f"odometry rejected: {update.odometry.rejection_reason or 'unknown'}"
-        if not all(math.isfinite(value) for value in (pose.x_cm, pose.y_cm, pose.yaw_cw_deg)):
-            return "non-finite global pose"
-        icp = update.odometry.icp
-        if icp is not None and (
-            not math.isfinite(icp.mean_error_cm)
-            or icp.mean_error_cm > self.config.trusted_max_icp_error_cm
-        ):
-            return f"ICP error {icp.mean_error_cm:.2f}cm exceeds trusted gate"
-
-        with self._lock:
-            calibration = self._calibration
-            previous = self._last_trusted_pose
-        if calibration is None:
-            return "field calibration unavailable"
-        outside_corners = [
-            corner
-            for corner in self._vehicle_footprint_corners(pose)
-            if not calibration.contains_point(*corner)
-        ]
-        if outside_corners:
-            return f"vehicle footprint outside fitted field at {outside_corners[0]}"
-        if previous is not None:
-            step_cm = math.hypot(pose.x_cm - previous.x_cm, pose.y_cm - previous.y_cm)
-            if step_cm > self.config.trusted_max_pose_step_cm:
-                return (
-                    f"pose translation jump {step_cm:.2f}cm exceeds "
-                    f"{self.config.trusted_max_pose_step_cm:.2f}cm"
-                )
-            yaw_step = abs(
-                (pose.yaw_cw_deg - previous.yaw_cw_deg + 180.0) % 360.0 - 180.0
-            )
-            if yaw_step > self.config.trusted_max_yaw_step_deg:
-                return (
-                    f"pose yaw jump {yaw_step:.2f}deg exceeds "
-                    f"{self.config.trusted_max_yaw_step_deg:.2f}deg"
-                )
-        return None
-
-    def _vehicle_footprint_corners(self, pose: Pose2D) -> tuple[tuple[float, float], ...]:
-        geometry = self._vehicle_geometry
-        clearance = self.config.footprint_clearance_cm
-        centre_x_body = geometry.rear_axle_to_body_center_cm
-        half_length = geometry.body_length_cm / 2.0 + clearance
-        half_width = geometry.body_width_cm / 2.0 + clearance
-        yaw = math.radians(pose.yaw_cw_deg)
-        cosine, sine = math.cos(yaw), math.sin(yaw)
-        corners: list[tuple[float, float]] = []
-        for body_x, body_y in (
-            (centre_x_body + half_length, half_width),
-            (centre_x_body + half_length, -half_width),
-            (centre_x_body - half_length, half_width),
-            (centre_x_body - half_length, -half_width),
-        ):
-            corners.append(
-                (
-                    pose.x_cm + cosine * body_x + sine * body_y,
-                    pose.y_cm - sine * body_x + cosine * body_y,
-                )
-            )
-        return tuple(corners)
-
-    def _filter_vehicle_footprint_points(
-        self,
-        points: list[tuple[float, float]] | tuple[tuple[float, float], ...],
-        pose: Pose2D,
-    ) -> list[tuple[float, float]]:
-        """Remove radar self-returns and stale hits under the physical car."""
-
-        return [
-            (point_x, point_y)
-            for point_x, point_y in points
-            if not self._point_inside_vehicle_clearance(point_x, point_y, pose)
-        ]
-
-    def _point_inside_vehicle_clearance(
-        self,
-        point_x: float,
-        point_y: float,
-        pose: Pose2D,
-    ) -> bool:
-        geometry = self._vehicle_geometry
-        clearance = self._self_return_clearance_cm
-        half_length = geometry.body_length_cm / 2.0 + clearance
-        half_width = geometry.body_width_cm / 2.0 + clearance
-        yaw = math.radians(pose.yaw_cw_deg)
-        cosine, sine = math.cos(yaw), math.sin(yaw)
-        dx, dy = point_x - pose.x_cm, point_y - pose.y_cm
-        body_x = cosine * dx - sine * dy
-        body_y = sine * dx + cosine * dy
-        return (
-            abs(body_x - geometry.rear_axle_to_body_center_cm) <= half_length
-            and abs(body_y) <= half_width
-        )
-
-    def _purge_trusted_vehicle_footprint(self, pose: Pose2D) -> int:
-        """Erase historical self-return cells while the car occupies them."""
-
-        return self._trusted_map.remove_cells(
-            lambda point_x, point_y: self._point_inside_vehicle_clearance(
-                point_x,
-                point_y,
-                pose,
-            )
-        )
-
     def _refresh_trusted_grid(self, *, now: float | None = None, force: bool = False) -> bool:
-        timestamp = time.monotonic() if now is None else now
-        with self._lock:
-            calibration = self._calibration
-            pose = self._last_trusted_pose
-            elapsed = timestamp - self._last_map_update
-        if calibration is None or pose is None:
-            return False
-        if not force and elapsed < self.config.map_update_interval_s:
-            return False
-        cells = self._trusted_map.cells(min_hits=self.config.map_min_hits)
-        points = self._filter_vehicle_footprint_points(
-            [(cell.x_cm, cell.y_cm) for cell in cells],
-            pose,
-        )
-        grid = self._build_grid(points, calibration)
-        changed = self.navigation.set_map(grid)
-        with self._lock:
-            self._grid = grid
-            self._last_map_update = timestamp
-        LOG.debug(
-            "trusted map refresh source_cells=%d retained_after_current_footprint=%d "
-            "grid_changed=%s force=%s",
-            len(cells),
-            len(points),
-            changed,
-            force,
-        )
-        return changed
+        return self.coordinate_navigation.refresh_map(now=now, force=force)
 
-    @staticmethod
-    def _log_radar_update(update: RadarLocalizationUpdate, *, phase: str) -> None:
-        odometry = update.odometry
-        local_pose = odometry.pose
-        global_pose = update.global_pose
-        icp = odometry.icp
-        wall = update.wall_fusion
-        if icp is None:
-            icp_values = (0, math.nan, 0, math.nan, math.nan, math.nan)
-        else:
-            delta = icp.transform_current_to_reference
-            icp_values = (
-                icp.matched_points,
-                icp.mean_error_cm,
-                icp.iterations,
-                delta.x_cm,
-                delta.y_cm,
-                delta.yaw_cw_deg,
-            )
-        observation = None if wall is None else wall.observation
-        LOG.debug(
-            "radar phase=%s scan_ts_ms=%d points=%d rotation_deg_s=%d "
-            "odometry_accepted=%s initialized=%s rejection=%r "
-            "local_pose=(%.3f,%.3f,%.3f) global_pose=%s "
-            "icp=(matched=%d,error_cm=%.4f,iterations=%d,delta=%.3f,%.3f,%.3f) "
-            "wall=(attempted=%s,accepted=%s,status=%s,reason=%r,"
-            "observation=%s,residual=%.3f,%.3f,%.3f,"
-            "correction=%.3f,%.3f,%.3f,"
-            "consensus=%d,%d,%d,spread=%.3f,%.3f,%.3f) global_points=%d",
-            phase,
-            update.scan.timestamp_ms,
-            len(update.scan.points),
-            update.scan.rotation_speed_deg_s,
-            odometry.accepted,
-            odometry.initialized,
-            odometry.rejection_reason,
-            local_pose.x_cm,
-            local_pose.y_cm,
-            local_pose.yaw_cw_deg,
-            "none"
-            if global_pose is None
-            else f"({global_pose.x_cm:.3f},{global_pose.y_cm:.3f},"
-            f"{global_pose.yaw_cw_deg:.3f})",
-            *icp_values,
-            False if wall is None else wall.attempted,
-            False if wall is None else wall.accepted,
-            "none" if wall is None else wall.status.value,
-            None if wall is None else wall.reason,
-            "none"
-            if observation is None
-            else f"({observation.x_cm},{observation.y_cm},"
-            f"{observation.yaw_cw_deg};points="
-            f"{observation.back_wall_points},{observation.right_wall_points};"
-            f"rms={observation.back_wall_rms_cm},{observation.right_wall_rms_cm})",
-            0.0 if wall is None else wall.residual_x_cm,
-            0.0 if wall is None else wall.residual_y_cm,
-            0.0 if wall is None else wall.residual_yaw_deg,
-            0.0 if wall is None else wall.correction_x_cm,
-            0.0 if wall is None else wall.correction_y_cm,
-            0.0 if wall is None else wall.correction_yaw_deg,
-            0 if wall is None else wall.x_consensus_samples,
-            0 if wall is None else wall.y_consensus_samples,
-            0 if wall is None else wall.yaw_consensus_samples,
-            math.inf if wall is None else wall.x_residual_spread_cm,
-            math.inf if wall is None else wall.y_residual_spread_cm,
-            math.inf if wall is None else wall.yaw_residual_spread_deg,
-            len(update.global_points_cm),
-        )
-
-    def _build_grid(
-        self,
-        obstacle_points: list[tuple[float, float]],
-        calibration: RectangleFieldCalibration,
-    ) -> OccupancyGrid:
-        resolution = self.config.map_resolution_cm
-        margin = self.config.map_margin_cm
-        origin_x = math.floor((calibration.min_x_cm - margin) / resolution) * resolution
-        origin_y = math.floor((calibration.min_y_cm - margin) / resolution) * resolution
-        max_x = math.ceil((calibration.max_x_cm + margin) / resolution) * resolution
-        max_y = math.ceil((calibration.max_y_cm + margin) / resolution) * resolution
-        width = max(1, round((max_x - origin_x) / resolution))
-        height = max(1, round((max_y - origin_y) / resolution))
-        grid = OccupancyGrid.from_obstacle_points(
-            obstacle_points,
-            resolution_cm=resolution,
-            origin_x_cm=origin_x,
-            origin_y_cm=origin_y,
-            width=width,
-            height=height,
-        )
-        # The fitted rectangle is the only area declared as known free space.
-        # Keep the margin cells for footprint collision checks, but mark every
-        # cell outside the field as occupied so a path can never route around a
-        # sparse/missed wall return.
-        cells = list(grid.cells)
-        for iy in range(height):
-            for ix in range(width):
-                x_cm, y_cm = grid.cell_center(ix, iy)
-                if not calibration.contains_point(x_cm, y_cm):
-                    cells[iy * width + ix] = 100
-        result = OccupancyGrid(
-            grid.resolution_cm,
-            grid.origin_x_cm,
-            grid.origin_y_cm,
-            grid.width,
-            grid.height,
-            tuple(cells),
-            grid.occupied_threshold,
-            grid.unknown_is_occupied,
-        )
-        LOG.debug(
-            "grid built obstacle_points=%d dimensions=%dx%d resolution_cm=%.2f "
-            "origin=(%.2f,%.2f) occupied_cells=%d",
-            len(obstacle_points),
-            width,
-            height,
-            resolution,
-            origin_x,
-            origin_y,
-            sum(value >= result.occupied_threshold for value in result.cells),
-        )
-        return result
-
-    @staticmethod
-    def _navigation_pose(
-        x_cm: float,
-        y_cm: float,
-        heading_deg: float,
-    ) -> NavigationPose:
-        return NavigationPose(x_cm, y_cm, heading_deg, time.monotonic())
+    def _install_navigation_grid(self, grid) -> bool:
+        """Task-layer hook for conservative, obstacle-only map overlays."""
+        return self.navigation.set_map(grid)
 
     def _on_link_frame(self, frame: bytes) -> None:
         if self.protocol is None:
@@ -990,24 +444,24 @@ class CarMainApplication:
         receipt: NavigationCommandReceipt,
     ) -> None:
         with self._lock:
-            if not self._ready or self._calibration is None:
-                raise NavigationCommandRejected(RejectReason.TASK_BUSY, "startup calibration incomplete")
             if self._active_receipt is not None or self._console_mission_active:
                 raise NavigationCommandRejected(RejectReason.TASK_BUSY, "navigation already active")
-            calibration = self._calibration
-        if not calibration.contains_point(goal.x_cm, goal.y_cm):
-            raise NavigationCommandRejected(RejectReason.BAD_PAYLOAD, "goal lies outside field")
-        self._refresh_trusted_grid(force=True)
-        if not self._goal_has_safe_vehicle_footprint(goal):
-            raise NavigationCommandRejected(
-                RejectReason.BAD_PAYLOAD,
-                "goal vehicle footprint intersects an obstacle or fitted field boundary",
-            )
-        with self._lock:
             self._active_receipt = receipt
         try:
-            self.navigation.set_goal(goal)
-            self.navigation.start_navigation()
+            self.coordinate_navigation.navigate(goal)
+        except CoordinateGoalRejected as exc:
+            with self._lock:
+                if self._active_receipt == receipt:
+                    self._active_receipt = None
+            reason = (
+                RejectReason.TASK_BUSY
+                if exc.reason in (
+                    CoordinateGoalRejectReason.NOT_READY,
+                    CoordinateGoalRejectReason.BUSY,
+                )
+                else RejectReason.BAD_PAYLOAD
+            )
+            raise NavigationCommandRejected(reason, str(exc)) from exc
         except BaseException:
             with self._lock:
                 if self._active_receipt == receipt:
@@ -1077,11 +531,11 @@ class CarMainApplication:
 
         pose = self.navigation.pose
         with self._lock:
-            grid = self._grid
-            calibration = self._calibration
-            trusted_pose = self._last_trusted_pose
-            trusted_time = self._last_trusted_pose_time
-            trusted_rejection = self._last_trusted_rejection
+            grid = self.trusted_map.grid
+            calibration = self.trusted_map.calibration
+            trusted_pose = self.trusted_map.last_pose
+            trusted_time = self.trusted_map.last_pose_time
+            trusted_rejection = self.trusted_map.last_rejection
         if pose is None or grid is None or calibration is None:
             LOG.error(
                 "navigation blocked diagnostics unavailable reason=%r pose=%s grid=%s calibration=%s",
@@ -1093,7 +547,7 @@ class CarMainApplication:
             return
 
         radar_pose = Pose2D(pose.x_cm, pose.y_cm, (-pose.heading_deg) % 360.0)
-        corners = self._vehicle_footprint_corners(radar_pose)
+        corners = self.trusted_map.vehicle_footprint_corners(radar_pose)
         checker = VehicleCollisionChecker(
             grid,
             self.navigation.geometry,
@@ -1136,7 +590,7 @@ class CarMainApplication:
             else f"({trusted_pose.x_cm:.2f},{trusted_pose.y_cm:.2f},{trusted_pose.yaw_cw_deg:.2f})",
             math.inf if trusted_time <= 0 else max(0.0, time.monotonic() - trusted_time),
             trusted_rejection,
-            len(self._trusted_map.cells(min_hits=self.config.map_min_hits)),
+            self.trusted_map.trusted_cell_count(),
             len(self.radar.global_map.cells(min_hits=self.config.map_min_hits)),
         )
 
@@ -1154,7 +608,7 @@ class CarMainApplication:
     def _fleet_state(self) -> CarFleetState:
         with self._lock:
             alignment = self._fleet_alignment
-            calibration = self._calibration
+            calibration = self.trusted_map.calibration
             ready = self._ready
         pose = self.navigation.pose
         pose_valid = (
@@ -1228,7 +682,7 @@ class CarMainApplication:
         self, command: CoordinateFrameCommand
     ) -> FleetCommandResult:
         with self._lock:
-            if not self._ready or self._calibration is None:
+            if not self._ready or self.trusted_map.calibration is None:
                 return FleetCommandResult(
                     FleetAckStatus.REJECTED, FleetAckReason.NOT_READY
                 )
@@ -1416,24 +870,28 @@ class CarMainApplication:
         self._submit_console_goal(command.goal)
 
     def _submit_console_goal(self, goal: NavigationGoal) -> None:
+        returning_to_start_without_heading = (
+            goal.final_heading_deg is None
+            and math.hypot(goal.x_cm, goal.y_cm) <= 1.0
+        )
         with self._lock:
-            calibration = self._calibration
-            if not self._ready or calibration is None:
-                raise NavigationCommandRejected(RejectReason.TASK_BUSY, "建图尚未完成")
             if self._console_mission_active or self._active_receipt is not None:
                 raise NavigationCommandRejected(RejectReason.TASK_BUSY, "已有任务，先输入 stop")
-            if not calibration.contains_point(goal.x_cm, goal.y_cm):
-                raise NavigationCommandRejected(RejectReason.BAD_PAYLOAD, "目标位于拟合场地外")
             self._console_mission_active = True
         try:
-            self._refresh_trusted_grid(force=True)
-            if not self._goal_has_safe_vehicle_footprint(goal):
-                raise NavigationCommandRejected(
-                    RejectReason.BAD_PAYLOAD,
-                    "goal vehicle footprint intersects an obstacle or fitted field boundary",
+            self.coordinate_navigation.navigate(goal)
+        except CoordinateGoalRejected as exc:
+            with self._lock:
+                self._console_mission_active = False
+            reason = (
+                RejectReason.TASK_BUSY
+                if exc.reason in (
+                    CoordinateGoalRejectReason.NOT_READY,
+                    CoordinateGoalRejectReason.BUSY,
                 )
-            self.navigation.set_goal(goal)
-            self.navigation.start_navigation()
+                else RejectReason.BAD_PAYLOAD
+            )
+            raise NavigationCommandRejected(reason, str(exc)) from exc
         except BaseException:
             with self._lock:
                 self._console_mission_active = False
@@ -1443,40 +901,20 @@ class CarMainApplication:
             f"已接受目标：x={goal.x_cm:.1f}cm y={goal.y_cm:.1f}cm heading={heading}；"
             "正在自主规划并使用雷达持续纠偏。"
         )
+        if returning_to_start_without_heading:
+            self._console_print(
+                "注意：0 0 不约束最终车头方向；若要回到启动位置和启动朝向，请输入 0 0 0。"
+            )
+            LOG.warning(
+                "return-to-origin goal has no final heading; planner may arrive "
+                "with any feasible vehicle orientation"
+            )
         LOG.info(
             "accepted SSH goal x=%.2f y=%.2f heading=%s",
             goal.x_cm,
             goal.y_cm,
             "none" if goal.final_heading_deg is None else f"{goal.final_heading_deg:.2f}",
         )
-
-    def _goal_has_safe_vehicle_footprint(self, goal: NavigationGoal) -> bool:
-        """Require at least one collision-free full-body pose at the goal."""
-
-        with self._lock:
-            calibration = self._calibration
-            grid = self._grid
-        if calibration is None or grid is None:
-            return False
-        checker = VehicleCollisionChecker(
-            grid,
-            self._vehicle_geometry,
-            safety_margin_cm=self._navigation_safety_margin_cm,
-        )
-        headings = (
-            (goal.final_heading_deg,)
-            if goal.final_heading_deg is not None
-            else tuple(float(value) for value in range(0, 360, 10))
-        )
-        for heading_deg in headings:
-            pose = NavigationPose(goal.x_cm, goal.y_cm, heading_deg, 0.0)
-            radar_pose = Pose2D(goal.x_cm, goal.y_cm, (-heading_deg) % 360.0)
-            if all(
-                calibration.contains_point(*corner)
-                for corner in self._vehicle_footprint_corners(radar_pose)
-            ) and checker.is_pose_free(pose):
-                return True
-        return False
 
     def _cancel_from_console(self) -> None:
         LOG.info("SSH requested navigation cancellation")
@@ -1524,7 +962,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.set_defaults(allow_reverse=NAVIGATION_ALLOW_REVERSE)
     parser.add_argument("--no-console", action="store_true", help="disable SSH terminal input")
-    parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING"), default="INFO")
+    parser.add_argument(
+        "--log-level",
+        choices=("OFF", "DEBUG", "INFO", "WARNING", "ERROR"),
+        default="OFF",
+        help=(
+            "optional SSH terminal logging; default OFF keeps coordinate input clean "
+            "(the rotating file log always records DEBUG)"
+        ),
+    )
     parser.add_argument(
         "--log-dir",
         default=None,

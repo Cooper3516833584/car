@@ -18,7 +18,7 @@ from components.radar_driver import (  # noqa: E402
     RadarScanAssembler,
     RectangleFieldCalibrator,
 )
-from main import rebase_calibration_to_start_pose  # noqa: E402
+from components import rebase_calibration_to_start_pose  # noqa: E402
 
 
 def main() -> int:

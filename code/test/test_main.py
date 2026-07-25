@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import sys
 import tempfile
-import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -28,6 +27,7 @@ from components import (  # noqa: E402
     WallFusionResult,
     WallFusionStatus,
     pack_navigation_command,
+    rebase_calibration_to_start_pose,
     unpack_authenticated_frame,
 )
 from components.radar_driver import RadarOdometryUpdate  # noqa: E402
@@ -37,11 +37,11 @@ from main import (  # noqa: E402
     NAVIGATION_ALLOW_REVERSE,
     NAVIGATION_CRUISE_SPEED_CM_S,
     NAVIGATION_REVERSE_SPEED_CM_S,
+    RADAR_ABSOLUTE_WALL_LOW_PASS_RATIO,
     build_argument_parser,
     configure_logging,
     default_log_dir,
     parse_console_command,
-    rebase_calibration_to_start_pose,
     shutdown_logging,
 )
 
@@ -110,12 +110,10 @@ class MainCoordinatorTests(unittest.TestCase):
     def make_app(self) -> CarMainApplication:
         app = CarMainApplication(MainConfig(), hmac_key=KEY)
         calibration = make_calibration()
-        app._calibration = calibration
-        app._grid = app._build_grid([], calibration)
-        app.navigation.set_map(app._grid)
-        app._last_trusted_pose = Pose2D()
-        app._last_map_update = time.monotonic()
+        grid = app.trusted_map.initialize(calibration, [], pose=Pose2D())
+        app.navigation.set_map(grid)
         app._ready = True
+        app.coordinate_navigation._ready = True
         return app
 
     @staticmethod
@@ -138,7 +136,7 @@ class MainCoordinatorTests(unittest.TestCase):
     def test_grid_marks_field_exterior_occupied(self) -> None:
         app = self.make_app()
         calibration = make_calibration()
-        grid = app._build_grid([(25.0, 25.0)], calibration)
+        grid = app.trusted_map.build_grid([(25.0, 25.0)], calibration)
 
         outside = grid.world_to_cell(-110.0, 0.0)
         inside = grid.world_to_cell(0.0, 0.0)
@@ -149,12 +147,10 @@ class MainCoordinatorTests(unittest.TestCase):
 
     def test_trusted_localization_rejects_pose_jump_and_field_exit(self) -> None:
         app = self.make_app()
-        app._last_trusted_pose = Pose2D()
-
-        jump = app._trusted_localization_rejection(
+        jump = app.trusted_map.rejection_reason(
             self.make_radar_update(Pose2D(30.0, 0.0, 0.0))
         )
-        outside = app._trusted_localization_rejection(
+        outside = app.trusted_map.rejection_reason(
             self.make_radar_update(Pose2D(195.0, 0.0, 0.0))
         )
 
@@ -163,9 +159,7 @@ class MainCoordinatorTests(unittest.TestCase):
 
     def test_trusted_localization_rejects_large_icp_error(self) -> None:
         app = self.make_app()
-        app._last_trusted_pose = Pose2D()
-
-        rejection = app._trusted_localization_rejection(
+        rejection = app.trusted_map.rejection_reason(
             self.make_radar_update(Pose2D(2.0, 0.0, 0.0), error_cm=10.1)
         )
 
@@ -173,24 +167,22 @@ class MainCoordinatorTests(unittest.TestCase):
 
     def test_rejected_pose_does_not_update_navigation_or_trusted_map(self) -> None:
         app = self.make_app()
-        app._last_trusted_pose = Pose2D()
-        app._last_map_update = time.monotonic()
         update = self.make_radar_update(
             Pose2D(30.0, 0.0, 0.0),
             points=((50.0, 20.0),),
         )
 
-        app._on_radar_update(update)
+        app.coordinate_navigation._on_radar_update(update)
 
         self.assertIsNone(app.navigation.pose)
-        self.assertEqual(app._trusted_map.cells(), [])
-        self.assertIn("translation jump", app._last_trusted_rejection or "")
+        self.assertEqual(app.trusted_map.point_map.cells(), [])
+        self.assertIn("translation jump", app.trusted_map.last_rejection or "")
 
     def test_vehicle_footprint_points_are_removed_from_map(self) -> None:
         app = self.make_app()
         pose = Pose2D(50.0, 20.0, 0.0)
 
-        retained = app._filter_vehicle_footprint_points(
+        retained = app.trusted_map.filter_vehicle_footprint_points(
             [(50.0, 20.0), (55.0, 20.0), (80.0, 20.0), (50.0, 40.0)],
             pose,
         )
@@ -200,12 +192,16 @@ class MainCoordinatorTests(unittest.TestCase):
     def test_forced_grid_refresh_clears_historical_hits_under_current_car(self) -> None:
         app = self.make_app()
         pose = Pose2D(50.0, 20.0, 0.0)
-        app._last_trusted_pose = pose
-        app._trusted_map.add_points([(50.0, 20.0), (50.0, 20.0), (80.0, 20.0), (80.0, 20.0)])
+        calibration = app.trusted_map.calibration
+        assert calibration is not None
+        app.trusted_map.initialize(calibration, [], pose=pose)
+        app.trusted_map.point_map.add_points(
+            [(50.0, 20.0), (50.0, 20.0), (80.0, 20.0), (80.0, 20.0)]
+        )
 
         app._refresh_trusted_grid(force=True)
 
-        grid = app._grid
+        grid = app.trusted_map.grid
         self.assertIsNotNone(grid)
         assert grid is not None
         self.assertFalse(grid.is_occupied(*grid.world_to_cell(50.0, 20.0)))
@@ -215,21 +211,19 @@ class MainCoordinatorTests(unittest.TestCase):
         app = self.make_app()
         pose = Pose2D(197.50, 193.09, -57.16)
         self_return = (202.5, 182.5)
-        app._trusted_map.add_points((self_return, self_return))
+        app.trusted_map.point_map.add_points((self_return, self_return))
 
-        removed = app._purge_trusted_vehicle_footprint(pose)
+        removed = app.trusted_map.purge_vehicle_footprint(pose)
 
         self.assertEqual(removed, 1)
-        self.assertEqual(app._trusted_map.cells(), [])
+        self.assertEqual(app.trusted_map.point_map.cells(), [])
 
     def test_rejected_wall_correction_scan_does_not_pollute_trusted_map(self) -> None:
         app = self.make_app()
-        app._last_trusted_pose = Pose2D()
-        app._last_map_update = time.monotonic()
         pose = Pose2D(2.0, 0.0, 0.0)
         wall = WallFusionResult(True, False, None, pose, "wall X residual gate")
 
-        app._on_radar_update(
+        app.coordinate_navigation._on_radar_update(
             self.make_radar_update(
                 pose,
                 points=((50.0, 20.0),),
@@ -238,12 +232,10 @@ class MainCoordinatorTests(unittest.TestCase):
         )
 
         self.assertEqual(app.navigation.pose.x_cm if app.navigation.pose else None, 2.0)
-        self.assertEqual(app._trusted_map.cells(), [])
+        self.assertEqual(app.trusted_map.point_map.cells(), [])
 
     def test_pending_wall_consensus_keeps_trusted_icp_map_updates(self) -> None:
         app = self.make_app()
-        app._last_trusted_pose = Pose2D()
-        app._last_map_update = time.monotonic()
         pose = Pose2D(2.0, 0.0, 0.0)
         wall = WallFusionResult(
             True,
@@ -254,7 +246,7 @@ class MainCoordinatorTests(unittest.TestCase):
             status=WallFusionStatus.PENDING,
         )
 
-        app._on_radar_update(
+        app.coordinate_navigation._on_radar_update(
             self.make_radar_update(
                 pose,
                 points=((50.0, 20.0),),
@@ -262,7 +254,7 @@ class MainCoordinatorTests(unittest.TestCase):
             )
         )
 
-        self.assertNotEqual(app._trusted_map.cells(), [])
+        self.assertNotEqual(app.trusted_map.point_map.cells(), [])
 
     def test_main_initializes_radar_as_stationary(self) -> None:
         app = self.make_app()
@@ -284,6 +276,10 @@ class MainCoordinatorTests(unittest.TestCase):
             shutdown_logging()
             self.assertEqual(log_path.name, "car-main.log")
             self.assertIn("detailed-log-probe", log_path.read_text(encoding="utf-8"))
+
+    def test_terminal_logging_is_off_by_default(self) -> None:
+        args = build_argument_parser().parse_args([])
+        self.assertEqual(args.log_level, "OFF")
 
     def test_top_level_drive_speeds_are_applied_to_navigation(self) -> None:
         app = self.make_app()
@@ -315,6 +311,15 @@ class MainCoordinatorTests(unittest.TestCase):
         self.assertTrue(parser.parse_args([]).allow_reverse)
         self.assertFalse(parser.parse_args(["--no-reverse"]).allow_reverse)
         self.assertTrue(parser.parse_args(["--allow-reverse"]).allow_reverse)
+
+    def test_drone_style_wall_localization_is_enabled_by_default(self) -> None:
+        config = MainConfig()
+
+        self.assertTrue(config.wall_rotation_adaptation)
+        self.assertAlmostEqual(
+            config.wall_low_pass_ratio,
+            RADAR_ABSOLUTE_WALL_LOW_PASS_RATIO,
+        )
 
     def test_start_frame_rebase_sets_position_and_heading_to_zero(self) -> None:
         edge_frame = DroneGlobalAlignment(0.0, 0.0, 20.0)
@@ -374,7 +379,7 @@ class MainCoordinatorTests(unittest.TestCase):
             )
         )
         app = self.make_app()
-        grid = app._build_grid([], calibration)
+        grid = app.trusted_map.build_grid([], calibration)
         outside_polygon = grid.world_to_cell(
             calibration.min_x_cm + 1.0,
             calibration.min_y_cm + 1.0,
@@ -417,9 +422,19 @@ class MainCoordinatorTests(unittest.TestCase):
         self.assertTrue(fake_navigation.started)
         self.assertTrue(app._console_mission_active)
 
+    def test_return_to_origin_without_heading_warns_about_free_orientation(self) -> None:
+        app = self.make_app()
+        app.navigation = FakeNavigation()  # type: ignore[assignment]
+        messages: list[str] = []
+        app._console_print = messages.append  # type: ignore[method-assign]
+
+        app._submit_console_goal(NavigationGoal(0.0, 0.0))
+
+        self.assertTrue(any("请输入 0 0 0" in message for message in messages))
+
     def test_arrival_accepts_next_goal_without_changing_startup_origin(self) -> None:
         app = self.make_app()
-        calibration = app._calibration
+        calibration = app.trusted_map.calibration
         fake_navigation = FakeNavigation()
         app.navigation = fake_navigation  # type: ignore[assignment]
 
@@ -427,7 +442,7 @@ class MainCoordinatorTests(unittest.TestCase):
         app._on_navigation_state(NavigationState.ARRIVED, "goal reached")
 
         self.assertFalse(app._console_mission_active)
-        self.assertIs(app._calibration, calibration)
+        self.assertIs(app.trusted_map.calibration, calibration)
         self.assertIn("origin retained", fake_navigation.cancel_reasons[-1])
 
         next_goal = NavigationGoal(120.0, 80.0, 90.0)
@@ -462,9 +477,17 @@ class MainCoordinatorTests(unittest.TestCase):
         app = self.make_app()
         app.navigation.on_state_changed = None
         app.navigation._active = True
-        app._last_trusted_pose = Pose2D(180.0, 0.0, 0.0)
+        calibration = app.trusted_map.calibration
+        assert calibration is not None
+        app.trusted_map.initialize(
+            calibration,
+            [],
+            pose=Pose2D(180.0, 0.0, 0.0),
+        )
 
-        app._on_radar_update(self.make_radar_update(Pose2D(195.0, 0.0, 0.0)))
+        app.coordinate_navigation._on_radar_update(
+            self.make_radar_update(Pose2D(195.0, 0.0, 0.0))
+        )
 
         self.assertFalse(app.navigation.active)
         self.assertIs(app.navigation.state, NavigationState.BLOCKED)

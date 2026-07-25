@@ -99,6 +99,7 @@ def wheel_speeds_to_chassis(
     max_wheel_speed_mm_s: float = 300.0,
     track_width_mm: float = DEFAULT_TRACK_WIDTH_MM,
     min_turn_radius_mm: float = DEFAULT_MIN_TURN_RADIUS_MM,
+    allow_in_place_rotation: bool = False,
 ) -> ChassisCommand:
     """Convert two rear-wheel targets to a feasible C10B Ackermann command.
 
@@ -130,12 +131,16 @@ def wheel_speeds_to_chassis(
     if math.isclose(linear, 0.0, abs_tol=1e-9):
         if math.isclose(angular_rad_s, 0.0, abs_tol=1e-9):
             return STOP_COMMAND
-        raise UnsupportedWheelCommand(
-            "the Ackermann firmware cannot rotate in place or drive the rear "
-            "wheels in opposite directions"
-        )
+        if not allow_in_place_rotation:
+            raise UnsupportedWheelCommand(
+                "in-place rear-wheel rotation is disabled; enable it only for "
+                "the front-centred adjacent-grid manoeuvre"
+            )
 
-    if not math.isclose(angular_rad_s, 0.0, abs_tol=1e-12):
+    if (
+        not math.isclose(linear, 0.0, abs_tol=1e-9)
+        and not math.isclose(angular_rad_s, 0.0, abs_tol=1e-12)
+    ):
         radius_mm = abs(linear / angular_rad_s)
         if radius_mm + 1e-9 < min_radius:
             raise UnsupportedWheelCommand(
@@ -205,6 +210,7 @@ class RearMotorDriver:
         command_timeout_s: float = 0.5,
         track_width_mm: float = DEFAULT_TRACK_WIDTH_MM,
         min_turn_radius_mm: float = DEFAULT_MIN_TURN_RADIUS_MM,
+        allow_in_place_rotation: bool = False,
         stop_frame_count: int = 5,
     ) -> None:
         self.device = device
@@ -219,6 +225,7 @@ class RearMotorDriver:
         self.min_turn_radius_mm = _finite_number(
             "min_turn_radius_mm", min_turn_radius_mm
         )
+        self.allow_in_place_rotation = bool(allow_in_place_rotation)
         if not 1.0 <= self.send_rate_hz <= 100.0:
             raise ValueError("send_rate_hz must be in [1, 100]")
         if not 0.1 <= self.command_timeout_s <= 10.0:
@@ -232,6 +239,7 @@ class RearMotorDriver:
             max_wheel_speed_mm_s=self.max_wheel_speed_mm_s,
             track_width_mm=self.track_width_mm,
             min_turn_radius_mm=self.min_turn_radius_mm,
+            allow_in_place_rotation=self.allow_in_place_rotation,
         )
         self.stop_frame_count = stop_frame_count
         self._fd: int | None = None
@@ -301,6 +309,7 @@ class RearMotorDriver:
             max_wheel_speed_mm_s=self.max_wheel_speed_mm_s,
             track_width_mm=self.track_width_mm,
             min_turn_radius_mm=self.min_turn_radius_mm,
+            allow_in_place_rotation=self.allow_in_place_rotation,
         )
         self._set_command(command)
         return command

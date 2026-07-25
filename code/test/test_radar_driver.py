@@ -352,6 +352,66 @@ class WallLineFusionTests(unittest.TestCase):
         self.assertGreaterEqual(observation.back_wall_points, 10)
         self.assertGreaterEqual(observation.right_wall_points, 10)
 
+    def test_rotation_adaptation_localizes_a_highly_rotated_car(self) -> None:
+        true_wall_pose = Pose2D(100, 80, 72)
+        predicted_wall_pose = Pose2D(106, 75, 68)
+
+        observation = self.localizer.observe(
+            rectangular_wall_scan(true_wall_pose),
+            self.wall_to_global.pose_to_global(predicted_wall_pose),
+        )
+
+        self.assertAlmostEqual(observation.x_cm, true_wall_pose.x_cm, delta=1.0)
+        self.assertAlmostEqual(observation.y_cm, true_wall_pose.y_cm, delta=1.0)
+        self.assertAlmostEqual(observation.yaw_cw_deg, true_wall_pose.yaw_cw_deg, delta=1.0)
+
+        without_adaptation = WallLineLocalizer(
+            self.reference,
+            config=WallLineConfig(
+                min_points_per_wall=10,
+                min_line_span_cm=40,
+                rotation_adaptation=False,
+            ),
+        ).observe(
+            rectangular_wall_scan(true_wall_pose),
+            self.wall_to_global.pose_to_global(predicted_wall_pose),
+        )
+        self.assertEqual(without_adaptation.observed_axes, 0)
+
+    def test_drone_absolute_profile_uses_per_scan_low_pass_correction(self) -> None:
+        config = WallFusionConfig.drone_absolute(low_pass_ratio=0.60)
+
+        self.assertEqual(config.update_every_scans, 1)
+        self.assertEqual(config.consistency_samples, 3)
+        self.assertAlmostEqual(config.position_gain, 0.60)
+        self.assertAlmostEqual(config.yaw_gain, 0.60)
+        self.assertEqual(config.max_position_residual_cm, 12.0)
+        self.assertEqual(config.max_position_correction_cm, 5.0)
+
+    def test_drone_absolute_profile_rejects_parallel_line_jump_from_real_log(self) -> None:
+        predicted_wall = Pose2D(92.0, 4.6, -32.0)
+        predicted_global = self.wall_to_global.pose_to_global(predicted_wall)
+        false_parallel_line = WallPoseObservation(
+            92.8,
+            35.1,
+            -32.1,
+            100,
+            84,
+            3.24,
+            2.67,
+        )
+
+        result = fuse_wall_observation(
+            predicted_global,
+            false_parallel_line,
+            self.reference,
+            WallFusionConfig.drone_absolute(),
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertIs(result.status, WallFusionStatus.HARD_REJECTED)
+        self.assertIn("wall Y residual gate", result.reason or "")
+
     def test_partial_back_wall_corrects_x_but_not_y(self) -> None:
         true_wall_pose = Pose2D(100, 80, 15)
         predicted_wall_pose = Pose2D(108, 73, 20)
@@ -388,6 +448,30 @@ class WallLineFusionTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(observation.x_cm, true_pose.x_cm, delta=1.0)
+        self.assertAlmostEqual(observation.y_cm, true_pose.y_cm, delta=1.0)
+        self.assertAlmostEqual(observation.yaw_cw_deg, true_pose.yaw_cw_deg, delta=1.0)
+
+    def test_real_wall_cluster_wins_over_denser_parallel_interior_line(self) -> None:
+        true_pose = Pose2D(100.0, 80.0, 0.0)
+        wall_points: list[tuple[float, float]] = []
+        wall_points.extend((0.0, float(y_cm)) for y_cm in range(0, 205, 5))
+        wall_points.extend((float(x_cm), 0.0) for x_cm in range(0, 305, 5))
+        # This is the failure shape from the vehicle log: a denser horizontal
+        # structure sits 18 cm inboard but remains inside the 45 cm wall gate.
+        wall_points.extend((float(x_cm), 18.0) for x_cm in range(0, 305, 2))
+        radar_points: list[RadarPoint] = []
+        for wall_x, wall_y in wall_points:
+            body_x = wall_x - true_pose.x_cm
+            body_y = wall_y - true_pose.y_cm
+            distance_cm = math.hypot(body_x, body_y)
+            angle_cw = math.degrees(math.atan2(-body_y, body_x)) % 360.0
+            radar_points.append(RadarPoint(angle_cw, round(distance_cm * 10), 200))
+
+        observation = self.localizer.observe(
+            RadarScan(tuple(radar_points), 0, 3600),
+            self.wall_to_global.pose_to_global(true_pose),
+        )
+
         self.assertAlmostEqual(observation.y_cm, true_pose.y_cm, delta=1.0)
         self.assertAlmostEqual(observation.yaw_cw_deg, true_pose.yaw_cw_deg, delta=1.0)
 

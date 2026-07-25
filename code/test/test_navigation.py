@@ -259,6 +259,22 @@ class PurePursuitTests(unittest.TestCase):
         self.assertIs(command.direction, MotorDirection.REVERSE)
         self.assertEqual(command.speed_mm_s, 30.0)
 
+    def test_forward_reverse_cusp_selects_later_reverse_segment(self) -> None:
+        controller = PurePursuitController()
+        path = NavigationPath(
+            (
+                PathPoint(0, 0, 0, MotorDirection.FORWARD),
+                PathPoint(10, 0, 0, MotorDirection.FORWARD),
+                PathPoint(0, 0, 0, MotorDirection.REVERSE),
+            ),
+            NavigationGoal(0, 0, final_heading_deg=0, position_tolerance_cm=1),
+        )
+
+        command = controller.compute(NavigationPose(10, 0, 0, 0), path)
+
+        self.assertEqual(command.nearest_path_index, 1)
+        self.assertIs(command.direction, MotorDirection.REVERSE)
+
     def test_speed_reduces_near_goal(self) -> None:
         controller = PurePursuitController()
         far_path = NavigationPath(
@@ -553,6 +569,37 @@ class NavigationStateMachineTests(unittest.TestCase):
         self.assertEqual(len(drive.commands), 1)
         self.assertIs(drive.commands[0][2], MotorDirection.REVERSE)
 
+    def test_forward_reverse_cusp_stops_before_changing_gear(self) -> None:
+        drive = _FakeDrive()
+        drive.start()
+        navigation = Navigation(
+            drive=drive,
+            config=NavigationConfig(gear_change_stop_s=0.25),
+        )
+        now = time.monotonic()
+        path = NavigationPath(
+            (
+                PathPoint(0, 0, 0, MotorDirection.FORWARD),
+                PathPoint(10, 0, 0, MotorDirection.FORWARD),
+                PathPoint(0, 0, 0, MotorDirection.REVERSE),
+            ),
+            NavigationGoal(0, 0, final_heading_deg=0, position_tolerance_cm=1),
+            map_revision=1,
+        )
+        navigation._active = True
+        navigation._pose = NavigationPose(10, 0, 0, now)
+        navigation._grid = open_grid()
+        navigation._map_revision = 1
+        navigation._goal = path.goal
+        navigation._path = path
+        navigation._last_direction = MotorDirection.FORWARD
+
+        navigation._control_step(now)
+
+        self.assertIs(navigation.state, NavigationState.GEAR_CHANGE)
+        self.assertEqual(drive.commands, [])
+        self.assertGreater(drive.stop_count, 0)
+
     def test_each_radar_pose_closes_lateral_steering_loop(self) -> None:
         drive = _FakeDrive()
         drive.start()
@@ -684,6 +731,30 @@ class NavigationStateMachineTests(unittest.TestCase):
         self.assertFalse(navigation.active)
         self.assertIs(navigation.state, NavigationState.BLOCKED)
         self.assertGreater(drive.stop_count, 0)
+
+    def test_goal_distance_growth_without_path_progress_triggers_guard(self) -> None:
+        navigation = Navigation(
+            drive=_FakeDrive(),
+            config=NavigationConfig(max_unprogressed_goal_increase_cm=20.0),
+        )
+
+        def command(distance: float) -> TrackerCommand:
+            return TrackerCommand(
+                100.0,
+                0.0,
+                MotorDirection.FORWARD,
+                0,
+                0.0,
+                distance,
+            )
+
+        self.assertIsNone(navigation._unprogressed_goal_increase(command(10.0), 1))
+        self.assertIsNone(navigation._unprogressed_goal_increase(command(100.0), 1))
+        self.assertIsNone(navigation._unprogressed_goal_increase(command(25.0), 2))
+        self.assertAlmostEqual(
+            navigation._unprogressed_goal_increase(command(31.0), 3),
+            21.0,
+        )
 
     def test_predicted_motion_sweep_blocks_wall_before_drive_command(self) -> None:
         drive = _FakeDrive()

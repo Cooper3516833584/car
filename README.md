@@ -7,6 +7,7 @@
 - `components/rear_motor.py`：C10B 后轮串口控制、20 Hz 刷新、超时停车。
 - `components/steering_servo.py`：ROCK 5A Pin 23 前轮转向舵机及厂家标定曲线。
 - `components/ackermann_drive.py`：统一设置车速、前轮偏航方向，并可联动后轮差速。
+- `components/trusted_navigation_map.py`：可信雷达位姿门限、车体自反射过滤和导航占据图。
 
 `main.py` 通过 `Navigation` 间接使用 `AckermannDrive`；只有维护、标定或特殊控制时才直接访问前后独立组件。
 
@@ -277,6 +278,7 @@ from components import (
     Pose2D,
     RectangularWallReference,
     WallFusionConfig,
+    WallLineConfig,
 )
 
 # 示例：后墙/右墙交点在无人机全局 (300, -200) cm，场地 +X 相对
@@ -287,27 +289,29 @@ wall_to_global = DroneGlobalAlignment.from_reference(
 )
 radar.enable_wall_fusion(
     RectangularWallReference(wall_to_global),
-    fusion_config=WallFusionConfig(
-        update_every_scans=1,  # 每个完整圆周都尝试一次
-        position_gain=0.20,    # 每次只修正 20% 位置残差
-        yaw_gain=0.15,         # 每次只修正 15% 航向残差
-        consistency_samples=3, # 连续三次“墙线观测-ICP预测”残差一致后才允许回写
-    ),
+    # 先用预测车身航向把点云旋转回墙体坐标系，允许小车在转弯中定位。
+    line_config=WallLineConfig(rotation_adaptation=True),
+    # 复用无人机每圈绝对墙线解算 + 0.60 低通融合的核心逻辑。
+    fusion_config=WallFusionConfig.drone_absolute(low_pass_ratio=0.60),
 )
 ```
 
-墙线修正不会因为增益计算结果超过单圈限幅而整次丢弃。组件不会直接比较车辆运动时
-连续变化的绝对墙线坐标，而是比较“墙线绝对观测 - 同圈 ICP 预测”的残差；残差连续
-一致后，位置每圈最多修正 `2 cm`、航向每圈最多修正 `0.5°`。墙线与 ICP 的位置残差达到
-`15 cm` 时 Navigation 进入 `RELOCALIZING` 并保持停车；残差连续两次回到 `5 cm`
-以内后，保留原目标并从修正后的当前位置重新规划。
+正式 `main.py` 默认使用上述无人机式绝对定位模式。每个有效完整圆周独立解算可见墙体
+对应的绝对 X/Y 和车身航向，再以 `0.60` 低通比例回写；未观测到的轴继续沿用 ICP。
+为适配会转弯的小车，定位器先使用 ICP 预测航向旋转点云，再从墙线剩余角度求航向修正。
+它仍保留车端安全门限：连续三圈残差一致后才允许融合，位置/航向残差分别不得超过
+`12 cm/8°`，单圈修正不得超过 `5 cm/2°`。这些门限用于拒绝货架、路沿或车体反射形成
+的平行假墙，避免单圈十几厘米的错误回写。墙线与 ICP 的二维位置残差达到 `15 cm` 时
+Navigation 进入 `RELOCALIZING` 并保持停车；残差连续两次回到 `5 cm` 以内后，保留原
+目标并从修正后的当前位置重新规划。
 
 每个完整圆周仍先由 ICP 推进连续位姿。到达配置周期后，墙线定位器使用 ICP 预测把
 点云转换到墙体坐标系，对后墙和右墙分别做候选距离筛选、离群点剔除和 PCA 直线拟合；
+同一 `45 cm` 关联带内存在多条平行结构时，先按轴向坐标分簇，再选择离已标定墙坐标
+最近且通过质量门限的线簇，禁止让点数更多的货架或路沿用整体中位数顶替真实外墙。
 直线必须满足最少 `25` 点、长度、`3.5 cm` RMS、轴向角和两墙正交一致性门限。X、Y
-和航向分别维护独立残差窗口：某一面墙暂时被遮挡或质量不足时，只暂停对应轴，不会
-清空另一轴已经形成的共识。通过质量检查后，
-墙距/航向还必须通过相对 ICP 预测的最大位置和航向残差门限，才按有限增益回写
+和航向分别独立处理：某一面墙暂时被遮挡或质量不足时，只暂停对应轴。通过质量检查后，
+墙距/航向还必须通过相对 ICP 预测的最大位置和航向残差门限，才按低通增益回写
 `RadarOdometry.pose`。纠正后的同一位姿用于全局点云建图和 Navigation，避免定位与
 地图使用两套姿态。
 
@@ -415,7 +419,6 @@ navigation_heading_deg = (-radar_yaw_cw_deg) % 360
 from components import (
     Navigation,
     NavigationConfig,
-    NavigationGoal,
     OccupancyGrid,
 )
 
@@ -429,21 +432,17 @@ navigation.start()
 navigation.set_map(occupancy_grid)
 radar.on_update = navigation.update_from_radar
 
-# 只要求抵达坐标附近。
-navigation.set_goal(NavigationGoal(x_cm=500, y_cm=240))
-navigation.start_navigation()
+# 只要求抵达坐标附近。坐标相对本次启动原点，+X 向启动车头，+Y 向左。
+navigation.navigate_to(500, 240)
 
-# 或要求抵达后车头约为逆时针 90°。
-navigation.set_goal(
-    NavigationGoal(
-        x_cm=500,
-        y_cm=240,
-        final_heading_deg=90,
-        position_tolerance_cm=15,
-        heading_tolerance_deg=8,
-    )
+# 或要求抵达后车头相对启动车头逆时针 90°。
+navigation.navigate_to(
+    500,
+    240,
+    90,
+    position_tolerance_cm=15,
+    heading_tolerance_deg=8,
 )
-navigation.start_navigation()
 ```
 
 倒车默认关闭。`NavigationConfig(allow_reverse=True)` 开启后，Hybrid A* 才会生成
@@ -458,7 +457,8 @@ navigation.start_navigation()
 `OccupancyGrid.from_obstacle_points()` 会把给定边界内所有非击中单元当成自由空间，
 只适用于调用方明确确认整个边界为已知空间；不能仅凭雷达“没有击中”就推断自由。
 
-安全行为：设置目标后还必须显式调用 `start_navigation()`；定位超过 `0.5 s` 未更新、
+底层仍保留 `set_goal()` + `start_navigation()` 两阶段接口，供需要“加载但暂不发车”的
+任务控制器使用；普通坐标调用使用 `navigate_to()` 一次完成。定位超过 `0.5 s` 未更新、
 没有地图、无可行路径、已确认路径偏差过大、暂停、取消、关闭或控制异常时立即停车并
 回中。雷达地图刷新后会先对尚未走完的路径做完整矩形碰撞复查：新障碍不影响剩余路径
 时保留原路径连续行驶，只有路径被阻断时才停车重规划。状态可通过 `Navigation.state`
@@ -471,9 +471,56 @@ navigation.start_navigation()
 而是把反馈投影为阿克曼允许的前进速度和前轮转角。连续相对位姿仍由本项目已有的
 SVD-ICP 与墙线有限增益纠漂提供。
 
+## 可信定位与导航地图组件
+
+文件：`components/trusted_navigation_map.py`。`TrustedNavigationMap` 封装了原先位于
+`main.py` 内的可信雷达定位门限、车体自反射过滤、历史自反射清理、雷达点累计，以及
+“矩形场地外全部为障碍”的占据栅格生成策略。它不直接操作电机、舵机或
+`Navigation`；正式 main 先让该组件校验雷达更新，再交给 Navigation 接受位姿，最后
+把通过门限的点云写入可信地图。
+
+组件通过 `TrustedNavigationMapConfig` 接收地图分辨率、刷新周期、最小命中次数、
+ICP 残差、相邻位姿跳变和车身余量等参数。`initialize()` 建立本次启动的场地与原点，
+`rejection_reason()` 只做安全校验，`ingest()` 记录已经被 Navigation 接受的位姿与
+点云，`refresh_grid()` 按周期或强制生成新的不可变 `OccupancyGrid`。墙线共识仍在
+积累时允许 ICP 点云进入可信图；墙线触发硬门限时跳过该圈点云，行为与拆分前一致。
+
+## 相对起点坐标导航组件
+
+文件：`components/coordinate_navigation.py`。`CoordinateNavigation` 是完整巡路运行时，
+负责 D500 启动矩形标定、以启动后轴中心和启动车头重基准、可信地图更新、雷达定位
+门限，以及 `Navigation` 的规划和车辆控制。HC-14、FleetBus、SSH 输入、业务 ACK 和
+进程信号不在该组件内，由 `main.py` 负责接入。
+
+组件启动后只需一次调用即可提交目标：`x/y` 单位为厘米，均相对本次启动位姿；`+X`
+指向启动车头，`+Y` 在启动车头左侧；车头角度以启动车头为 `0°`，俯视逆时针为正。
+
+```python
+from components import CoordinateNavigation, CoordinateNavigationConfig
+
+navigator = CoordinateNavigation(CoordinateNavigationConfig(allow_reverse=True))
+try:
+    calibration = navigator.start()  # 车辆须静止，阻塞到矩形建图完成
+    navigator.navigate_to(
+        x_cm=120.0,
+        y_cm=80.0,
+        final_heading_deg=90.0,
+    )
+finally:
+    navigator.close()  # 停车、回中并关闭雷达
+```
+
+提交前组件会强制刷新可信栅格，并验证目标点及完整旋转车身均在拟合场地内且不与障碍
+相交；未建图、已有活动任务、目标在场外或目标车身姿态不安全时会在发车前抛出
+`CoordinateGoalRejected`。`cancel()` 只清当前任务，保留本次启动原点、矩形地图和累计
+定位，因此后续可继续提交新坐标。
+
 ## 正式主程序
 
 文件：`main.py`
+
+`main.py` 现在只协调 `CoordinateNavigation` 与 HC-14/FleetBus/SSH 命令入口、状态回执、
+日志和安全退出；雷达建图、可信定位、目标校验、规划和控制不再在主程序中重复实现。
 
 正常行驶速度集中在 `main.py` 顶部的 `NAVIGATION_CRUISE_SPEED_CM_S`，单位为
 `cm/s`（例如 `50.0` 等于 `0.5 m/s`），允许范围为 `0～100 cm/s`。主程序只在把
@@ -546,6 +593,7 @@ sudo -E python3 main.py
 ```text
 200 50          # 前往 x=200cm, y=50cm，不限定最终车头
 200 50 90       # 前往同一点，并最终对齐到逆时针 90°
+0 0 0           # 回到启动后轴中心，并恢复启动时的车头方向
 status           # 当前定位、导航状态和原因
 stop             # 立即停车回中并取消任务
 help             # 显示简要帮助
@@ -571,8 +619,9 @@ ACK 后同样可以发送下一条新的 `(session, seq)` 坐标任务。
 
 主程序每次启动都会创建 `main.py` 同级的 `logs/car-main.log`。本地路径为
 `C:\Users\TZDEZACR\Desktop\cccccar\car\code\logs\car-main.log`，部署到 ROCK 5A 后为
-`/home/radxa/car/logs/car-main.log`。文件始终记录 DEBUG 级详细诊断，终端仍由
-`--log-level` 控制，默认只显示 INFO 及以上；也可用 `--log-dir` 或环境变量
+`/home/radxa/car/logs/car-main.log`。文件始终记录 DEBUG 级详细诊断，SSH 终端默认不
+显示运行日志，以免打断坐标输入；建图完成、任务状态、输入提示及命令错误仍直接显示。
+如需临时观察终端日志，可用 `--log-level WARNING`（或 `INFO`/`DEBUG`）显式开启；也可用 `--log-dir` 或环境变量
 `CAR_LOG_DIR` 覆盖目录。
 
 日志包括启动参数（不含 HMAC 密钥）、矩形拟合结果、每圈雷达的 ICP/墙线门限与位姿、

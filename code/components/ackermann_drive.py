@@ -142,6 +142,7 @@ class AckermannDrive:
         track_width_mm: float = DEFAULT_TRACK_WIDTH_MM,
         firmware_track_width_mm: float | None = None,
         max_wheel_speed_mm_s: float | None = None,
+        allow_in_place_rotation: bool = False,
         hardware_lock_path: str | os.PathLike[str] | None = DEFAULT_HARDWARE_LOCK_PATH,
     ) -> None:
         if rear_motors is None:
@@ -158,6 +159,7 @@ class AckermannDrive:
             self.rear_motors = RearMotorDriver(
                 track_width_mm=firmware_track,
                 max_wheel_speed_mm_s=rear_speed_limit,
+                allow_in_place_rotation=allow_in_place_rotation,
             )
         else:
             self.rear_motors = rear_motors
@@ -177,6 +179,10 @@ class AckermannDrive:
             ):
                 raise ValueError(
                     "max_wheel_speed_mm_s does not match supplied rear motor driver"
+                )
+            if allow_in_place_rotation != rear_motors.allow_in_place_rotation:
+                raise ValueError(
+                    "allow_in_place_rotation does not match supplied rear motor driver"
                 )
         self.steering = steering or FrontSteeringServo()
         self.wheelbase_mm = float(wheelbase_mm)
