@@ -97,17 +97,20 @@ class DisasterRescueApplication(CarMainApplication):
         with self._semantic_lock:
             step = self._semantic_step
         if step is not None:
-            current, target = step
-            allowed = {cell for cell in (current, target) if cell is not None}
-            blocked = GridLayout.all_cells() - allowed
+            _current, _target, blocked = step
             grid = overlay_blocked_terrain(grid, blocked)
         return self._base_navigation_set_map(grid)
 
-    def _set_semantic_step(self, current, target) -> None:
+    def _set_semantic_step(self, current, target, blocked) -> None:
         with self._semantic_lock:
-            self._semantic_step = (current, target)
+            self._semantic_step = (current, target, blocked)
         self._refresh_trusted_grid(force=True)
-        LOG.info("semantic rescue corridor current=%s target=%s", current, target)
+        LOG.info(
+            "semantic rescue corridor current=%s target=%s blocked=%s",
+            current,
+            target,
+            sorted(blocked),
+        )
 
     def _clear_semantic_overlay(self) -> None:
         with self._semantic_lock:

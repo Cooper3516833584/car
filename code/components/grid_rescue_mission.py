@@ -57,6 +57,8 @@ class RescueRoutePlan:
     to_water: Tuple[Cell, ...]
     to_wildfire: Tuple[Cell, ...]
     to_start_entry: Tuple[Cell, ...]
+    blocked_to_water: FrozenSet[Cell]
+    blocked_after_water: FrozenSet[Cell]
 
     @property
     def driven_cells(self) -> Tuple[Cell, ...]:
@@ -135,6 +137,8 @@ class AdjacentGridRescuePlanner:
                 tuple(to_water),
                 tuple(water_to_fire[1:]),
                 tuple(fire_to_entry[1:]),
+                frozenset(inbound_blocked),
+                frozenset(after_water_blocked),
             )
             candidates.append((len(plan.driven_cells), water, plan))
         if not candidates:
@@ -214,7 +218,9 @@ class GridRescueMissionController:
         planner: AdjacentGridRescuePlanner,
         *,
         navigate: Callable[[Optional[Cell]], bool],
-        set_step_overlay: Callable[[Optional[Cell], Optional[Cell]], None],
+        set_step_overlay: Callable[
+            [Optional[Cell], Optional[Cell], FrozenSet[Cell]], None
+        ],
         clear_overlay: Callable[[], None],
         indicator: Callable[[str, bool], None] = lambda _stage, _active: None,
         on_result: Callable[[CommandResult], None] = lambda _result: None,
@@ -264,17 +270,17 @@ class GridRescueMissionController:
         current = None  # type: Optional[Cell]
         try:
             for target in plan.to_water:
-                self._move(current, target)
+                self._move(current, target, plan.blocked_to_water)
                 current = target
             self._hold("water")
             for target in plan.to_wildfire:
-                self._move(current, target)
+                self._move(current, target, plan.blocked_after_water)
                 current = target
             self._hold("wildfire")
             for target in plan.to_start_entry:
-                self._move(current, target)
+                self._move(current, target, plan.blocked_after_water)
                 current = target
-            self._move(current, None)
+            self._move(current, None, plan.blocked_after_water)
             with self._lock:
                 self._completed_event_ids.add(event_id)
             result = CommandResult(AckStatus.COMPLETED)
@@ -286,10 +292,18 @@ class GridRescueMissionController:
             self._clear_overlay()
             self._on_result(result)
 
-    def _move(self, current: Optional[Cell], target: Optional[Cell]) -> None:
+    def _move(
+        self,
+        current: Optional[Cell],
+        target: Optional[Cell],
+        blocked_cells: FrozenSet[Cell],
+    ) -> None:
         if self._stop.is_set():
             raise RuntimeError("rescue mission stopped")
-        self._set_step_overlay(current, target)
+        step_blocked = frozenset(
+            cell for cell in blocked_cells if cell not in (current, target)
+        )
+        self._set_step_overlay(current, target, step_blocked)
         if not self._navigate(target):
             raise RuntimeError("navigation did not reach the next adjacent rescue cell")
 

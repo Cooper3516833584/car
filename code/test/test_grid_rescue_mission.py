@@ -58,6 +58,9 @@ class AdjacentGridPlannerTests(unittest.TestCase):
         self.assertEqual((1, 2), plan.wildfire_cell)
         self.assertNotIn((0, 1), plan.to_wildfire)
         self.assertNotIn((0, 1), plan.to_start_entry)
+        self.assertNotIn((0, 1), plan.blocked_to_water)
+        self.assertIn((0, 1), plan.blocked_after_water)
+        self.assertNotIn((0, 2), plan.blocked_after_water)
         route = plan.driven_cells
         for first, second in zip(route, route[1:]):
             self.assertEqual(
@@ -92,7 +95,9 @@ class ControllerTests(unittest.TestCase):
         controller = GridRescueMissionController(
             planner,
             navigate=lambda cell: calls.append(("navigate", cell)) or True,
-            set_step_overlay=lambda current, target: calls.append(("overlay", current, target)),
+            set_step_overlay=lambda current, target, blocked: calls.append(
+                ("overlay", current, target, blocked)
+            ),
             clear_overlay=lambda: calls.append(("clear",)),
             indicator=lambda stage, active: calls.append((stage, active)),
             on_result=lambda result: (results.append(result), result_event.set()),
