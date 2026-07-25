@@ -111,6 +111,17 @@ from .coordinate_navigation import (
     CoordinateNavigation,
     CoordinateNavigationConfig,
 )
+from .grid_rescue_mission import (
+    AdjacentGridNavigator,
+    AdjacentGridRescuePlanner,
+    GridLayout,
+    GridRescueMissionController,
+    InPlaceDifferentialTurn,
+    InPlaceTurnConfig,
+    RescuePlanError,
+    RescueRoutePlan,
+    overlay_blocked_terrain,
+)
 
 __all__ = [
     "ChassisCommand",
@@ -208,6 +219,15 @@ __all__ = [
     "CoordinateGoalRejectReason",
     "CoordinateNavigation",
     "CoordinateNavigationConfig",
+    "AdjacentGridNavigator",
+    "AdjacentGridRescuePlanner",
+    "GridLayout",
+    "GridRescueMissionController",
+    "InPlaceDifferentialTurn",
+    "InPlaceTurnConfig",
+    "RescuePlanError",
+    "RescueRoutePlan",
+    "overlay_blocked_terrain",
 ]
 
 from .navigation_protocol import (

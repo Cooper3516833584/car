@@ -2,7 +2,10 @@
 
 from collections import deque
 from dataclasses import dataclass
+import logging
+import math
 import threading
+import time
 from typing import Callable, FrozenSet, Iterable, Optional, Tuple
 
 from .fleet_models import (
@@ -12,10 +15,18 @@ from .fleet_models import (
     DisasterRescueCommand,
     TerrainCode,
 )
-from .navigation import OccupancyGrid
+from .ackermann_drive import AckermannDrive
+from .navigation import (
+    NavigationPose,
+    OccupancyGrid,
+    normalize_heading_deg,
+    signed_heading_error_deg,
+)
+from .rear_motor import UnsupportedWheelCommand
 
 
 Cell = Tuple[int, int]
+LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -45,6 +56,23 @@ class GridLayout:
         row, col = cell
         return self.x_centres_cm[col], self.y_centres_cm[row]
 
+    def step_heading_deg(self, current: Cell, target: Cell) -> float:
+        """Return the cardinal heading for one orthogonally adjacent step."""
+
+        self.validate_cell(current)
+        self.validate_cell(target)
+        delta_row = target[0] - current[0]
+        delta_col = target[1] - current[1]
+        if abs(delta_row) + abs(delta_col) != 1:
+            raise ValueError("grid move must target one orthogonally adjacent cell")
+        if delta_col == 1:
+            return 0.0
+        if delta_row == 1:
+            return 90.0
+        if delta_col == -1:
+            return 180.0
+        return 270.0
+
     @staticmethod
     def all_cells() -> FrozenSet[Cell]:
         return frozenset((row, col) for row in range(3) for col in range(5))
@@ -67,6 +95,183 @@ class RescueRoutePlan:
 
 class RescuePlanError(ValueError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class InPlaceTurnConfig:
+    wheel_speed_mm_s: float = 80.0
+    heading_tolerance_deg: float = 4.0
+    localization_timeout_s: float = 0.5
+    timeout_s: float = 8.0
+    refresh_interval_s: float = 0.05
+    confirmation_samples: int = 2
+
+    def __post_init__(self) -> None:
+        if not all(
+            math.isfinite(float(value)) and float(value) > 0.0
+            for value in (
+                self.wheel_speed_mm_s,
+                self.heading_tolerance_deg,
+                self.localization_timeout_s,
+                self.timeout_s,
+                self.refresh_interval_s,
+            )
+        ):
+            raise ValueError("in-place turn parameters must be finite and positive")
+        if self.heading_tolerance_deg >= 45.0:
+            raise ValueError("heading_tolerance_deg must be below 45 degrees")
+        if self.confirmation_samples <= 0:
+            raise ValueError("confirmation_samples must be positive")
+
+
+class InPlaceDifferentialTurn:
+    """Radar-heading closed-loop pivot with centred front wheels.
+
+    Counter-clockwise turns command the left rear wheel backwards and the
+    right rear wheel forwards.  The inverse is used for clockwise turns.  This
+    manoeuvre is explicitly opt-in on ``RearMotorDriver`` and is not used by
+    normal Ackermann Navigation.
+    """
+
+    def __init__(
+        self,
+        drive: AckermannDrive,
+        *,
+        pose_provider: Callable[[], NavigationPose | None],
+        config: InPlaceTurnConfig = InPlaceTurnConfig(),
+        on_motion_changed: Callable[[bool], None] = lambda _moving: None,
+        stop_requested: Callable[[], bool] = lambda: False,
+    ) -> None:
+        self.drive = drive
+        self.pose_provider = pose_provider
+        self.config = config
+        self.on_motion_changed = on_motion_changed
+        self.stop_requested = stop_requested
+
+    def turn_to(self, heading_deg: float) -> None:
+        target = normalize_heading_deg(heading_deg)
+        if not self.drive.rear_motors.allow_in_place_rotation:
+            raise RuntimeError(
+                "rear motor driver has not enabled the adjacent-grid "
+                "in-place rotation mode"
+            )
+
+        # Stop first, then centre the physical front wheels before any rear
+        # wheel is allowed to move.
+        self.drive.stop(center_steering=True)
+        deadline = time.monotonic() + self.config.timeout_s
+        last_confirmation_timestamp: float | None = None
+        confirmations = 0
+        moving = False
+        LOG.info(
+            "adjacent-grid pivot started target_heading=%.1fdeg speed=%.1fmm/s",
+            target,
+            self.config.wheel_speed_mm_s,
+        )
+        try:
+            while True:
+                if self.stop_requested():
+                    raise RuntimeError("in-place turn cancelled")
+                now = time.monotonic()
+                if now >= deadline:
+                    raise RuntimeError(
+                        f"in-place turn timed out before heading {target:.1f}deg"
+                    )
+                pose = self.pose_provider()
+                if pose is None or now - pose.timestamp_s > self.config.localization_timeout_s:
+                    raise RuntimeError("in-place turn requires a fresh radar pose")
+                error = signed_heading_error_deg(target, pose.heading_deg)
+                if abs(error) <= self.config.heading_tolerance_deg:
+                    self.drive.rear_motors.stop()
+                    if pose.timestamp_s != last_confirmation_timestamp:
+                        confirmations += 1
+                        last_confirmation_timestamp = pose.timestamp_s
+                    if confirmations >= self.config.confirmation_samples:
+                        LOG.info(
+                            "adjacent-grid pivot complete heading=%.1fdeg error=%+.2fdeg",
+                            pose.heading_deg,
+                            error,
+                        )
+                        return
+                else:
+                    confirmations = 0
+                    last_confirmation_timestamp = None
+                    direction = 1.0 if error > 0.0 else -1.0
+                    speed = self.config.wheel_speed_mm_s
+                    try:
+                        self.drive.rear_motors.set_wheels(
+                            -direction * speed,
+                            direction * speed,
+                        )
+                    except UnsupportedWheelCommand as exc:
+                        raise RuntimeError(
+                            "C10B rejected the configured in-place wheel command"
+                        ) from exc
+                    if not moving:
+                        self.on_motion_changed(True)
+                        moving = True
+                    LOG.debug(
+                        "adjacent-grid pivot feedback current=%.2f target=%.2f "
+                        "error=%+.2f rear=(%+.1f,%+.1f)mm/s",
+                        pose.heading_deg,
+                        target,
+                        error,
+                        -direction * speed,
+                        direction * speed,
+                    )
+                time.sleep(self.config.refresh_interval_s)
+        finally:
+            try:
+                self.drive.rear_motors.stop()
+            finally:
+                try:
+                    self.drive.steering.center()
+                finally:
+                    if moving:
+                        self.on_motion_changed(False)
+
+
+class AdjacentGridNavigator:
+    """Move between centres of adjacent cells in the fixed 3x5/70 cm field."""
+
+    def __init__(
+        self,
+        pivot_turn: InPlaceDifferentialTurn,
+        *,
+        navigate_to: Callable[[float, float, float | None], bool],
+        layout: GridLayout = GridLayout(),
+    ) -> None:
+        self.pivot_turn = pivot_turn
+        self.navigate_to = navigate_to
+        self.layout = layout
+
+    def move(self, current: Optional[Cell], target: Optional[Cell]) -> bool:
+        """Pivot to the step direction, then drive to the target cell centre."""
+
+        if target is None:
+            if current not in self.layout.start_entry_cells:
+                raise ValueError("only a start-entry cell can return to start point")
+            self.pivot_turn.turn_to(0.0)
+            x_cm, y_cm = self.layout.start_point_cm
+            return bool(self.navigate_to(x_cm, y_cm, 0.0))
+        self.layout.validate_cell(target)
+        if current is None:
+            if target not in self.layout.start_entry_cells:
+                raise ValueError("the first grid move must enter a configured start cell")
+            x_cm, y_cm = self.layout.centre(target)
+            return bool(self.navigate_to(x_cm, y_cm, None))
+
+        heading = self.layout.step_heading_deg(current, target)
+        LOG.info(
+            "adjacent-grid move current=%s target=%s centre=(%.1f,%.1f) heading=%.1f",
+            current,
+            target,
+            *self.layout.centre(target),
+            heading,
+        )
+        self.pivot_turn.turn_to(heading)
+        x_cm, y_cm = self.layout.centre(target)
+        return bool(self.navigate_to(x_cm, y_cm, heading))
 
 
 class AdjacentGridRescuePlanner:
@@ -218,6 +423,7 @@ class GridRescueMissionController:
         planner: AdjacentGridRescuePlanner,
         *,
         navigate: Callable[[Optional[Cell]], bool],
+        move_adjacent: Callable[[Optional[Cell], Optional[Cell]], bool] | None = None,
         set_step_overlay: Callable[
             [Optional[Cell], Optional[Cell], FrozenSet[Cell]], None
         ],
@@ -228,6 +434,7 @@ class GridRescueMissionController:
     ) -> None:
         self.planner = planner
         self._navigate = navigate
+        self._move_adjacent = move_adjacent
         self._set_step_overlay = set_step_overlay
         self._clear_overlay = clear_overlay
         self._indicator = indicator
@@ -304,7 +511,12 @@ class GridRescueMissionController:
             cell for cell in blocked_cells if cell not in (current, target)
         )
         self._set_step_overlay(current, target, step_blocked)
-        if not self._navigate(target):
+        reached = (
+            self._navigate(target)
+            if self._move_adjacent is None
+            else self._move_adjacent(current, target)
+        )
+        if not reached:
             raise RuntimeError("navigation did not reach the next adjacent rescue cell")
 
     def _hold(self, stage: str) -> None:

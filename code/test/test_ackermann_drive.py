@@ -44,6 +44,10 @@ class AckermannLinkageTests(unittest.TestCase):
         drive = AckermannDrive(max_wheel_speed_mm_s=600.0)
         self.assertEqual(drive.rear_motors.max_wheel_speed_mm_s, 600.0)
 
+    def test_owned_rear_driver_propagates_explicit_pivot_capability(self) -> None:
+        drive = AckermannDrive(allow_in_place_rotation=True)
+        self.assertTrue(drive.rear_motors.allow_in_place_rotation)
+
     def test_straight_motion_keeps_rear_wheels_equal(self) -> None:
         plan = plan_ackermann_motion(100, 0.0)
         self.assertEqual(plan.rear.requested.left_mm_s, 100)

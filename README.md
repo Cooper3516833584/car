@@ -61,7 +61,10 @@ Vx = (left + right) / 2
 Vz = (right - left) / 0.164
 ```
 
-固件强制最小转弯半径 `350 mm`，因此两轮同向但速度略有差别可以准确控制；单轮转动、左右反转和原地旋转无法由当前固件实现，组件会抛出 `UnsupportedWheelCommand`。如果后续确实要求这些动作，必须另行设计并刷写 C10B 的“左右轮直接目标”扩展协议，不能只修改 ROCK 5A 上位机。
+常规阿克曼行驶仍强制最小转弯半径 `350 mm`。3×5 相邻格任务是唯一显式例外：构造
+`RearMotorDriver(allow_in_place_rotation=True)` 后，可以用 `Vx=0`、左右后轮等速反向
+原地旋转；该模式必须先停车、将前轮回正并使用雷达航向闭环。默认值仍为 `False`，
+普通 Navigation 不会隐式产生单轮、左右反转或原地旋转命令。
 
 ## 前轮转向舵机
 
@@ -514,6 +517,21 @@ finally:
 相交；未建图、已有活动任务、目标在场外或目标车身姿态不安全时会在发车前抛出
 `CoordinateGoalRejected`。`cancel()` 只清当前任务，保留本次启动原点、矩形地图和累计
 定位，因此后续可继续提交新坐标。
+
+## 3×5 相邻格格心导航
+
+文件：`components/grid_rescue_mission.py`。`GridLayout` 固定为 3 行×5 列，每格
+`70 cm × 70 cm`；`AdjacentGridNavigator` 只接受上下左右相邻格，自动把目标转换为
+格子中心坐标，并将车头对准本步的 `0/90/180/270°` 方向。
+
+每步执行顺序固定为：停车、前轮回正、`InPlaceDifferentialTurn` 使用左右后轮等速反向
+旋转、由 D500/Navigation 航向闭环确认角度、后轮停车，最后调用坐标导航驶向相邻格
+中心。原地旋转默认速度 `80 mm/s`、航向容差 `4°`，需要两个不同雷达位姿确认；定位
+超过 `0.5 s` 未更新、旋转超过 `8 s` 或收到停止请求时立即停车回中并报告失败。
+
+该例外仅在 `disaster_rescue_main.py` 中通过
+`MainConfig(allow_in_place_rotation=True)` 开启。正式 `main.py` 和普通 Navigation 默认
+保持关闭，避免其他任务意外发出左右后轮反向命令。
 
 ## 正式主程序
 

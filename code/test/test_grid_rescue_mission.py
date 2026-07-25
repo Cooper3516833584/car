@@ -1,5 +1,6 @@
 from pathlib import Path
 import threading
+import time
 import sys
 import unittest
 
@@ -7,12 +8,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from components.fleet_models import AckStatus, DisasterRescueCommand, TerrainCode
 from components.grid_rescue_mission import (
+    AdjacentGridNavigator,
     AdjacentGridRescuePlanner,
     GridLayout,
     GridRescueMissionController,
+    InPlaceDifferentialTurn,
+    InPlaceTurnConfig,
     overlay_blocked_terrain,
 )
-from components.navigation import OccupancyGrid
+from components.navigation import NavigationPose, OccupancyGrid
 
 
 def command():
@@ -46,6 +50,16 @@ class AdjacentGridPlannerTests(unittest.TestCase):
         self.assertEqual((0.0, 0.0), layout.centre((0, 0)))
         self.assertEqual((70.0, 0.0), layout.centre((0, 1)))
         self.assertEqual((140.0, 70.0), layout.centre((1, 2)))
+        self.assertEqual(0.0, layout.step_heading_deg((1, 1), (1, 2)))
+        self.assertEqual(90.0, layout.step_heading_deg((1, 1), (2, 1)))
+        self.assertEqual(180.0, layout.step_heading_deg((1, 1), (1, 0)))
+        self.assertEqual(270.0, layout.step_heading_deg((1, 1), (0, 1)))
+
+    def test_layout_rejects_diagonal_or_skipped_step(self):
+        layout = GridLayout()
+        for target in ((2, 2), (1, 3), (1, 1)):
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                layout.step_heading_deg((1, 1), target)
 
     def test_requested_commissioning_route_is_adjacent_and_avoids_water_after_pickup(self):
         terrain = [int(TerrainCode.FIELD)] * 15
@@ -109,6 +123,118 @@ class ControllerTests(unittest.TestCase):
         self.assertIn(("water", True), calls)
         self.assertIn(("wildfire", True), calls)
         self.assertEqual(("navigate", None), [call for call in calls if call[0] == "navigate"][-1])
+
+    def test_controller_can_use_adjacent_motion_component(self):
+        planner = AdjacentGridPlannerTests().planner()
+        moves = []
+        result_event = threading.Event()
+        controller = GridRescueMissionController(
+            planner,
+            navigate=lambda _cell: self.fail("legacy navigate callback used"),
+            move_adjacent=lambda current, target: moves.append((current, target)) or True,
+            set_step_overlay=lambda *_args: None,
+            clear_overlay=lambda: None,
+            on_result=lambda _result: result_event.set(),
+            hold_seconds=0.0,
+        )
+        self.assertEqual(AckStatus.ACCEPTED, controller.submit(command()).status)
+        self.assertTrue(result_event.wait(1.0))
+        self.assertEqual((None, (0, 0)), moves[0])
+        self.assertEqual(((0, 0), None), moves[-1])
+
+
+class _FakeRearMotors:
+    allow_in_place_rotation = True
+
+    def __init__(self):
+        self.commands = []
+        self.stops = 0
+
+    def set_wheels(self, left, right):
+        self.commands.append((left, right))
+
+    def stop(self):
+        self.stops += 1
+
+
+class _FakeSteering:
+    def __init__(self):
+        self.centres = 0
+
+    def center(self):
+        self.centres += 1
+
+
+class _FakeDrive:
+    def __init__(self):
+        self.rear_motors = _FakeRearMotors()
+        self.steering = _FakeSteering()
+        self.stop_calls = []
+
+    def stop(self, *, center_steering=True):
+        self.stop_calls.append(center_steering)
+        self.rear_motors.stop()
+        if center_steering:
+            self.steering.center()
+
+
+class AdjacentGridMotionTests(unittest.TestCase):
+    def test_pivot_centres_front_and_uses_opposite_rear_speeds(self):
+        drive = _FakeDrive()
+        now = time.monotonic()
+        poses = iter(
+            (
+                NavigationPose(0, 0, 0, now),
+                NavigationPose(0, 0, 88, now + 0.01),
+                NavigationPose(0, 0, 90, now + 0.02),
+            )
+        )
+        latest = [NavigationPose(0, 0, 90, now + 0.02)]
+
+        def pose_provider():
+            try:
+                latest[0] = next(poses)
+            except StopIteration:
+                pass
+            return latest[0]
+
+        motion = []
+        pivot = InPlaceDifferentialTurn(
+            drive,  # type: ignore[arg-type]
+            pose_provider=pose_provider,
+            config=InPlaceTurnConfig(
+                refresh_interval_s=0.001,
+                timeout_s=0.2,
+            ),
+            on_motion_changed=motion.append,
+        )
+
+        pivot.turn_to(90)
+
+        self.assertEqual([True], drive.stop_calls)
+        self.assertIn((-80.0, 80.0), drive.rear_motors.commands)
+        self.assertGreaterEqual(drive.steering.centres, 2)
+        self.assertEqual([True, False], motion)
+
+    def test_adjacent_navigator_pivots_then_targets_exact_cell_centre(self):
+        turns = []
+        goals = []
+
+        class Pivot:
+            def turn_to(self, heading):
+                turns.append(heading)
+
+        navigator = AdjacentGridNavigator(
+            Pivot(),  # type: ignore[arg-type]
+            navigate_to=lambda x, y, heading: goals.append((x, y, heading)) or True,
+        )
+
+        self.assertTrue(navigator.move((1, 1), (1, 2)))
+        self.assertEqual([0.0], turns)
+        self.assertEqual([(140.0, 70.0, 0.0)], goals)
+
+        with self.assertRaises(ValueError):
+            navigator.move((1, 1), (2, 2))
 
 
 if __name__ == "__main__":

@@ -13,9 +13,11 @@ import time
 
 from components.fleet_models import AckReason, AckStatus, CommandResult, TerrainCode
 from components.grid_rescue_mission import (
+    AdjacentGridNavigator,
     AdjacentGridRescuePlanner,
     GridLayout,
     GridRescueMissionController,
+    InPlaceDifferentialTurn,
     overlay_blocked_terrain,
 )
 from components.navigation import NavigationGoal, NavigationState
@@ -82,9 +84,23 @@ class DisasterRescueApplication(CarMainApplication):
             forbidden_terrain_codes=terrain_codes(FORBIDDEN_TERRAINS),
             layout=layout,
         )
+        self.grid_navigator = AdjacentGridNavigator(
+            InPlaceDifferentialTurn(
+                self.navigation.drive,
+                pose_provider=lambda: self.navigation.pose,
+                on_motion_changed=self.radar.set_motion_hint,
+                stop_requested=lambda: (
+                    self.rescue_controller is not None
+                    and self.rescue_controller.stop_requested
+                ),
+            ),
+            navigate_to=self._navigate_grid_pose,
+            layout=layout,
+        )
         self.rescue_controller = GridRescueMissionController(
             planner,
             navigate=self._navigate_rescue_cell,
+            move_adjacent=self.grid_navigator.move,
             set_step_overlay=self._set_semantic_step,
             clear_overlay=self._clear_semantic_overlay,
             indicator=self._mission_indicator,
@@ -118,20 +134,29 @@ class DisasterRescueApplication(CarMainApplication):
         self._refresh_trusted_grid(force=True)
 
     def _navigate_rescue_cell(self, cell) -> bool:
-        if self.rescue_controller is None or self.rescue_controller.stop_requested:
-            return False
         if cell is None:
             x_cm, y_cm = GridLayout().start_point_cm
             heading = 0.0
         else:
             x_cm, y_cm = GridLayout().centre(cell)
             heading = None
+        return self._navigate_grid_pose(x_cm, y_cm, heading)
+
+    def _navigate_grid_pose(self, x_cm, y_cm, heading) -> bool:
+        if self.rescue_controller is None or self.rescue_controller.stop_requested:
+            return False
         with self._rescue_condition:
             generation = self._rescue_terminal_generation
         try:
             self._submit_console_goal(NavigationGoal(x_cm, y_cm, heading))
         except Exception as exc:
-            LOG.error("rescue waypoint rejected cell=%s: %s", cell, exc)
+            LOG.error(
+                "rescue waypoint rejected pose=(%.1f,%.1f,%s): %s",
+                x_cm,
+                y_cm,
+                heading,
+                exc,
+            )
             return False
         deadline = time.monotonic() + NAVIGATION_STEP_TIMEOUT_S
         with self._rescue_condition:
@@ -207,6 +232,7 @@ def main(argv=None) -> int:
             startup_scan_count=args.startup_scans,
             calibration_timeout_s=args.calibration_timeout,
             allow_reverse=args.allow_reverse,
+            allow_in_place_rotation=True,
             console_enabled=not args.no_console,
         )
         app = DisasterRescueApplication(config)

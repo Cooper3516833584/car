@@ -42,6 +42,18 @@ class RearMotorProtocolTests(unittest.TestCase):
         with self.assertRaises(UnsupportedWheelCommand):
             wheel_speeds_to_chassis(-100, 100)
 
+    def test_explicit_grid_mode_encodes_in_place_rotation(self) -> None:
+        command = wheel_speeds_to_chassis(
+            -80,
+            80,
+            allow_in_place_rotation=True,
+        )
+        self.assertEqual(command.linear_mm_s, 0)
+        self.assertEqual(command.angular_mrad_s, 976)
+        represented = command.represented_wheel_speeds()
+        self.assertAlmostEqual(represented.left_mm_s, -80.032, places=3)
+        self.assertAlmostEqual(represented.right_mm_s, 80.032, places=3)
+
     def test_rejects_turn_below_firmware_radius(self) -> None:
         with self.assertRaisesRegex(UnsupportedWheelCommand, "turn radius"):
             wheel_speeds_to_chassis(0, 100)
