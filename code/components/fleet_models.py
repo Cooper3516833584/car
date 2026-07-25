@@ -21,6 +21,8 @@ class MessageKind(IntEnum):
     MAP_REPORT = 0x06
     PATH_REQUEST = 0x07
     PATH_REPORT = 0x08
+    SURVEY_REQUEST = 0x09
+    SURVEY_REPORT = 0x0A
 
 
 class CommandId(IntEnum):
@@ -28,6 +30,7 @@ class CommandId(IntEnum):
     TARGETED_STOP = 0x02
     SET_COORDINATE_FRAME = 0x10
     CAR_NAVIGATE_TO = 0x11
+    CAR_DISASTER_RESCUE = 0x12
     DRONE_GOTO = 0x20
     DRONE_HOLD = 0x21
     CANCEL_TASK = 0x22
@@ -79,6 +82,21 @@ class NodeFlags(IntFlag):
 
 class GoalFlags(IntFlag):
     HAS_FINAL_HEADING = 0x01
+
+
+class TerrainCode(IntEnum):
+    UNKNOWN = 0
+    SNOW_MOUNTAIN = 1
+    FIELD = 2
+    RIVER = 3
+    SETTLEMENTS = 4
+    LAKE = 5
+    DEBRIS_FLOW = 6
+    WILDFIRE = 7
+
+
+class SurveyFlags(IntFlag):
+    COMPLETE = 0x01
 
 
 @dataclass(frozen=True)
@@ -169,6 +187,14 @@ class DroneGotoCommand:
 
 
 @dataclass(frozen=True)
+class DisasterRescueCommand:
+    event_id: int
+    wildfire_row: int
+    wildfire_col: int
+    terrain_codes: Tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class MapReportPayload:
     request_session: int
     request_seq: int
@@ -182,6 +208,21 @@ class PathReportPayload:
     request_seq: int
     path_revision: int
     points: Tuple[Tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class SurveyReportPayload:
+    request_session: int
+    request_seq: int
+    survey_revision: int
+    survey_flags: int
+    wildfire_event_id: int
+    wildfire_row: int
+    wildfire_col: int
+    debris_event_id: int
+    debris_row: int
+    debris_col: int
+    terrain_codes: Tuple[int, ...]
 
 
 @dataclass(frozen=True)

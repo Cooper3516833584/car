@@ -16,6 +16,7 @@ class Harness:
         self.coordinate_calls = []
         self.navigate_calls = []
         self.stop_calls = 0
+        self.rescue_calls = []
         self.callback_threads = []
         self.event = threading.Event()
         self.state = CarFleetState(
@@ -36,6 +37,10 @@ class Harness:
             wait=lambda _: False,
         )
         self.node.start()
+
+    def rescue(self, value):
+        self.rescue_calls.append(value)
+        return CommandResult(AckStatus.ACCEPTED)
 
     def write(self, raw):
         self.writes.append(raw)
@@ -109,6 +114,19 @@ class FleetCarNodeTests(unittest.TestCase):
         ))
         self.assertNotEqual(self.h.callback_threads[-1], caller)
         self.assertEqual(decode_ack(unpack_frame(raw).payload).status, AckStatus.ACCEPTED)
+
+    def test_disaster_rescue_is_decoded_by_optional_task_handler(self):
+        self.h.node.close()
+        self.h.node.set_disaster_handler(self.h.rescue)
+        self.h.node.start()
+        terrain = (int(TerrainCode.FIELD),) * 14 + (int(TerrainCode.WILDFIRE),)
+        body = encode_disaster_rescue(DisasterRescueCommand(8, 2, 4, terrain))
+        raw = self.h.send(self.request(
+            MessageKind.COMMAND,
+            encode_command(CommandPayload(CommandId.CAR_DISASTER_RESCUE, 0, body)),
+        ))
+        self.assertEqual(AckStatus.ACCEPTED, decode_ack(unpack_frame(raw).payload).status)
+        self.assertEqual(8, self.h.rescue_calls[-1].event_id)
 
     def test_ground_session_change_clears_dedupe(self):
         request1 = self.request(

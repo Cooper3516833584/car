@@ -27,6 +27,7 @@ from .fleet_protocol import (
     decode_car_navigate,
     decode_command,
     decode_coordinate_frame,
+    decode_disaster_rescue,
     encode_ack,
     encode_map_report,
     encode_path_report,
@@ -53,6 +54,7 @@ class FleetCarNode:
         self._on_set_coordinate_frame = on_set_coordinate_frame
         self._on_navigate = on_navigate
         self._on_stop = on_stop
+        self._on_disaster_rescue = None
         self._timing = timing
         self._parser = FrameParser(local_node=NodeId.CAR)
         self._queue = queue.PriorityQueue(maxsize=timing.queue_size)
@@ -70,6 +72,21 @@ class FleetCarNode:
         self._active_command_seq = 0
         self._active_command_status = 0
         self._error_code = 0
+
+    def set_disaster_handler(self, callback: Callable) -> None:
+        """Install the task-layer rescue callback before accepting commands."""
+        if self._thread is not None and self._thread.is_alive():
+            raise RuntimeError("disaster handler must be installed before FleetCarNode.start")
+        self._on_disaster_rescue = callback
+
+    def set_active_command_result(self, result: CommandResult) -> None:
+        """Publish asynchronous task completion in subsequent state reports."""
+        self._active_command_status = int(result.status)
+        self._error_code = (
+            int(result.reason)
+            if result.status in (AckStatus.REJECTED, AckStatus.FAILED)
+            else 0
+        )
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -219,6 +236,15 @@ class FleetCarNode:
                 result = self._on_navigate(
                     decode_car_navigate(command.command_body)
                 )
+            elif command_id == CommandId.CAR_DISASTER_RESCUE:
+                if self._on_disaster_rescue is None:
+                    result = CommandResult(
+                        AckStatus.REJECTED, AckReason.UNSUPPORTED
+                    )
+                else:
+                    result = self._on_disaster_rescue(
+                        decode_disaster_rescue(command.command_body)
+                    )
             else:
                 result = CommandResult(AckStatus.REJECTED, AckReason.UNSUPPORTED)
         except ValueError as exc:
