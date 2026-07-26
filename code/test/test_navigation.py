@@ -57,6 +57,12 @@ def open_grid() -> OccupancyGrid:
 
 
 class CoordinateAndGeometryTests(unittest.TestCase):
+    def test_goal_defaults_keep_position_accuracy_without_overstrict_heading(self) -> None:
+        goal = NavigationGoal(10.0, 20.0, final_heading_deg=30.0)
+
+        self.assertEqual(goal.position_tolerance_cm, 5.0)
+        self.assertEqual(goal.heading_tolerance_deg, 8.0)
+
     def test_measured_dimensions_are_defaults(self) -> None:
         geometry = VehicleGeometry()
         self.assertAlmostEqual(DEFAULT_TRACK_WIDTH_MM, 117.1)
@@ -161,6 +167,24 @@ class HybridAStarTests(unittest.TestCase):
         end = path.points[-1]
         self.assertAlmostEqual(end.x_cm, goal.x_cm, places=3)
         self.assertAlmostEqual(end.y_cm, goal.y_cm, places=3)
+
+    def test_near_goal_reverse_recovery_does_not_take_forward_dubins_loop(self) -> None:
+        start = NavigationPose(-10.40, 1.49, 1.18, 0.0)
+        goal = NavigationGoal(0.0, 0.0, final_heading_deg=0.0)
+
+        path = HybridAStarPlanner().plan(
+            start,
+            goal,
+            open_grid(),
+            allow_reverse=True,
+        )
+
+        travelled_cm = sum(
+            math.hypot(second.x_cm - first.x_cm, second.y_cm - first.y_cm)
+            for first, second in zip(path.points, path.points[1:])
+        )
+        self.assertLess(len(path.points), 10)
+        self.assertLess(travelled_cm, 50.0)
 
     def test_planner_honours_cancellation_before_search(self) -> None:
         with self.assertRaises(PlanningCancelledError):
@@ -307,7 +331,7 @@ class PurePursuitTests(unittest.TestCase):
 
         self.assertLessEqual(command.speed_mm_s, 50.0)
 
-    def test_default_terminal_speed_cap_starts_fifty_centimetres_from_goal(self) -> None:
+    def test_default_terminal_speed_cap_does_not_start_forty_centimetres_from_goal(self) -> None:
         controller = PurePursuitController(
             config=PurePursuitConfig(
                 cruise_speed_mm_s=300.0,
@@ -323,7 +347,7 @@ class PurePursuitTests(unittest.TestCase):
 
         command = controller.compute(NavigationPose(0, 0, 0, 0), path)
 
-        self.assertEqual(command.speed_mm_s, 50.0)
+        self.assertGreater(command.speed_mm_s, 50.0)
 
     def test_signed_cross_track_and_heading_feedback_correct_radar_error(self) -> None:
         controller = PurePursuitController()
@@ -1044,6 +1068,12 @@ class NavigationStateMachineTests(unittest.TestCase):
         )
         self.assertEqual(navigation._terminal_recovery_replan_count, 8)
 
+    def test_terminal_defaults_use_short_adjustment_zone_and_sixty_second_budget(self) -> None:
+        navigation = Navigation(drive=_FakeDrive())
+
+        self.assertEqual(navigation.config.terminal_deviation_distance_cm, 25.0)
+        self.assertEqual(navigation.config.terminal_recovery_timeout_s, 60.0)
+
     def test_terminal_saturated_cross_track_requests_replan_after_distinct_poses(self) -> None:
         navigation = Navigation(
             drive=_FakeDrive(),
@@ -1100,8 +1130,33 @@ class NavigationStateMachineTests(unittest.TestCase):
                 )
             )
 
-    def test_large_wall_residual_holds_then_releases_navigation(self) -> None:
+    def test_wall_correction_does_not_pause_navigation_by_default(self) -> None:
         navigation = Navigation(drive=_FakeDrive())
+
+        def radar_update(residual_x_cm: float) -> RadarLocalizationUpdate:
+            wall = WallFusionResult(
+                True,
+                True,
+                None,
+                Pose2D(),
+                residual_x_cm=residual_x_cm,
+            )
+            return RadarLocalizationUpdate(
+                RadarScan((), 0, 0),
+                RadarOdometryUpdate(Pose2D(), True, True),
+                Pose2D(),
+                (),
+                wall,
+            )
+
+        navigation.update_from_radar(radar_update(9.0))
+        self.assertFalse(navigation._wall_relocalization_hold)
+
+    def test_opt_in_large_wall_residual_hold_still_releases(self) -> None:
+        navigation = Navigation(
+            drive=_FakeDrive(),
+            config=NavigationConfig(pause_for_wall_relocalization=True),
+        )
 
         def radar_update(residual_x_cm: float) -> RadarLocalizationUpdate:
             wall = WallFusionResult(

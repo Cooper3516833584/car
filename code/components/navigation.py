@@ -113,7 +113,7 @@ class NavigationGoal:
     y_cm: float
     final_heading_deg: float | None = None
     position_tolerance_cm: float = 5.0
-    heading_tolerance_deg: float = 5.0
+    heading_tolerance_deg: float = 8.0
 
     def __post_init__(self) -> None:
         if not math.isfinite(float(self.x_cm)) or not math.isfinite(float(self.y_cm)):
@@ -379,6 +379,7 @@ class HybridAStarConfig:
     safety_margin_cm: float = 2.0
     planning_position_tolerance_cm: float = 5.0
     planning_heading_tolerance_deg: float = 5.0
+    near_goal_reverse_dubins_suppression_cm: float = 50.0
 
     def __post_init__(self) -> None:
         if self.heading_bins < 8 or self.primitive_length_cm <= 0:
@@ -390,6 +391,7 @@ class HybridAStarConfig:
             or self.analytic_expansion_interval <= 0
             or self.planning_position_tolerance_cm <= 0
             or self.planning_heading_tolerance_deg <= 0
+            or self.near_goal_reverse_dubins_suppression_cm <= 0
         ):
             raise ValueError("invalid Hybrid A* limits")
 
@@ -491,6 +493,22 @@ class HybridAStarPlanner:
             0.5 / left_radius,
             1.0 / left_radius,
         )
+        # A forward-only Dubins connection can be several metres long when a
+        # pose goal is only a few centimetres away but its exact heading is not
+        # yet satisfied.  When reverse is explicitly available, let Hybrid A*
+        # find the short forward/reverse manoeuvre instead of accepting that
+        # large loop at the first analytic expansion.
+        suppress_analytic_expansion = allow_reverse and math.hypot(
+            goal.x_cm - start.x_cm,
+            goal.y_cm - start.y_cm,
+        ) <= self.config.near_goal_reverse_dubins_suppression_cm
+        if suppress_analytic_expansion:
+            LOG.debug(
+                "suppressing Dubins analytic expansion for near-goal reverse "
+                "recovery distance_cm=%.3f threshold_cm=%.3f",
+                math.hypot(goal.x_cm - start.x_cm, goal.y_cm - start.y_cm),
+                self.config.near_goal_reverse_dubins_suppression_cm,
+            )
 
         expansions = 0
         while frontier and expansions < self.config.max_expansions:
@@ -519,7 +537,9 @@ class HybridAStarPlanner:
             analytic_interval = self.config.analytic_expansion_interval * (
                 1 if goal.final_heading_deg is not None else 4
             )
-            if expansions == 1 or expansions % analytic_interval == 0:
+            if not suppress_analytic_expansion and (
+                expansions == 1 or expansions % analytic_interval == 0
+            ):
                 analytic_tail = self._dubins_tail(node, goal, checker)
                 if analytic_tail is not None:
                     LOG.debug(
@@ -913,7 +933,7 @@ class PurePursuitConfig:
     heading_slowdown_deg: float = 35.0
     minimum_tracking_speed_scale: float = 0.40
     nearest_search_ahead_points: int = 30
-    terminal_adjustment_distance_cm: float = 50.0
+    terminal_adjustment_distance_cm: float = 25.0
     terminal_adjustment_speed_mm_s: float = 50.0
 
     def __post_init__(self) -> None:
@@ -1213,12 +1233,13 @@ class NavigationConfig:
     safety_prediction_step_s: float = 0.1
     terminal_overshoot_margin_cm: float = 5.0
     terminal_overshoot_samples: int = 3
-    terminal_deviation_distance_cm: float = 50.0
+    terminal_deviation_distance_cm: float = 25.0
     terminal_deviation_cross_track_cm: float = 6.0
     terminal_deviation_samples: int = 3
     max_recovery_replans: int = 3
     max_terminal_recovery_replans: int = 8
-    terminal_recovery_timeout_s: float = 30.0
+    terminal_recovery_timeout_s: float = 60.0
+    pause_for_wall_relocalization: bool = False
     wall_relocalization_enter_cm: float = 8.0
     wall_relocalization_exit_cm: float = 3.0
     wall_relocalization_release_samples: int = 2
@@ -1509,7 +1530,11 @@ class Navigation:
             self._pose_revision += 1
             self._localization_speed_scale = speed_scale
             wall = update.wall_fusion
-            if wall is not None and wall.accepted:
+            if (
+                self.config.pause_for_wall_relocalization
+                and wall is not None
+                and wall.accepted
+            ):
                 wall_residual_cm = math.hypot(
                     wall.residual_x_cm,
                     wall.residual_y_cm,

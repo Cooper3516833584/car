@@ -295,7 +295,7 @@ class CoordinateNavigation:
         final_heading_deg: float | None = None,
         *,
         position_tolerance_cm: float = 5.0,
-        heading_tolerance_deg: float = 5.0,
+        heading_tolerance_deg: float = 8.0,
     ) -> NavigationGoal:
         """Plan and drive to a pose relative to startup position and heading."""
 
