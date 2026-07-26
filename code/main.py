@@ -60,6 +60,12 @@ from components.grid_rescue_mission import (
     InPlaceDifferentialTurn,
     overlay_blocked_terrain,
 )
+from components.sound_light_alarm import (
+    AlarmGPIOError,
+    SoundLightAlarm,
+    alarm_off,
+    alarm_on,
+)
 
 
 # 自主导航巡航速度，单位 cm/s；定位调试阶段保持 10 cm/s = 0.1 m/s。
@@ -305,6 +311,7 @@ class CarMainApplication:
         self._semantic_step = None
         self._semantic_lock = threading.Lock()
         self.rescue_controller: GridRescueMissionController | None = None
+        self._alarm: SoundLightAlarm | None = None
 
         LOG.debug(
             "application config radar_port=%s link_port=%s radar_mount=(%.2f,%.2f,%.2f) "
@@ -390,6 +397,7 @@ class CarMainApplication:
                 on_navigate=self._fleet_navigate,
                 on_stop=self._fleet_stop,
                 on_start_mapping=self._fleet_start_mapping,
+                on_set_alarm=self._fleet_set_alarm,
             )
             self._initialize_grid_rescue()
         elif hmac_key is not None:
@@ -462,6 +470,11 @@ class CarMainApplication:
             self._rescue_condition.notify_all()
         try:
             self.coordinate_navigation.request_stop()
+            if self._alarm is not None:
+                try:
+                    self._alarm.off()
+                except AlarmGPIOError as exc:
+                    LOG.warning("could not silence alarm during shutdown: %s", exc)
             if self.fleet_node is not None:
                 self.fleet_node.close()
             if self.link is not None:
@@ -801,6 +814,19 @@ class CarMainApplication:
             request_seq,
         )
         return FleetCommandResult(FleetAckStatus.ACCEPTED)
+
+    def _fleet_set_alarm(self, active: bool) -> FleetCommandResult:
+        try:
+            self._alarm = alarm_on() if active else alarm_off()
+        except AlarmGPIOError as exc:
+            LOG.error("could not set sound/light alarm active=%s: %s", active, exc)
+            return FleetCommandResult(
+                FleetAckStatus.FAILED,
+                FleetAckReason.INTERNAL_ERROR,
+                str(exc),
+            )
+        LOG.info("sound/light alarm %s by FleetBus", "on" if active else "off")
+        return FleetCommandResult(FleetAckStatus.COMPLETED)
 
     def _initialize_grid_rescue(self) -> None:
         if self.fleet_node is None:

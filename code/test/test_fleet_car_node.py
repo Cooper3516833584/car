@@ -18,6 +18,7 @@ class Harness:
         self.stop_calls = 0
         self.rescue_calls = []
         self.mapping_calls = []
+        self.alarm_calls = []
         self.callback_threads = []
         self.event = threading.Event()
         self.state = CarFleetState(
@@ -35,6 +36,7 @@ class Harness:
             on_navigate=self.navigate,
             on_stop=self.stop,
             on_start_mapping=self.start_mapping,
+            on_set_alarm=self.set_alarm,
             timing=NodeTiming(0, 16),
             wait=lambda _: False,
         )
@@ -65,6 +67,10 @@ class Harness:
     def start_mapping(self, request_seq):
         self.mapping_calls.append(request_seq)
         return CommandResult(AckStatus.ACCEPTED)
+
+    def set_alarm(self, active):
+        self.alarm_calls.append(active)
+        return CommandResult(AckStatus.COMPLETED)
 
     def send(self, frame):
         self.event.clear()
@@ -156,6 +162,22 @@ class FleetCarNodeTests(unittest.TestCase):
         ))
         self.assertEqual(AckStatus.ACCEPTED, decode_ack(unpack_frame(raw).payload).status)
         self.assertEqual([9], self.h.mapping_calls)
+
+    def test_alarm_commands_call_new_alarm_component_handler(self):
+        for seq, command_id, expected in (
+            (10, CommandId.CAR_ALARM_ON, True),
+            (11, CommandId.CAR_ALARM_OFF, False),
+        ):
+            raw = self.h.send(self.request(
+                MessageKind.COMMAND,
+                encode_command(CommandPayload(command_id)),
+                seq=seq,
+            ))
+            self.assertEqual(
+                AckStatus.COMPLETED,
+                decode_ack(unpack_frame(raw).payload).status,
+            )
+            self.assertEqual(expected, self.h.alarm_calls[-1])
 
     def test_disaster_rescue_is_decoded_by_optional_task_handler(self):
         self.h.node.close()

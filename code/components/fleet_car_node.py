@@ -47,6 +47,7 @@ class FleetCarNode:
         on_navigate: Callable,
         on_stop: Callable[[], CommandResult],
         on_start_mapping: Optional[Callable[[int], CommandResult]] = None,
+        on_set_alarm: Optional[Callable[[bool], CommandResult]] = None,
         timing: NodeTiming = NodeTiming(),
         wait: Optional[Callable[[float], bool]] = None,
     ) -> None:
@@ -56,6 +57,7 @@ class FleetCarNode:
         self._on_navigate = on_navigate
         self._on_stop = on_stop
         self._on_start_mapping = on_start_mapping
+        self._on_set_alarm = on_set_alarm
         self._on_disaster_rescue = None
         self._timing = timing
         self._parser = FrameParser(local_node=NodeId.CAR)
@@ -268,6 +270,17 @@ class FleetCarNode:
                     )
                 else:
                     result = self._on_start_mapping(request.seq)
+            elif command_id in (CommandId.CAR_ALARM_ON, CommandId.CAR_ALARM_OFF):
+                if command.command_body:
+                    raise ValueError("CAR_ALARM command body must be empty")
+                if self._on_set_alarm is None:
+                    result = CommandResult(
+                        AckStatus.REJECTED, AckReason.UNSUPPORTED
+                    )
+                else:
+                    result = self._on_set_alarm(
+                        command_id == CommandId.CAR_ALARM_ON
+                    )
             else:
                 result = CommandResult(AckStatus.REJECTED, AckReason.UNSUPPORTED)
         except ValueError as exc:

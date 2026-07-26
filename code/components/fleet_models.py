@@ -32,10 +32,13 @@ class CommandId(IntEnum):
     CAR_NAVIGATE_TO = 0x11
     CAR_DISASTER_RESCUE = 0x12
     CAR_START_MAPPING = 0x13
+    CAR_ALARM_ON = 0x14
+    CAR_ALARM_OFF = 0x15
     DRONE_GOTO = 0x20
     DRONE_HOLD = 0x21
     CANCEL_TASK = 0x22
     DRONE_START_MISSION = 0x23
+    DRONE_PREPARE_MISSION = 0x24
 
 
 class AckStatus(IntEnum):
