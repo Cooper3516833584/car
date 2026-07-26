@@ -81,6 +81,11 @@ class FleetCarNode:
             raise RuntimeError("disaster handler must be installed before FleetCarNode.start")
         self._on_disaster_rescue = callback
 
+    @property
+    def active_command_seq(self) -> int:
+        """Return the request sequence currently represented by status reports."""
+        return self._active_command_seq
+
     def set_active_command_result(
         self, result: CommandResult, request_seq: Optional[int] = None
     ) -> None:

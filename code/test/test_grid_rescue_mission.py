@@ -45,6 +45,18 @@ class AdjacentGridPlannerTests(unittest.TestCase):
         self.assertEqual(1, sum(cell in water for cell in route))
         self.assertEqual((2, 4), plan.wildfire_cell)
 
+    def test_nearest_reachable_water_wins_before_total_route_length(self):
+        terrain = [int(TerrainCode.FIELD)] * 15
+        terrain[1] = int(TerrainCode.LAKE)
+        terrain[10] = int(TerrainCode.RIVER)
+        terrain[14] = int(TerrainCode.WILDFIRE)
+
+        plan = self.planner().plan(
+            DisasterRescueCommand(8, 2, 4, tuple(terrain))
+        )
+
+        self.assertEqual((0, 1), plan.water_cell)
+
     def test_layout_uses_five_x_columns_and_three_y_rows(self):
         layout = GridLayout()
         self.assertEqual((0.0, 0.0), layout.centre((0, 0)))
@@ -142,6 +154,32 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual((None, (0, 0)), moves[0])
         self.assertEqual(((0, 0), None), moves[-1])
 
+    def test_stop_interrupts_three_second_hold(self):
+        planner = AdjacentGridPlannerTests().planner()
+        water_hold_started = threading.Event()
+        result_event = threading.Event()
+        results = []
+        controller = GridRescueMissionController(
+            planner,
+            navigate=lambda _cell: True,
+            set_step_overlay=lambda *_args: None,
+            clear_overlay=lambda: None,
+            indicator=lambda stage, active: (
+                water_hold_started.set()
+                if stage == "water" and active
+                else None
+            ),
+            on_result=lambda result: (results.append(result), result_event.set()),
+        )
+        self.assertEqual(AckStatus.ACCEPTED, controller.submit(command()).status)
+        self.assertTrue(water_hold_started.wait(1.0))
+
+        controller.stop()
+
+        self.assertTrue(result_event.wait(1.0))
+        self.assertEqual(AckStatus.FAILED, results[-1].status)
+        self.assertTrue(controller.wait(0.1))
+
 
 class _FakeRearMotors:
     allow_in_place_rotation = True
@@ -235,6 +273,23 @@ class AdjacentGridMotionTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             navigator.move((1, 1), (2, 2))
+
+    def test_return_to_start_does_not_constrain_final_heading(self):
+        turns = []
+        goals = []
+
+        class Pivot:
+            def turn_to(self, heading):
+                turns.append(heading)
+
+        navigator = AdjacentGridNavigator(
+            Pivot(),  # type: ignore[arg-type]
+            navigate_to=lambda x, y, heading: goals.append((x, y, heading)) or True,
+        )
+
+        self.assertTrue(navigator.move((0, 0), None))
+        self.assertEqual([], turns)
+        self.assertEqual([(0.0, 0.0, None)], goals)
 
 
 if __name__ == "__main__":

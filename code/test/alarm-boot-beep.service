@@ -1,0 +1,16 @@
+[Unit]
+Description=Rock 5A alarm boot self-test (3 s beep then silent)
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/usr/bin/python3 /home/radxa/car/code/test/alarm_boot_beep.py
+StandardOutput=journal
+StandardError=journal
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

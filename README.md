@@ -7,6 +7,7 @@
 - `components/rear_motor.py`：C10B 后轮串口控制、20 Hz 刷新、超时停车。
 - `components/steering_servo.py`：ROCK 5A Pin 23 前轮转向舵机及厂家标定曲线。
 - `components/ackermann_drive.py`：统一设置车速、前轮偏航方向，并可联动后轮差速。
+- `components/sound_light_alarm.py`：ROCK 5A GPIO4_B3 低电平触发声光报警器。
 - `components/trusted_navigation_map.py`：可信雷达位姿门限、车体自反射过滤和导航占据图。
 
 `main.py` 通过 `Navigation` 间接使用 `AckermannDrive`；只有维护、标定或特殊控制时才直接访问前后独立组件。
@@ -163,6 +164,24 @@ Vz = (right - left) / 164
 所有角度、转弯半径和内外轮速度会先完整校验，再写入 PWM 和串口。高速大转角导致外侧轮超过默认 `300 mm/s` 限幅时会拒绝整条命令；调用方应降低中心速度，不会由组件静默缩放。
 
 后轮的 `0.5 s` 命令看门狗继续有效，所以运动状态下 `main` 需要周期性调用 `set_motion()`、`set_speed()` 或 `set_yaw()`。仅改变一次舵机并不能永久维持后轮运动命令。
+
+## GPIO4_B3 声光报警器
+
+低电平触发的声光报警器接 ROCK 5A `GPIO4_B3`（40Pin 物理 Pin 11）。组件会在运行时从
+`gpio4` 的 sysfs base 解析 line 11，当前板端对应全局 GPIO 139；初始化时使用
+`direction=high` 原子地切换为输出高电平，避免切换方向时产生短暂的低电平报警。
+
+```python
+from components import SoundLightAlarm
+
+alarm = SoundLightAlarm().initialize()  # 高电平，关闭报警
+alarm.on()                              # 低电平，开启声光报警
+alarm.off()                             # 高电平，关闭声光报警
+```
+
+板端安装了 `sound-light-alarm.service`，开机自动执行 `--off --grant-group gpio`，保持
+GPIO4_B3 为高电平，并允许 `gpio` 组中的项目进程随时调用组件。服务单元的仓库副本位于
+`code/test/sound-light-alarm.service`。
 
 ## HC-14 串口通信组件
 

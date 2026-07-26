@@ -48,7 +48,17 @@ from components.fleet_models import (
     CarNavigateCommand,
     CommandResult as FleetCommandResult,
     CoordinateFrameCommand,
+    DisasterRescueCommand,
     NodeFlags as FleetNodeFlags,
+    TerrainCode,
+)
+from components.grid_rescue_mission import (
+    AdjacentGridNavigator,
+    AdjacentGridRescuePlanner,
+    GridLayout,
+    GridRescueMissionController,
+    InPlaceDifferentialTurn,
+    overlay_blocked_terrain,
 )
 
 
@@ -63,6 +73,25 @@ NAVIGATION_CRUISE_SPEED_CM_S = 30.0
 NAVIGATION_REVERSE_SPEED_CM_S = 15.0
 # 自主导航倒车开关；True 允许规划倒车和前进/倒车换挡，False 只允许前进。
 NAVIGATION_ALLOW_REVERSE = True
+# ==================== 比赛现场只需编辑以下三个列表 ====================
+# 模拟取水地块：可临时改成 field 等，不要求一定是真实 lake/river。
+WATER_PICKUP_TERRAINS = ["lake", "river"]
+# 模拟灭火目标地块：通常保持 wildfire。
+WILDFIRE_TARGET_TERRAINS = ["wildfire"]
+# 禁止进入地块：当前无要求所以留空；如需避开居民地可填 ["settlements"]。
+FORBIDDEN_TERRAINS = []
+# =====================================================================
+
+TERRAIN_NAME_TO_CODE = {
+    "snow_mountain": int(TerrainCode.SNOW_MOUNTAIN),
+    "field": int(TerrainCode.FIELD),
+    "river": int(TerrainCode.RIVER),
+    "settlements": int(TerrainCode.SETTLEMENTS),
+    "lake": int(TerrainCode.LAKE),
+    "debris_flow": int(TerrainCode.DEBRIS_FLOW),
+    "wildfire": int(TerrainCode.WILDFIRE),
+}
+RESCUE_NAVIGATION_STEP_TIMEOUT_S = 90.0
 # The ground car uses wall lines only for conservative drift correction over
 # continuous ICP; quality, residual and per-update jump gates remain mandatory.
 RADAR_ABSOLUTE_WALL_LOW_PASS_RATIO = 0.20
@@ -74,6 +103,14 @@ LOG_FILENAME = "car-main.log"
 LOG_MAX_BYTES = 20 * 1024 * 1024
 LOG_BACKUP_COUNT = 10
 _LOG_LISTENER: QueueListener | None = None
+
+
+def terrain_codes(names) -> tuple[int, ...]:
+    normalized = tuple(str(name).strip().lower() for name in names)
+    unknown = sorted(set(normalized) - set(TERRAIN_NAME_TO_CODE))
+    if unknown:
+        raise ValueError("unknown terrain names: {}".format(", ".join(unknown)))
+    return tuple(TERRAIN_NAME_TO_CODE[name] for name in normalized)
 
 
 def default_log_dir() -> Path:
@@ -260,6 +297,14 @@ class CarMainApplication:
         self._console_thread: threading.Thread | None = None
         self._started_at = time.monotonic()
         self._fleet_alignment: DroneGlobalAlignment | None = None
+        self._rescue_condition = threading.Condition()
+        self._rescue_terminal_generation = 0
+        self._rescue_terminal_state: NavigationState | None = None
+        self._rescue_mission_active = False
+        self._rescue_request_seq: int | None = None
+        self._semantic_step = None
+        self._semantic_lock = threading.Lock()
+        self.rescue_controller: GridRescueMissionController | None = None
 
         LOG.debug(
             "application config radar_port=%s link_port=%s radar_mount=(%.2f,%.2f,%.2f) "
@@ -296,7 +341,9 @@ class CarMainApplication:
                 startup_scan_count=config.startup_scan_count,
                 calibration_timeout_s=config.calibration_timeout_s,
                 allow_reverse=config.allow_reverse,
-                allow_in_place_rotation=config.allow_in_place_rotation,
+                allow_in_place_rotation=(
+                    config.allow_in_place_rotation or fleet_bus
+                ),
                 cruise_speed_cm_s=NAVIGATION_CRUISE_SPEED_CM_S,
                 reverse_speed_cm_s=NAVIGATION_REVERSE_SPEED_CM_S,
                 max_cruise_speed_cm_s=_MAX_NAVIGATION_CRUISE_SPEED_CM_S,
@@ -344,6 +391,7 @@ class CarMainApplication:
                 on_stop=self._fleet_stop,
                 on_start_mapping=self._fleet_start_mapping,
             )
+            self._initialize_grid_rescue()
         elif hmac_key is not None:
             self.protocol = GroundNavigationProtocol(
                 key=hmac_key,
@@ -408,6 +456,10 @@ class CarMainApplication:
         LOG.info("application closing")
         with self._lock:
             self._ready = False
+        if self.rescue_controller is not None:
+            self.rescue_controller.stop()
+        with self._rescue_condition:
+            self._rescue_condition.notify_all()
         try:
             self.coordinate_navigation.request_stop()
             if self.fleet_node is not None:
@@ -417,6 +469,8 @@ class CarMainApplication:
             mapping_thread = self._fleet_mapping_thread
             if mapping_thread is not None:
                 mapping_thread.join(timeout=2.0)
+            if self.rescue_controller is not None:
+                self.rescue_controller.wait(timeout=2.0)
         finally:
             self.coordinate_navigation.close()
         LOG.info("application closed; hardware outputs are safe")
@@ -426,6 +480,11 @@ class CarMainApplication:
 
     def _install_navigation_grid(self, grid) -> bool:
         """Task-layer hook for conservative, obstacle-only map overlays."""
+        with self._semantic_lock:
+            step = self._semantic_step
+        if step is not None:
+            _current, _target, blocked = step
+            grid = overlay_blocked_terrain(grid, blocked)
         return self.navigation.set_map(grid)
 
     def _on_link_frame(self, frame: bytes) -> None:
@@ -533,6 +592,7 @@ class CarMainApplication:
                 )
             self.navigation.cancel(reason=ready_reason)
             LOG.info("terminal FleetBus mission published; startup origin retained")
+            self._notify_rescue_terminal(state)
             return
         if console_mission:
             if state is NavigationState.ARRIVED:
@@ -542,6 +602,7 @@ class CarMainApplication:
             self.navigation.cancel(reason=ready_reason)
             self._console_print("可继续输入下一目标；启动原点和地图坐标系保持不变。")
             LOG.info("terminal mission reset for next SSH goal; startup origin retained")
+            self._notify_rescue_terminal(state)
             return
         if receipt is not None:
             if state is NavigationState.ARRIVED:
@@ -559,6 +620,13 @@ class CarMainApplication:
             self._send_or_queue_status(reply)
         self.navigation.cancel(reason=ready_reason)
         LOG.info("terminal mission reset for next remote goal; startup origin retained")
+        self._notify_rescue_terminal(state)
+
+    def _notify_rescue_terminal(self, state: NavigationState) -> None:
+        with self._rescue_condition:
+            self._rescue_terminal_state = state
+            self._rescue_terminal_generation += 1
+            self._rescue_condition.notify_all()
 
     def _log_navigation_blocked(self, reason: str) -> None:
         """Record evidence that distinguishes a real obstacle from map drift."""
@@ -734,6 +802,166 @@ class CarMainApplication:
         )
         return FleetCommandResult(FleetAckStatus.ACCEPTED)
 
+    def _initialize_grid_rescue(self) -> None:
+        if self.fleet_node is None:
+            return
+        layout = GridLayout()
+        planner = AdjacentGridRescuePlanner(
+            water_terrain_codes=terrain_codes(WATER_PICKUP_TERRAINS),
+            wildfire_terrain_codes=terrain_codes(WILDFIRE_TARGET_TERRAINS),
+            forbidden_terrain_codes=terrain_codes(FORBIDDEN_TERRAINS),
+            layout=layout,
+        )
+        self.coordinate_navigation.map_installer = self._install_navigation_grid
+        pivot = InPlaceDifferentialTurn(
+            self.navigation.drive,
+            pose_provider=lambda: self.navigation.pose,
+            on_motion_changed=self.radar.set_motion_hint,
+            stop_requested=lambda: (
+                self._stop_event.is_set()
+                or (
+                    self.rescue_controller is not None
+                    and self.rescue_controller.stop_requested
+                )
+            ),
+        )
+        grid_navigator = AdjacentGridNavigator(
+            pivot,
+            navigate_to=self._navigate_grid_pose,
+            layout=layout,
+        )
+        self.rescue_controller = GridRescueMissionController(
+            planner,
+            navigate=self._navigate_rescue_cell,
+            move_adjacent=grid_navigator.move,
+            set_step_overlay=self._set_semantic_step,
+            clear_overlay=self._clear_semantic_overlay,
+            on_result=self._on_rescue_result,
+            hold_seconds=3.0,
+        )
+        self.fleet_node.set_disaster_handler(self._fleet_disaster_rescue)
+        LOG.info(
+            "adjacent-grid rescue enabled water=%s wildfire=%s forbidden=%s",
+            WATER_PICKUP_TERRAINS,
+            WILDFIRE_TARGET_TERRAINS,
+            FORBIDDEN_TERRAINS,
+        )
+
+    def _fleet_disaster_rescue(
+        self, command: DisasterRescueCommand
+    ) -> FleetCommandResult:
+        controller = self.rescue_controller
+        with self._lock:
+            if (
+                controller is None
+                or not self._ready
+                or self._fleet_alignment is None
+                or self.trusted_map.calibration is None
+            ):
+                return FleetCommandResult(
+                    FleetAckStatus.REJECTED, FleetAckReason.NOT_READY
+                )
+            if (
+                self._rescue_mission_active
+                or self._fleet_mission_active
+                or self._console_mission_active
+                or self._active_receipt is not None
+            ):
+                return FleetCommandResult(
+                    FleetAckStatus.REJECTED, FleetAckReason.BUSY
+                )
+            self._rescue_mission_active = True
+            self._rescue_request_seq = (
+                None
+                if self.fleet_node is None
+                else self.fleet_node.active_command_seq
+            )
+        result = controller.submit(command)
+        if result.status != FleetAckStatus.ACCEPTED:
+            with self._lock:
+                self._rescue_mission_active = False
+                self._rescue_request_seq = None
+        return result
+
+    def _on_rescue_result(self, result: FleetCommandResult) -> None:
+        with self._lock:
+            self._rescue_mission_active = False
+            request_seq = self._rescue_request_seq
+            self._rescue_request_seq = None
+        if self.fleet_node is not None:
+            self.fleet_node.set_active_command_result(result, request_seq)
+
+    def _set_semantic_step(self, current, target, blocked) -> None:
+        with self._semantic_lock:
+            self._semantic_step = (current, target, blocked)
+        self._refresh_trusted_grid(force=True)
+        LOG.info(
+            "semantic rescue corridor current=%s target=%s blocked=%s",
+            current,
+            target,
+            sorted(blocked),
+        )
+
+    def _clear_semantic_overlay(self) -> None:
+        with self._semantic_lock:
+            self._semantic_step = None
+        self._refresh_trusted_grid(force=True)
+
+    def _navigate_rescue_cell(self, cell) -> bool:
+        layout = GridLayout()
+        if cell is None:
+            x_cm, y_cm = layout.start_point_cm
+        else:
+            x_cm, y_cm = layout.centre(cell)
+        return self._navigate_grid_pose(x_cm, y_cm, None)
+
+    def _navigate_grid_pose(
+        self, x_cm: float, y_cm: float, heading: float | None
+    ) -> bool:
+        controller = self.rescue_controller
+        if (
+            controller is None
+            or controller.stop_requested
+            or self._stop_event.is_set()
+        ):
+            return False
+        with self._rescue_condition:
+            generation = self._rescue_terminal_generation
+        try:
+            self._submit_console_goal(NavigationGoal(x_cm, y_cm, heading))
+        except (
+            CoordinateGoalRejected,
+            NavigationCommandRejected,
+            NavigationError,
+            ValueError,
+        ) as exc:
+            LOG.error(
+                "rescue waypoint rejected pose=(%.1f,%.1f,%s): %s",
+                x_cm,
+                y_cm,
+                "none" if heading is None else f"{heading:.1f}",
+                exc,
+            )
+            return False
+        deadline = time.monotonic() + RESCUE_NAVIGATION_STEP_TIMEOUT_S
+        with self._rescue_condition:
+            while self._rescue_terminal_generation == generation:
+                if controller.stop_requested or self._stop_event.is_set():
+                    self._cancel_from_console()
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._cancel_from_console()
+                    LOG.error(
+                        "rescue waypoint timeout pose=(%.1f,%.1f,%s)",
+                        x_cm,
+                        y_cm,
+                        heading,
+                    )
+                    return False
+                self._rescue_condition.wait(min(0.2, remaining))
+            return self._rescue_terminal_state is NavigationState.ARRIVED
+
     def _run_fleet_mapping(self, request_seq: int) -> None:
         try:
             calibration = self.coordinate_navigation.start()
@@ -810,7 +1038,8 @@ class CarMainApplication:
             local_heading = (-local_yaw_cw) % 360.0
         with self._lock:
             if (
-                self._fleet_mission_active
+                self._rescue_mission_active
+                or self._fleet_mission_active
                 or self._console_mission_active
                 or self._active_receipt is not None
             ):
@@ -851,12 +1080,17 @@ class CarMainApplication:
         return FleetCommandResult(FleetAckStatus.ACCEPTED)
 
     def _fleet_stop(self) -> FleetCommandResult:
+        if self.rescue_controller is not None:
+            self.rescue_controller.stop()
         with self._lock:
             self._fleet_mission_active = False
+            self._rescue_mission_active = False
             mapping_active = self._fleet_mapping_active
         if mapping_active:
             self.coordinate_navigation.request_stop()
         self._cancel_from_console()
+        with self._rescue_condition:
+            self._rescue_condition.notify_all()
         return FleetCommandResult(FleetAckStatus.COMPLETED)
 
     def _send_frame(self, frame: bytes) -> None:

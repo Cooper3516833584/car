@@ -1,0 +1,16 @@
+[Unit]
+Description=Initialize GPIO4_B3 active-low sound/light alarm to safe high level
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 /home/radxa/car/code/components/sound_light_alarm.py --off --grant-group gpio
+ExecStop=/usr/bin/python3 /home/radxa/car/code/components/sound_light_alarm.py --off --grant-group gpio
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target

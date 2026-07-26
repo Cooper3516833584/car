@@ -78,6 +78,17 @@ class Harness:
 
 
 class FleetCarNodeTests(unittest.TestCase):
+    def test_active_command_sequence_is_exposed_for_async_result_matching(self):
+        request = self.request(
+            MessageKind.COMMAND,
+            encode_command(CommandPayload(CommandId.PING)),
+            seq=21,
+        )
+
+        self.h.send(request)
+
+        self.assertEqual(21, self.h.node.active_command_seq)
+
     def setUp(self):
         self.h = Harness()
         self.addCleanup(self.h.node.close)

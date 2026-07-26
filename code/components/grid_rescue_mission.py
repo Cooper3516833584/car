@@ -251,9 +251,8 @@ class AdjacentGridNavigator:
         if target is None:
             if current not in self.layout.start_entry_cells:
                 raise ValueError("only a start-entry cell can return to start point")
-            self.pivot_turn.turn_to(0.0)
             x_cm, y_cm = self.layout.start_point_cm
-            return bool(self.navigate_to(x_cm, y_cm, 0.0))
+            return bool(self.navigate_to(x_cm, y_cm, None))
         self.layout.validate_cell(target)
         if current is None:
             if target not in self.layout.start_entry_cells:
@@ -345,12 +344,14 @@ class AdjacentGridRescuePlanner:
                 frozenset(inbound_blocked),
                 frozenset(after_water_blocked),
             )
-            candidates.append((len(plan.driven_cells), water, plan))
+            candidates.append(
+                (len(plan.to_water), len(plan.driven_cells), water, plan)
+            )
         if not candidates:
             raise RescuePlanError(
                 "no adjacent route can visit water exactly once, reach wildfire and return"
             )
-        return min(candidates, key=lambda item: (item[0], item[1]))[2]
+        return min(candidates, key=lambda item: item[:3])[3]
 
     def _from_start(self, goal: Cell, blocked: set) -> Optional[Tuple[Cell, ...]]:
         paths = []
@@ -472,6 +473,14 @@ class GridRescueMissionController:
     def stop(self) -> None:
         self._stop.set()
 
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        with self._lock:
+            thread = self._thread
+        if thread is None:
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
+
     def _run(self, event_id: int, plan: RescueRoutePlan) -> None:
         result = CommandResult(AckStatus.FAILED, AckReason.INTERNAL_ERROR)
         current = None  # type: Optional[Cell]
@@ -491,7 +500,7 @@ class GridRescueMissionController:
             with self._lock:
                 self._completed_event_ids.add(event_id)
             result = CommandResult(AckStatus.COMPLETED)
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
             result = CommandResult(AckStatus.FAILED, AckReason.INTERNAL_ERROR, str(exc))
         finally:
             self._indicator("water", False)

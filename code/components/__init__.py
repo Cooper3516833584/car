@@ -33,6 +33,13 @@ from .serial_communication import (
     SerialCommunicationDriver,
     SerialDriverError,
 )
+from .sound_light_alarm import (
+    AlarmGPIOError,
+    SoundLightAlarm,
+    alarm_off,
+    alarm_on,
+    resolve_gpio_number,
+)
 from .radar_driver import (
     DEFAULT_D500_PORT,
     D500PacketParser,
@@ -149,6 +156,11 @@ __all__ = [
     "HC14SerialDriver",
     "SerialCommunicationDriver",
     "SerialDriverError",
+    "AlarmGPIOError",
+    "SoundLightAlarm",
+    "alarm_off",
+    "alarm_on",
+    "resolve_gpio_number",
     "DEFAULT_D500_PORT",
     "D500PacketParser",
     "D500RadarComponent",
