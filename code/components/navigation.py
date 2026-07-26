@@ -112,8 +112,8 @@ class NavigationGoal:
     x_cm: float
     y_cm: float
     final_heading_deg: float | None = None
-    position_tolerance_cm: float = 10.0
-    heading_tolerance_deg: float = 8.0
+    position_tolerance_cm: float = 5.0
+    heading_tolerance_deg: float = 5.0
 
     def __post_init__(self) -> None:
         if not math.isfinite(float(self.x_cm)) or not math.isfinite(float(self.y_cm)):
@@ -913,7 +913,7 @@ class PurePursuitConfig:
     heading_slowdown_deg: float = 35.0
     minimum_tracking_speed_scale: float = 0.40
     nearest_search_ahead_points: int = 30
-    terminal_adjustment_distance_cm: float = 25.0
+    terminal_adjustment_distance_cm: float = 50.0
     terminal_adjustment_speed_mm_s: float = 50.0
 
     def __post_init__(self) -> None:
@@ -1213,11 +1213,14 @@ class NavigationConfig:
     safety_prediction_step_s: float = 0.1
     terminal_overshoot_margin_cm: float = 5.0
     terminal_overshoot_samples: int = 3
+    terminal_deviation_distance_cm: float = 50.0
+    terminal_deviation_cross_track_cm: float = 6.0
+    terminal_deviation_samples: int = 3
     max_recovery_replans: int = 3
     max_terminal_recovery_replans: int = 8
     terminal_recovery_timeout_s: float = 30.0
-    wall_relocalization_enter_cm: float = 15.0
-    wall_relocalization_exit_cm: float = 5.0
+    wall_relocalization_enter_cm: float = 8.0
+    wall_relocalization_exit_cm: float = 3.0
     wall_relocalization_release_samples: int = 2
 
     def __post_init__(self) -> None:
@@ -1256,6 +1259,9 @@ class NavigationConfig:
         if (
             self.terminal_overshoot_margin_cm < 0
             or self.terminal_overshoot_samples <= 0
+            or self.terminal_deviation_distance_cm <= 0
+            or self.terminal_deviation_cross_track_cm <= 0
+            or self.terminal_deviation_samples <= 0
             or self.max_recovery_replans <= 0
             or self.max_terminal_recovery_replans <= 0
             or self.terminal_recovery_timeout_s <= 0
@@ -1352,6 +1358,8 @@ class Navigation:
         self._last_motion_plan: AckermannMotionPlan | None = None
         self._terminal_overshoot_count = 0
         self._last_terminal_overshoot_pose_revision = -1
+        self._terminal_deviation_count = 0
+        self._last_terminal_deviation_pose_revision = -1
         self._recovery_replan_count = 0
         self._terminal_recovery_replan_count = 0
         self._safety_recovery_replan_count = 0
@@ -1842,6 +1850,15 @@ class Navigation:
                 return
             self.fail_safe_stop("terminal recovery retry/time limit exceeded")
             return
+        if self._terminal_correction_requires_replan(command, pose_revision):
+            if self._request_replan(
+                "terminal steering saturated with excessive cross-track error",
+                terminal=True,
+                now=now,
+            ):
+                return
+            self.fail_safe_stop("terminal recovery retry/time limit exceeded")
+            return
         if self._correction_is_failing(command, pose_revision):
             self.fail_safe_stop(
                 "steering correction saturated while path/goal error worsened"
@@ -2202,6 +2219,42 @@ class Navigation:
                 >= self.config.correction_failure_samples
             )
 
+    def _terminal_correction_requires_replan(
+        self,
+        command: TrackerCommand,
+        pose_revision: int,
+    ) -> bool:
+        """Detect a terminal lateral miss before driving through the goal band."""
+
+        with self._lock:
+            if pose_revision == self._last_terminal_deviation_pose_revision:
+                return False
+            self._last_terminal_deviation_pose_revision = pose_revision
+            steering_limit = (
+                self.geometry.max_left_steering_rad
+                if command.steering_angle_rad >= 0.0
+                else abs(self.geometry.min_right_steering_rad)
+            )
+            saturated = (
+                steering_limit > 0.0
+                and abs(command.steering_angle_rad)
+                >= steering_limit * self.config.steering_saturation_ratio
+            )
+            excessive_terminal_error = (
+                command.distance_to_goal_cm
+                <= self.config.terminal_deviation_distance_cm
+                and command.cross_track_error_cm
+                >= self.config.terminal_deviation_cross_track_cm
+            )
+            if saturated and excessive_terminal_error:
+                self._terminal_deviation_count += 1
+            else:
+                self._terminal_deviation_count = 0
+            return (
+                self._terminal_deviation_count
+                >= self.config.terminal_deviation_samples
+            )
+
     def _unprogressed_goal_increase(
         self,
         command: TrackerCommand,
@@ -2470,10 +2523,14 @@ class Navigation:
         self._last_progress_guard_pose_revision = -1
         self._progress_guard_path_index = self._path_progress_index
         self._progress_guard_min_goal_distance_cm = None
+        self._terminal_deviation_count = 0
+        self._last_terminal_deviation_pose_revision = -1
 
     def _reset_terminal_recovery_tracking(self) -> None:
         self._terminal_overshoot_count = 0
         self._last_terminal_overshoot_pose_revision = -1
+        self._terminal_deviation_count = 0
+        self._last_terminal_deviation_pose_revision = -1
         self._recovery_replan_count = 0
         self._terminal_recovery_replan_count = 0
         self._safety_recovery_replan_count = 0

@@ -307,6 +307,24 @@ class PurePursuitTests(unittest.TestCase):
 
         self.assertLessEqual(command.speed_mm_s, 50.0)
 
+    def test_default_terminal_speed_cap_starts_fifty_centimetres_from_goal(self) -> None:
+        controller = PurePursuitController(
+            config=PurePursuitConfig(
+                cruise_speed_mm_s=300.0,
+                max_speed_mm_s=300.0,
+                approach_speed_mm_s=80.0,
+                reverse_speed_mm_s=150.0,
+            )
+        )
+        path = NavigationPath(
+            (PathPoint(0, 0, 0), PathPoint(40, 0, 0)),
+            NavigationGoal(40, 0, final_heading_deg=0),
+        )
+
+        command = controller.compute(NavigationPose(0, 0, 0, 0), path)
+
+        self.assertEqual(command.speed_mm_s, 50.0)
+
     def test_signed_cross_track_and_heading_feedback_correct_radar_error(self) -> None:
         controller = PurePursuitController()
         path = NavigationPath(
@@ -1026,6 +1044,62 @@ class NavigationStateMachineTests(unittest.TestCase):
         )
         self.assertEqual(navigation._terminal_recovery_replan_count, 8)
 
+    def test_terminal_saturated_cross_track_requests_replan_after_distinct_poses(self) -> None:
+        navigation = Navigation(
+            drive=_FakeDrive(),
+            config=NavigationConfig(
+                terminal_deviation_distance_cm=50.0,
+                terminal_deviation_cross_track_cm=6.0,
+                terminal_deviation_samples=3,
+            ),
+        )
+        command = TrackerCommand(
+            50.0,
+            navigation.geometry.min_right_steering_rad,
+            MotorDirection.FORWARD,
+            10,
+            9.5,
+            20.0,
+            9.5,
+            4.0,
+        )
+
+        self.assertFalse(navigation._terminal_correction_requires_replan(command, 1))
+        self.assertFalse(navigation._terminal_correction_requires_replan(command, 1))
+        self.assertFalse(navigation._terminal_correction_requires_replan(command, 2))
+        self.assertTrue(navigation._terminal_correction_requires_replan(command, 3))
+
+    def test_terminal_cross_track_guard_ignores_far_or_unsaturated_motion(self) -> None:
+        navigation = Navigation(drive=_FakeDrive())
+        far_command = TrackerCommand(
+            100.0,
+            navigation.geometry.min_right_steering_rad,
+            MotorDirection.FORWARD,
+            1,
+            9.0,
+            60.0,
+        )
+        unsaturated_command = TrackerCommand(
+            50.0,
+            -0.05,
+            MotorDirection.FORWARD,
+            2,
+            9.0,
+            20.0,
+        )
+
+        for revision in range(1, 5):
+            self.assertFalse(
+                navigation._terminal_correction_requires_replan(far_command, revision)
+            )
+        for revision in range(5, 9):
+            self.assertFalse(
+                navigation._terminal_correction_requires_replan(
+                    unsaturated_command,
+                    revision,
+                )
+            )
+
     def test_large_wall_residual_holds_then_releases_navigation(self) -> None:
         navigation = Navigation(drive=_FakeDrive())
 
@@ -1045,11 +1119,11 @@ class NavigationStateMachineTests(unittest.TestCase):
                 wall,
             )
 
-        navigation.update_from_radar(radar_update(20.0))
+        navigation.update_from_radar(radar_update(9.0))
         self.assertTrue(navigation._wall_relocalization_hold)
-        navigation.update_from_radar(radar_update(4.0))
+        navigation.update_from_radar(radar_update(2.5))
         self.assertTrue(navigation._wall_relocalization_hold)
-        navigation.update_from_radar(radar_update(4.0))
+        navigation.update_from_radar(radar_update(2.5))
         self.assertFalse(navigation._wall_relocalization_hold)
 
     @staticmethod

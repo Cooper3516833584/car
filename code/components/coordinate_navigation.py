@@ -85,7 +85,7 @@ class CoordinateNavigationConfig:
     trusted_max_icp_error_cm: float = 10.0
     footprint_clearance_cm: float = 2.0
     wall_rotation_adaptation: bool = True
-    wall_low_pass_ratio: float = 0.60
+    wall_low_pass_ratio: float = 0.20
 
     def __post_init__(self) -> None:
         if not self.radar_port:
@@ -245,8 +245,8 @@ class CoordinateNavigation:
         self.radar.odometry.reset(Pose2D())
         self.radar.global_map.clear()
         self.radar.alignment = calibration.local_to_global
-        fusion_config = WallFusionConfig.drone_absolute(
-            low_pass_ratio=self.config.wall_low_pass_ratio,
+        fusion_config = WallFusionConfig.car_slow_drift(
+            position_gain=self.config.wall_low_pass_ratio,
         )
         self.radar.enable_wall_fusion(
             calibration.wall_reference,
@@ -294,8 +294,8 @@ class CoordinateNavigation:
         y_cm: float,
         final_heading_deg: float | None = None,
         *,
-        position_tolerance_cm: float = 10.0,
-        heading_tolerance_deg: float = 8.0,
+        position_tolerance_cm: float = 5.0,
+        heading_tolerance_deg: float = 5.0,
     ) -> NavigationGoal:
         """Plan and drive to a pose relative to startup position and heading."""
 
@@ -485,6 +485,8 @@ class CoordinateNavigation:
             "radar phase=%s scan_ts_ms=%d points=%d accepted=%s initialized=%s "
             "rejection=%r local_pose=(%.3f,%.3f,%.3f) global_pose=%s "
             "icp_error_cm=%s icp_matches=%s wall_status=%s wall_reason=%r "
+            "wall_correction=(%.3f,%.3f,%.3f) "
+            "wall_residual=(%.3f,%.3f,%.3f) "
             "global_points=%d",
             phase,
             update.scan.timestamp_ms,
@@ -502,5 +504,11 @@ class CoordinateNavigation:
             "none" if icp is None else icp.matched_points,
             "none" if wall is None else wall.status.value,
             None if wall is None else wall.reason,
+            0.0 if wall is None else wall.correction_x_cm,
+            0.0 if wall is None else wall.correction_y_cm,
+            0.0 if wall is None else wall.correction_yaw_deg,
+            0.0 if wall is None else wall.residual_x_cm,
+            0.0 if wall is None else wall.residual_y_cm,
+            0.0 if wall is None else wall.residual_yaw_deg,
             len(update.global_points_cm),
         )

@@ -89,7 +89,7 @@ class CoordinateNavigationTests(unittest.TestCase):
         goal = component.navigate_to(80.0, 40.0, 90.0)
 
         self.assertEqual(goal, NavigationGoal(80.0, 40.0, 90.0))
-        self.assertEqual(navigation.calls, [(80.0, 40.0, 90.0, 10.0, 8.0)])
+        self.assertEqual(navigation.calls, [(80.0, 40.0, 90.0, 5.0, 5.0)])
 
     def test_goal_object_tolerances_are_preserved(self) -> None:
         component, navigation = self.make_component()

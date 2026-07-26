@@ -388,6 +388,17 @@ class WallLineFusionTests(unittest.TestCase):
         self.assertEqual(config.max_position_residual_cm, 12.0)
         self.assertEqual(config.max_position_correction_cm, 5.0)
 
+    def test_car_profile_limits_wall_correction_to_slow_drift(self) -> None:
+        config = WallFusionConfig.car_slow_drift()
+
+        self.assertEqual(config.update_every_scans, 5)
+        self.assertEqual(config.consistency_samples, 3)
+        self.assertAlmostEqual(config.position_gain, 0.20)
+        self.assertAlmostEqual(config.yaw_gain, 0.15)
+        self.assertEqual(config.max_position_residual_cm, 12.0)
+        self.assertEqual(config.max_position_correction_cm, 1.0)
+        self.assertEqual(config.max_yaw_correction_deg, 0.5)
+
     def test_drone_absolute_profile_rejects_parallel_line_jump_from_real_log(self) -> None:
         predicted_wall = Pose2D(92.0, 4.6, -32.0)
         predicted_global = self.wall_to_global.pose_to_global(predicted_wall)

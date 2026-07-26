@@ -63,9 +63,9 @@ NAVIGATION_CRUISE_SPEED_CM_S = 30.0
 NAVIGATION_REVERSE_SPEED_CM_S = 15.0
 # 自主导航倒车开关；True 允许规划倒车和前进/倒车换挡，False 只允许前进。
 NAVIGATION_ALLOW_REVERSE = True
-# Match the drone's default absolute-wall pose filter.  The car additionally
-# keeps wall quality, residual and maximum-jump gates in WallFusionConfig.
-RADAR_ABSOLUTE_WALL_LOW_PASS_RATIO = 0.60
+# The ground car uses wall lines only for conservative drift correction over
+# continuous ICP; quality, residual and per-update jump gates remain mandatory.
+RADAR_ABSOLUTE_WALL_LOW_PASS_RATIO = 0.20
 _MAX_NAVIGATION_CRUISE_SPEED_CM_S = 100.0
 _WHEEL_SPEED_HEADROOM = 1.20
 

@@ -1071,6 +1071,42 @@ class WallFusionConfig:
             max_axis_rms_cm=3.5,
         )
 
+    @classmethod
+    def car_slow_drift(
+        cls,
+        *,
+        position_gain: float = 0.20,
+        yaw_gain: float = 0.15,
+    ) -> "WallFusionConfig":
+        """Return the conservative wall-drift profile for the ground car.
+
+        An Ackermann controller must not consume centimetre-scale absolute
+        pose jumps on every radar revolution: it will interpret them as real
+        lateral motion and can immediately saturate the steering.  The car
+        therefore uses wall lines only as a slow absolute correction on top
+        of continuous ICP odometry.
+        """
+
+        if not 0.0 < position_gain <= 1.0 or not 0.0 < yaw_gain <= 1.0:
+            raise ValueError("car wall fusion gains must be in (0, 1]")
+        return cls(
+            update_every_scans=5,
+            position_gain=position_gain,
+            yaw_gain=yaw_gain,
+            max_position_residual_cm=12.0,
+            max_yaw_residual_deg=8.0,
+            max_position_correction_cm=1.0,
+            max_yaw_correction_deg=0.5,
+            consistency_samples=3,
+            consistency_history_size=5,
+            consistency_max_gap_scans=5,
+            max_position_spread_cm=3.0,
+            max_yaw_spread_deg=1.5,
+            min_x_wall_points=25,
+            min_y_wall_points=25,
+            max_axis_rms_cm=3.5,
+        )
+
     def __post_init__(self) -> None:
         if (
             self.update_every_scans <= 0
