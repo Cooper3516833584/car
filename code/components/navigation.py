@@ -377,6 +377,8 @@ class HybridAStarConfig:
     gear_change_cost_cm: float = 25.0
     steering_cost_cm: float = 1.0
     safety_margin_cm: float = 2.0
+    planning_position_tolerance_cm: float = 5.0
+    planning_heading_tolerance_deg: float = 5.0
 
     def __post_init__(self) -> None:
         if self.heading_bins < 8 or self.primitive_length_cm <= 0:
@@ -386,6 +388,8 @@ class HybridAStarConfig:
             or self.max_expansions <= 0
             or self.max_planning_time_s <= 0
             or self.analytic_expansion_interval <= 0
+            or self.planning_position_tolerance_cm <= 0
+            or self.planning_heading_tolerance_deg <= 0
         ):
             raise ValueError("invalid Hybrid A* limits")
 
@@ -817,13 +821,22 @@ class HybridAStarPlanner:
         heading_bin %= self.config.heading_bins
         return ix, iy, heading_bin, direction.value
 
-    @staticmethod
-    def _goal_reached(node: _SearchNode, goal: NavigationGoal) -> bool:
-        if math.hypot(node.x_cm - goal.x_cm, node.y_cm - goal.y_cm) > goal.position_tolerance_cm:
+    def _goal_reached(self, node: _SearchNode, goal: NavigationGoal) -> bool:
+        position_tolerance_cm = min(
+            goal.position_tolerance_cm,
+            self.config.planning_position_tolerance_cm,
+        )
+        if math.hypot(node.x_cm - goal.x_cm, node.y_cm - goal.y_cm) > position_tolerance_cm:
             return False
-        return goal.final_heading_deg is None or abs(
+        if goal.final_heading_deg is None:
+            return True
+        heading_tolerance_deg = min(
+            goal.heading_tolerance_deg,
+            self.config.planning_heading_tolerance_deg,
+        )
+        return abs(
             signed_heading_error_deg(goal.final_heading_deg, node.heading_deg)
-        ) <= goal.heading_tolerance_deg
+        ) <= heading_tolerance_deg
 
     @staticmethod
     def _heuristic(x_cm: float, y_cm: float, heading_deg: float, goal: NavigationGoal) -> float:
@@ -900,6 +913,8 @@ class PurePursuitConfig:
     heading_slowdown_deg: float = 35.0
     minimum_tracking_speed_scale: float = 0.40
     nearest_search_ahead_points: int = 30
+    terminal_adjustment_distance_cm: float = 25.0
+    terminal_adjustment_speed_mm_s: float = 50.0
 
     def __post_init__(self) -> None:
         speeds = (
@@ -916,6 +931,11 @@ class PurePursuitConfig:
             raise ValueError("tracking feedback gains cannot be negative")
         if self.feedback_softening_speed_cm_s <= 0:
             raise ValueError("feedback softening speed must be positive")
+        if (
+            self.terminal_adjustment_distance_cm <= 0
+            or self.terminal_adjustment_speed_mm_s <= 0
+        ):
+            raise ValueError("invalid terminal adjustment configuration")
         if self.cross_track_slowdown_cm <= 0 or self.heading_slowdown_deg <= 0:
             raise ValueError("tracking slowdown thresholds must be positive")
         if not 0 < self.minimum_tracking_speed_scale <= 1:
@@ -1040,6 +1060,11 @@ class PurePursuitController:
             if direction is MotorDirection.REVERSE
             else self.config.max_speed_mm_s
         )
+        if (
+            path.goal.final_heading_deg is not None
+            and distance_to_goal <= self.config.terminal_adjustment_distance_cm
+        ):
+            speed_cap = min(speed_cap, self.config.terminal_adjustment_speed_mm_s)
         speed_floor = min(self.config.approach_speed_mm_s, speed_cap)
         speed = max(speed_floor, min(speed, speed_cap))
         return TrackerCommand(
@@ -1169,6 +1194,7 @@ class NavigationConfig:
     localization_timeout_s: float = 0.5
     replan_interval_s: float = 0.5
     gear_change_stop_s: float = 0.25
+    gear_change_steering_settle_margin_s: float = 0.10
     max_steering_rate_rad_s: float = 1.2
     deviation_replan_samples: int = 2
     hard_path_deviation_cm: float = 30.0
@@ -1185,9 +1211,11 @@ class NavigationConfig:
     max_unprogressed_goal_increase_cm: float = 20.0
     safety_prediction_horizon_s: float = 0.8
     safety_prediction_step_s: float = 0.1
-    terminal_overshoot_margin_cm: float = 2.0
-    terminal_overshoot_samples: int = 2
+    terminal_overshoot_margin_cm: float = 5.0
+    terminal_overshoot_samples: int = 3
     max_recovery_replans: int = 3
+    max_terminal_recovery_replans: int = 8
+    terminal_recovery_timeout_s: float = 30.0
     wall_relocalization_enter_cm: float = 15.0
     wall_relocalization_exit_cm: float = 5.0
     wall_relocalization_release_samples: int = 2
@@ -1198,6 +1226,7 @@ class NavigationConfig:
             or self.localization_timeout_s <= 0
             or self.replan_interval_s < 0
             or self.gear_change_stop_s < 0
+            or self.gear_change_steering_settle_margin_s < 0
             or self.max_steering_rate_rad_s <= 0
         ):
             raise ValueError("invalid navigation timing configuration")
@@ -1228,6 +1257,8 @@ class NavigationConfig:
             self.terminal_overshoot_margin_cm < 0
             or self.terminal_overshoot_samples <= 0
             or self.max_recovery_replans <= 0
+            or self.max_terminal_recovery_replans <= 0
+            or self.terminal_recovery_timeout_s <= 0
         ):
             raise ValueError("invalid terminal recovery configuration")
         if (
@@ -1297,6 +1328,7 @@ class Navigation:
         self._pose_revision = 0
         self._localization_speed_scale = 1.0
         self._path_progress_index = 0
+        self._path_search_floor = 0
         self._deviation_count = 0
         self._last_deviation_pose_revision = -1
         self._arrival_confirmation_count = 0
@@ -1311,6 +1343,8 @@ class Navigation:
         self._progress_guard_min_goal_distance_cm: float | None = None
         self._last_direction: MotorDirection | None = None
         self._pending_direction: MotorDirection | None = None
+        self._pending_direction_path_index: int | None = None
+        self._pending_steering_angle_rad: float | None = None
         self._gear_change_ready_time = 0.0
         self._last_steering_angle_rad = 0.0
         self._last_motion_time: float | None = None
@@ -1319,6 +1353,9 @@ class Navigation:
         self._terminal_overshoot_count = 0
         self._last_terminal_overshoot_pose_revision = -1
         self._recovery_replan_count = 0
+        self._terminal_recovery_replan_count = 0
+        self._safety_recovery_replan_count = 0
+        self._terminal_recovery_started_at: float | None = None
         self._wall_relocalization_hold = False
         self._wall_relocalization_release_count = 0
 
@@ -1428,7 +1465,7 @@ class Navigation:
                 )
             else:
                 self._path = None
-                self._path_progress_index = 0
+                self._reset_path_direction_tracking()
                 self._reset_deviation_tracking()
                 self._reset_correction_tracking()
             path_invalidated = previous_path is not None and self._path is None
@@ -1473,7 +1510,7 @@ class Navigation:
                     self._wall_relocalization_hold = True
                     self._wall_relocalization_release_count = 0
                     self._path = None
-                    self._path_progress_index = 0
+                    self._reset_path_direction_tracking()
                 elif self._wall_relocalization_hold:
                     if wall_residual_cm <= self.config.wall_relocalization_exit_cm:
                         self._wall_relocalization_release_count += 1
@@ -1486,7 +1523,7 @@ class Navigation:
                         self._wall_relocalization_hold = False
                         self._wall_relocalization_release_count = 0
                         self._path = None
-                        self._path_progress_index = 0
+                        self._reset_path_direction_tracking()
                         self._last_plan_time = 0.0
         self._control_wakeup.set()
         return True
@@ -1497,14 +1534,12 @@ class Navigation:
         with self._lock:
             self._goal = goal
             self._path = None
-            self._path_progress_index = 0
+            self._reset_path_direction_tracking()
             self._reset_deviation_tracking()
             self._reset_arrival_tracking()
             self._reset_correction_tracking()
             self._active = False
             self._paused = False
-            self._last_direction = None
-            self._pending_direction = None
             self._last_steering_angle_rad = 0.0
             self._last_motion_time = None
             self._last_tracker_command = None
@@ -1522,9 +1557,7 @@ class Navigation:
             self._active = True
             self._paused = False
             self._path = None
-            self._last_direction = None
-            self._pending_direction = None
-            self._path_progress_index = 0
+            self._reset_path_direction_tracking()
             self._reset_deviation_tracking()
             self._reset_arrival_tracking()
             self._reset_correction_tracking()
@@ -1575,7 +1608,7 @@ class Navigation:
             self._paused = False
             self._active = True
             self._path = None
-            self._path_progress_index = 0
+            self._reset_path_direction_tracking()
             self._reset_deviation_tracking()
             self._reset_arrival_tracking()
             self._reset_correction_tracking()
@@ -1592,12 +1625,10 @@ class Navigation:
             self._paused = False
             self._goal = None
             self._path = None
-            self._path_progress_index = 0
+            self._reset_path_direction_tracking()
             self._reset_deviation_tracking()
             self._reset_arrival_tracking()
             self._reset_correction_tracking()
-            self._last_direction = None
-            self._pending_direction = None
             self._reset_terminal_recovery_tracking()
         self._safe_stop()
         self._set_state(NavigationState.IDLE, reason)
@@ -1616,12 +1647,10 @@ class Navigation:
             self._active = False
             self._paused = False
             self._path = None
-            self._path_progress_index = 0
+            self._reset_path_direction_tracking()
             self._reset_deviation_tracking()
             self._reset_arrival_tracking()
             self._reset_correction_tracking()
-            self._last_direction = None
-            self._pending_direction = None
         self._safe_stop()
         self._set_state(NavigationState.BLOCKED, reason)
 
@@ -1651,6 +1680,7 @@ class Navigation:
             pose_revision = self._pose_revision
             localization_speed_scale = self._localization_speed_scale
             path_progress_index = self._path_progress_index
+            path_search_floor = self._path_search_floor
             wall_relocalization_hold = self._wall_relocalization_hold
         if not active:
             return
@@ -1732,7 +1762,7 @@ class Navigation:
                 ):
                     return
                 self._path = path
-                self._path_progress_index = 0
+                self._reset_path_direction_tracking()
                 self._reset_deviation_tracking()
                 self._reset_correction_tracking()
             LOG.debug(
@@ -1756,6 +1786,19 @@ class Navigation:
                     for point in path.points
                 ),
             )
+            if len(path.points) <= 12:
+                LOG.debug(
+                    "short path sequence=%s",
+                    tuple(
+                        (
+                            round(point.x_cm, 2),
+                            round(point.y_cm, 2),
+                            round(point.heading_deg, 2),
+                            point.direction.name,
+                        )
+                        for point in path.points
+                    ),
+                )
             if self.on_path_updated is not None:
                 try:
                     self.on_path_updated(path)
@@ -1766,6 +1809,8 @@ class Navigation:
             latest_pose = self._pose
             pose_revision = self._pose_revision
             localization_speed_scale = self._localization_speed_scale
+            path_progress_index = self._path_progress_index
+            path_search_floor = self._path_search_floor
         if latest_pose is None or time.monotonic() - latest_pose.timestamp_s > self.config.localization_timeout_s:
             self._safe_stop()
             self._set_state(NavigationState.LOCALIZATION_LOST, "global pose became stale while planning")
@@ -1775,7 +1820,7 @@ class Navigation:
         command = self.controller.compute(
             pose,
             path,
-            min_path_index=max(0, path_progress_index - 1),
+            min_path_index=max(path_search_floor, path_progress_index - 1, 0),
         )
         with self._lock:
             self._last_tracker_command = command
@@ -1789,9 +1834,13 @@ class Navigation:
             command,
             pose_revision,
         ):
-            if self._request_replan("goal was passed; returning to the same coordinate"):
+            if self._request_replan(
+                "planned terminal endpoint was passed; returning to the same coordinate",
+                terminal=True,
+                now=now,
+            ):
                 return
-            self.fail_safe_stop("goal recovery retry limit exceeded")
+            self.fail_safe_stop("terminal recovery retry/time limit exceeded")
             return
         if self._correction_is_failing(command, pose_revision):
             self.fail_safe_stop(
@@ -1819,26 +1868,94 @@ class Navigation:
                 self._safe_stop()
                 with self._lock:
                     self._path = None
-                    self._path_progress_index = 0
+                    self._reset_path_direction_tracking()
                     self._reset_deviation_tracking()
                 self._set_state(NavigationState.PLANNING, "confirmed path deviation requires replanning")
                 return
         elif pose_revision != self._last_deviation_pose_revision:
             self._last_deviation_pose_revision = pose_revision
             self._deviation_count = 0
-        if self._last_direction is not None and command.direction is not self._last_direction:
-            if self._pending_direction is not command.direction:
-                self._pending_direction = command.direction
-                self._gear_change_ready_time = now + self.config.gear_change_stop_s
-            if now < self._gear_change_ready_time:
-                self._safe_stop()
-                self._set_state(NavigationState.GEAR_CHANGE, "stopped before direction change")
+        direction_change = (
+            self._last_direction is not None
+            and command.direction is not self._last_direction
+        )
+        initial_presteer = (
+            self._last_direction is None
+            and abs(command.steering_angle_rad) >= 0.05
+        )
+        if direction_change or initial_presteer:
+            with self._lock:
+                if self._pending_direction is not command.direction:
+                    self._pending_direction = command.direction
+                    self._pending_direction_path_index = command.nearest_path_index
+                    self._path_search_floor = max(
+                        self._path_search_floor,
+                        command.nearest_path_index,
+                    )
+                    self._pending_steering_angle_rad = command.steering_angle_rad
+                    steering_settle_s = (
+                        abs(command.steering_angle_rad - self._last_steering_angle_rad)
+                        / self.config.max_steering_rate_rad_s
+                        + self.config.gear_change_steering_settle_margin_s
+                    )
+                    minimum_stop_s = (
+                        self.config.gear_change_stop_s
+                        if direction_change
+                        else self.config.gear_change_steering_settle_margin_s
+                    )
+                    self._gear_change_ready_time = now + max(
+                        minimum_stop_s,
+                        steering_settle_s,
+                    )
+                elif (
+                    self._pending_steering_angle_rad is None
+                    or abs(
+                        command.steering_angle_rad
+                        - self._pending_steering_angle_rad
+                    )
+                    >= 0.02
+                ):
+                    previous_pending = (
+                        self._last_steering_angle_rad
+                        if self._pending_steering_angle_rad is None
+                        else self._pending_steering_angle_rad
+                    )
+                    self._pending_steering_angle_rad = command.steering_angle_rad
+                    additional_settle_s = (
+                        abs(command.steering_angle_rad - previous_pending)
+                        / self.config.max_steering_rate_rad_s
+                        + self.config.gear_change_steering_settle_margin_s
+                    )
+                    self._gear_change_ready_time = max(
+                        self._gear_change_ready_time,
+                        now + additional_settle_s,
+                    )
+                pending_steering = self._pending_steering_angle_rad
+                gear_change_ready_time = self._gear_change_ready_time
+            if pending_steering is None:
+                pending_steering = command.steering_angle_rad
+            if now < gear_change_ready_time:
+                self._presteer_while_stopped(
+                    pending_steering,
+                    command.direction,
+                    now,
+                )
+                self._set_state(
+                    NavigationState.GEAR_CHANGE,
+                    "rear wheels stopped; steering settling before motion",
+                )
                 return
-            self._last_direction = command.direction
-            self._pending_direction = None
+            with self._lock:
+                self._last_direction = command.direction
+                self._pending_direction = None
+                self._pending_direction_path_index = None
+                self._pending_steering_angle_rad = None
         elif self._last_direction is None:
-            self._last_direction = command.direction
-            self._pending_direction = None
+            with self._lock:
+                self._last_direction = command.direction
+                self._pending_direction = None
+                self._pending_direction_path_index = None
+                self._pending_steering_angle_rad = None
         steering = self._rate_limited_steering(command.steering_angle_rad, now)
         speed = command.speed_mm_s * localization_speed_scale
         with self._lock:
@@ -1960,12 +2077,10 @@ class Navigation:
         with self._lock:
             self._active = False
             self._path = None
-            self._path_progress_index = 0
+            self._reset_path_direction_tracking()
             self._reset_deviation_tracking()
             self._reset_arrival_tracking()
             self._reset_correction_tracking()
-            self._last_direction = None
-            self._pending_direction = None
         self._set_state(NavigationState.ARRIVED, "goal position and heading reached")
         if self.on_goal_reached is not None:
             try:
@@ -1987,6 +2102,41 @@ class Navigation:
                 self.on_motion_changed(False)
             except BaseException:
                 LOG.exception("motion-state callback failed")
+
+    def _presteer_while_stopped(
+        self,
+        steering_angle_rad: float,
+        direction: MotorDirection,
+        now: float,
+    ) -> None:
+        """Hold both rear wheels at zero while positioning steering for a cusp."""
+
+        try:
+            if self.drive.is_running:
+                self.drive.set_motion(
+                    0.0,
+                    steering_angle_rad,
+                    direction=direction,
+                    rear_differential_linked=True,
+                )
+        except BaseException:
+            LOG.exception("failed to pre-position steering during direction change")
+            raise
+        with self._lock:
+            self._last_steering_angle_rad = steering_angle_rad
+            self._last_motion_time = now
+        if self.on_motion_changed is not None:
+            try:
+                self.on_motion_changed(False)
+            except BaseException:
+                LOG.exception("motion-state callback failed")
+        LOG.debug(
+            "gear presteer direction=%s steering=%.5f ready_at=%.6f now=%.6f",
+            direction.name,
+            steering_angle_rad,
+            self._gear_change_ready_time,
+            now,
+        )
 
     def _arrival_confirmed(self, pose_revision: int, now: float) -> bool:
         with self._lock:
@@ -2084,7 +2234,7 @@ class Navigation:
         command: TrackerCommand,
         pose_revision: int,
     ) -> bool:
-        """Confirm that the rear axle crossed beyond the requested coordinate."""
+        """Confirm that the rear axle crossed beyond the planned path endpoint."""
 
         if pose_revision == self._last_terminal_overshoot_pose_revision:
             return False
@@ -2099,11 +2249,11 @@ class Navigation:
         if tangent_length <= 1e-9:
             self._terminal_overshoot_count = 0
             return False
-        beyond_goal_cm = (
-            (pose.x_cm - path.goal.x_cm) * tangent_x
-            + (pose.y_cm - path.goal.y_cm) * tangent_y
+        beyond_endpoint_cm = (
+            (pose.x_cm - second.x_cm) * tangent_x
+            + (pose.y_cm - second.y_cm) * tangent_y
         ) / tangent_length
-        if beyond_goal_cm >= self.config.terminal_overshoot_margin_cm:
+        if beyond_endpoint_cm >= self.config.terminal_overshoot_margin_cm:
             self._terminal_overshoot_count += 1
         else:
             self._terminal_overshoot_count = 0
@@ -2112,21 +2262,44 @@ class Navigation:
             >= self.config.terminal_overshoot_samples
         )
 
-    def _request_replan(self, reason: str) -> bool:
+    def _request_replan(
+        self,
+        reason: str,
+        *,
+        terminal: bool = False,
+        now: float | None = None,
+    ) -> bool:
         """Stop, retain the mission goal and plan again from the latest pose."""
 
+        requested_at = time.monotonic() if now is None else now
         with self._lock:
             if not self._active or self._goal is None:
                 return False
-            if self._recovery_replan_count >= self.config.max_recovery_replans:
-                return False
+            if terminal:
+                if self._terminal_recovery_started_at is None:
+                    self._terminal_recovery_started_at = requested_at
+                if (
+                    requested_at - self._terminal_recovery_started_at
+                    >= self.config.terminal_recovery_timeout_s
+                    or self._terminal_recovery_replan_count
+                    >= self.config.max_terminal_recovery_replans
+                ):
+                    return False
+                self._terminal_recovery_replan_count += 1
+                attempt = self._terminal_recovery_replan_count
+                limit = self.config.max_terminal_recovery_replans
+                recovery_kind = "terminal"
+            else:
+                if self._safety_recovery_replan_count >= self.config.max_recovery_replans:
+                    return False
+                self._safety_recovery_replan_count += 1
+                attempt = self._safety_recovery_replan_count
+                limit = self.config.max_recovery_replans
+                recovery_kind = "safety"
             self._recovery_replan_count += 1
-            attempt = self._recovery_replan_count
             self._path = None
-            self._path_progress_index = 0
+            self._reset_path_direction_tracking()
             self._last_plan_time = 0.0
-            self._last_direction = None
-            self._pending_direction = None
             self._reset_deviation_tracking()
             self._reset_arrival_tracking()
             self._reset_correction_tracking()
@@ -2135,7 +2308,7 @@ class Navigation:
         self._safe_stop()
         self._set_state(
             NavigationState.PLANNING,
-            f"{reason} (recovery {attempt}/{self.config.max_recovery_replans})",
+            f"{reason} ({recovery_kind} recovery {attempt}/{limit})",
         )
         self._control_wakeup.set()
         return True
@@ -2275,6 +2448,15 @@ class Navigation:
         self._deviation_count = 0
         self._last_deviation_pose_revision = -1
 
+    def _reset_path_direction_tracking(self) -> None:
+        self._path_progress_index = 0
+        self._path_search_floor = 0
+        self._last_direction = None
+        self._pending_direction = None
+        self._pending_direction_path_index = None
+        self._pending_steering_angle_rad = None
+        self._gear_change_ready_time = 0.0
+
     def _reset_arrival_tracking(self) -> None:
         self._arrival_confirmation_count = 0
         self._last_arrival_pose_revision = -1
@@ -2293,6 +2475,9 @@ class Navigation:
         self._terminal_overshoot_count = 0
         self._last_terminal_overshoot_pose_revision = -1
         self._recovery_replan_count = 0
+        self._terminal_recovery_replan_count = 0
+        self._safety_recovery_replan_count = 0
+        self._terminal_recovery_started_at = None
 
     def _set_state(self, state: NavigationState, reason: str) -> None:
         callback = None

@@ -287,6 +287,26 @@ class PurePursuitTests(unittest.TestCase):
         near = controller.compute(NavigationPose(80, 0, 0, 0), near_path)
         self.assertLess(near.speed_mm_s, far.speed_mm_s)
 
+    def test_final_heading_adjustment_uses_terminal_speed_cap(self) -> None:
+        controller = PurePursuitController(
+            config=PurePursuitConfig(
+                cruise_speed_mm_s=300.0,
+                max_speed_mm_s=300.0,
+                approach_speed_mm_s=80.0,
+                reverse_speed_mm_s=150.0,
+                terminal_adjustment_distance_cm=25.0,
+                terminal_adjustment_speed_mm_s=50.0,
+            )
+        )
+        path = NavigationPath(
+            (PathPoint(0, 0, 0), PathPoint(20, 0, 0)),
+            NavigationGoal(20, 0, final_heading_deg=0),
+        )
+
+        command = controller.compute(NavigationPose(0, 0, 0, 0), path)
+
+        self.assertLessEqual(command.speed_mm_s, 50.0)
+
     def test_signed_cross_track_and_heading_feedback_correct_radar_error(self) -> None:
         controller = PurePursuitController()
         path = NavigationPath(
@@ -562,12 +582,45 @@ class NavigationStateMachineTests(unittest.TestCase):
 
         navigation._control_step(now)
         self.assertIs(navigation.state, NavigationState.GEAR_CHANGE)
-        self.assertEqual(drive.commands, [])
-        self.assertGreater(drive.stop_count, 0)
+        self.assertEqual(len(drive.commands), 1)
+        self.assertEqual(drive.commands[0][0], 0.0)
+        self.assertIs(drive.commands[0][2], MotorDirection.REVERSE)
 
         navigation._control_step(now + 0.3)
-        self.assertEqual(len(drive.commands), 1)
-        self.assertIs(drive.commands[0][2], MotorDirection.REVERSE)
+        self.assertEqual(len(drive.commands), 2)
+        self.assertGreater(drive.commands[-1][0], 0.0)
+        self.assertIs(drive.commands[-1][2], MotorDirection.REVERSE)
+
+    def test_large_initial_steering_is_positioned_before_motion(self) -> None:
+        drive = _FakeDrive()
+        drive.start()
+        navigation = Navigation(drive=drive, config=NavigationConfig())
+        now = time.monotonic()
+        path = NavigationPath(
+            (
+                PathPoint(0, 0, 0, MotorDirection.FORWARD),
+                PathPoint(10, 10, 45, MotorDirection.FORWARD),
+            ),
+            NavigationGoal(10, 10, final_heading_deg=45, position_tolerance_cm=1),
+            map_revision=1,
+        )
+        navigation._active = True
+        navigation._pose = NavigationPose(0, 0, 0, now)
+        navigation._grid = open_grid()
+        navigation._map_revision = 1
+        navigation._goal = path.goal
+        navigation._path = path
+
+        navigation._control_step(now)
+
+        self.assertIs(navigation.state, NavigationState.GEAR_CHANGE)
+        self.assertEqual(drive.commands[-1][0], 0.0)
+        self.assertGreater(abs(drive.commands[-1][1]), 0.05)
+
+        navigation._pose = NavigationPose(0, 0, 0, now + 0.6)
+        navigation._control_step(now + 0.6)
+
+        self.assertGreater(drive.commands[-1][0], 0.0)
 
     def test_forward_reverse_cusp_stops_before_changing_gear(self) -> None:
         drive = _FakeDrive()
@@ -597,8 +650,46 @@ class NavigationStateMachineTests(unittest.TestCase):
         navigation._control_step(now)
 
         self.assertIs(navigation.state, NavigationState.GEAR_CHANGE)
-        self.assertEqual(drive.commands, [])
-        self.assertGreater(drive.stop_count, 0)
+        self.assertEqual(len(drive.commands), 1)
+        self.assertEqual(drive.commands[0][0], 0.0)
+        self.assertIs(drive.commands[0][2], MotorDirection.REVERSE)
+
+    def test_committed_cusp_cannot_jump_back_to_forward_segment(self) -> None:
+        drive = _FakeDrive()
+        drive.start()
+        navigation = Navigation(
+            drive=drive,
+            config=NavigationConfig(gear_change_stop_s=0.25),
+        )
+        now = time.monotonic()
+        path = NavigationPath(
+            (
+                PathPoint(0, 0, 0, MotorDirection.FORWARD),
+                PathPoint(10, 0, 0, MotorDirection.FORWARD),
+                PathPoint(10, 10, 0, MotorDirection.REVERSE),
+            ),
+            NavigationGoal(10, 10, position_tolerance_cm=1),
+            map_revision=1,
+        )
+        navigation._active = True
+        navigation._pose = NavigationPose(10, 0, 0, now)
+        navigation._grid = open_grid()
+        navigation._map_revision = 1
+        navigation._goal = path.goal
+        navigation._path = path
+        navigation._last_direction = MotorDirection.FORWARD
+
+        navigation._control_step(now)
+        self.assertIs(navigation.state, NavigationState.GEAR_CHANGE)
+        self.assertEqual(navigation._path_search_floor, 1)
+
+        navigation._control_step(now + 0.3)
+        navigation._pose = NavigationPose(9, 0, 0, now + 0.4)
+        navigation._control_step(now + 0.4)
+
+        self.assertEqual(navigation._path_search_floor, 1)
+        self.assertIs(drive.commands[-1][2], MotorDirection.REVERSE)
+        self.assertGreater(drive.commands[-1][0], 0.0)
 
     def test_each_radar_pose_closes_lateral_steering_loop(self) -> None:
         drive = _FakeDrive()
@@ -842,12 +933,98 @@ class NavigationStateMachineTests(unittest.TestCase):
                 2,
             )
         )
-        self.assertTrue(navigation._request_replan("unit-test overshoot"))
+        self.assertTrue(
+            navigation._request_replan(
+                "unit-test overshoot",
+                terminal=True,
+                now=10.0,
+            )
+        )
         self.assertTrue(navigation.active)
         self.assertIs(navigation._goal, goal)
         self.assertIsNone(navigation.path)
         self.assertEqual(navigation._recovery_replan_count, 1)
         self.assertGreater(drive.stop_count, 0)
+
+    def test_crossing_goal_does_not_preempt_planned_terminal_endpoint(self) -> None:
+        navigation = Navigation(
+            drive=_FakeDrive(),
+            config=NavigationConfig(
+                terminal_overshoot_samples=3,
+                terminal_overshoot_margin_cm=5.0,
+            ),
+        )
+        goal = NavigationGoal(100.0, 0.0, final_heading_deg=20.0)
+        path = NavigationPath(
+            (
+                PathPoint(90.0, 0.0, 0.0),
+                PathPoint(106.0, 0.0, 20.0),
+            ),
+            goal,
+            map_revision=1,
+        )
+        command = TrackerCommand(
+            50.0,
+            0.0,
+            MotorDirection.FORWARD,
+            0,
+            0.0,
+            3.0,
+        )
+
+        for revision in (1, 2, 3):
+            self.assertFalse(
+                navigation._terminal_path_was_passed(
+                    NavigationPose(103.0, 0.0, 0.0),
+                    path,
+                    command,
+                    revision,
+                )
+            )
+        self.assertFalse(
+            navigation._terminal_path_was_passed(
+                NavigationPose(112.0, 0.0, 0.0), path, command, 4
+            )
+        )
+        self.assertFalse(
+            navigation._terminal_path_was_passed(
+                NavigationPose(113.0, 0.0, 0.0), path, command, 5
+            )
+        )
+        self.assertTrue(
+            navigation._terminal_path_was_passed(
+                NavigationPose(114.0, 0.0, 0.0), path, command, 6
+            )
+        )
+
+    def test_terminal_recovery_has_independent_eight_attempt_budget(self) -> None:
+        navigation = Navigation(
+            drive=_FakeDrive(),
+            config=NavigationConfig(
+                max_recovery_replans=3,
+                max_terminal_recovery_replans=8,
+                terminal_recovery_timeout_s=30.0,
+            ),
+        )
+        navigation._active = True
+        navigation._goal = NavigationGoal(100.0, 0.0, final_heading_deg=0.0)
+
+        for attempt in range(8):
+            self.assertTrue(
+                navigation._request_replan(
+                    "unit-test terminal recovery",
+                    terminal=True,
+                    now=10.0 + attempt,
+                )
+            )
+        self.assertFalse(
+            navigation._request_replan(
+                "unit-test terminal recovery",
+                terminal=True,
+                now=18.0,
+            )
+        )
+        self.assertEqual(navigation._terminal_recovery_replan_count, 8)
 
     def test_large_wall_residual_holds_then_releases_navigation(self) -> None:
         navigation = Navigation(drive=_FakeDrive())
