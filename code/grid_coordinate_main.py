@@ -150,10 +150,21 @@ class GridCoordinateApplication(CarMainApplication):
                     y_cm,
                     distance_cm,
                 )
+                # Diagnostic: check if in-place rotation is enabled
+                if not self.navigation.drive.rear_motors.allow_in_place_rotation:
+                    LOG.error(
+                        "DIAGNOSTIC: rear motors do NOT have allow_in_place_rotation enabled! "
+                        "This will cause the turn_to() call to fail."
+                    )
+                else:
+                    LOG.info("DIAGNOSTIC: rear motors have allow_in_place_rotation enabled")
+
+                LOG.info("DIAGNOSTIC: about to call pivot_turn.turn_to(%.1fdeg)", bearing_deg)
                 try:
                     self.pivot_turn.turn_to(bearing_deg)
+                    LOG.info("DIAGNOSTIC: pivot_turn.turn_to() completed successfully")
                 except Exception as exc:
-                    LOG.error("in-place turn failed: %s", exc)
+                    LOG.error("in-place turn failed: %s", exc, exc_info=True)
                     return False, f"turn failed: {exc}"
 
             # Decide whether this segment should enforce final heading
