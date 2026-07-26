@@ -46,6 +46,7 @@ class FleetCarNode:
         on_set_coordinate_frame: Callable,
         on_navigate: Callable,
         on_stop: Callable[[], CommandResult],
+        on_start_mapping: Optional[Callable[[int], CommandResult]] = None,
         timing: NodeTiming = NodeTiming(),
         wait: Optional[Callable[[float], bool]] = None,
     ) -> None:
@@ -54,6 +55,7 @@ class FleetCarNode:
         self._on_set_coordinate_frame = on_set_coordinate_frame
         self._on_navigate = on_navigate
         self._on_stop = on_stop
+        self._on_start_mapping = on_start_mapping
         self._on_disaster_rescue = None
         self._timing = timing
         self._parser = FrameParser(local_node=NodeId.CAR)
@@ -79,8 +81,12 @@ class FleetCarNode:
             raise RuntimeError("disaster handler must be installed before FleetCarNode.start")
         self._on_disaster_rescue = callback
 
-    def set_active_command_result(self, result: CommandResult) -> None:
+    def set_active_command_result(
+        self, result: CommandResult, request_seq: Optional[int] = None
+    ) -> None:
         """Publish asynchronous task completion in subsequent state reports."""
+        if request_seq is not None and self._active_command_seq != request_seq:
+            return
         self._active_command_status = int(result.status)
         self._error_code = (
             int(result.reason)
@@ -215,6 +221,9 @@ class FleetCarNode:
 
     def _command(self, request: Frame) -> bytes:
         command_id = 0
+        self._active_command_seq = request.seq
+        self._active_command_status = int(AckStatus.RECEIVED)
+        self._error_code = 0
         try:
             command = decode_command(request.payload)
             command_id = command.command_id
@@ -245,19 +254,31 @@ class FleetCarNode:
                     result = self._on_disaster_rescue(
                         decode_disaster_rescue(command.command_body)
                     )
+            elif command_id == CommandId.CAR_START_MAPPING:
+                if command.command_body:
+                    raise ValueError("CAR_START_MAPPING body must be empty")
+                if self._on_start_mapping is None:
+                    result = CommandResult(
+                        AckStatus.REJECTED, AckReason.UNSUPPORTED
+                    )
+                else:
+                    result = self._on_start_mapping(request.seq)
             else:
                 result = CommandResult(AckStatus.REJECTED, AckReason.UNSUPPORTED)
         except ValueError as exc:
             result = CommandResult(
                 AckStatus.REJECTED, AckReason.BAD_PAYLOAD, str(exc)
             )
-        self._active_command_seq = request.seq
-        self._active_command_status = int(result.status)
-        self._error_code = (
-            int(result.reason)
-            if result.status in (AckStatus.REJECTED, AckStatus.FAILED)
-            else 0
-        )
+        if self._active_command_status not in (
+            int(AckStatus.COMPLETED),
+            int(AckStatus.FAILED),
+        ):
+            self._active_command_status = int(result.status)
+            self._error_code = (
+                int(result.reason)
+                if result.status in (AckStatus.REJECTED, AckStatus.FAILED)
+                else 0
+            )
         ack = AckPayload(
             request.session,
             request.seq,

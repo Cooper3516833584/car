@@ -52,6 +52,13 @@ class FleetProtocolTests(unittest.TestCase):
         terrain = tuple(range(1, 8)) + tuple(range(1, 8)) + (1,)
         survey = SurveyReportPayload(1, 2, 3, int(SurveyFlags.COMPLETE), 4, 2, 3, 5, 1, 4, terrain)
         self.assertEqual(decode_survey_report(encode_survey_report(survey)), survey)
+        positions = tuple((115 + 70 * col, 175 + 70 * row) for row in range(3) for col in range(5))
+        extended = SurveyReportPayload(
+            1, 2, 4,
+            int(SurveyFlags.COMPLETE | SurveyFlags.ABSOLUTE_POSITIONS),
+            4, 2, 3, 5, 1, 4, terrain, positions,
+        )
+        self.assertEqual(decode_survey_report(encode_survey_report(extended)), extended)
         rescue = DisasterRescueCommand(4, 2, 3, terrain)
         self.assertEqual(decode_disaster_rescue(encode_disaster_rescue(rescue)), rescue)
         counter = SequenceCounter(0xFFFE)

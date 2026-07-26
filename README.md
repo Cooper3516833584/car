@@ -544,6 +544,13 @@ finally:
 
 文件：`main.py`
 
+使用 `--fleet-bus` 时，主程序会先启动 HC-14/FleetBus 接收，但保持车辆静止且不启动
+D500 建图；只有收到地面站的空载荷 `CAR_START_MAPPING (0x13)` 后，才在后台执行启动矩形
+标定。标定成功后状态才置为 `READY | MAP_READY`。`TARGETED_STOP` 在等待和标定阶段均可
+中断；非 FleetBus/SSH 的原有启动建图流程不变。随后地面站以小车启动后轴中心的场地绝对
+位置和初始朝向执行 `SET_COORDINATE_FRAME`，车端继续复用既有 SE(2) 对齐和 `main` 导航
+方法。
+
 `main.py` 现在只协调 `CoordinateNavigation` 与 HC-14/FleetBus/SSH 命令入口、状态回执、
 日志和安全退出；雷达建图、可信定位、目标校验、规划和控制不再在主程序中重复实现。
 

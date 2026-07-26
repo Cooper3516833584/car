@@ -17,6 +17,7 @@ class Harness:
         self.navigate_calls = []
         self.stop_calls = 0
         self.rescue_calls = []
+        self.mapping_calls = []
         self.callback_threads = []
         self.event = threading.Event()
         self.state = CarFleetState(
@@ -33,6 +34,7 @@ class Harness:
             on_set_coordinate_frame=self.coordinate,
             on_navigate=self.navigate,
             on_stop=self.stop,
+            on_start_mapping=self.start_mapping,
             timing=NodeTiming(0, 16),
             wait=lambda _: False,
         )
@@ -59,6 +61,10 @@ class Harness:
     def stop(self):
         self.stop_calls += 1
         return CommandResult(AckStatus.COMPLETED)
+
+    def start_mapping(self, request_seq):
+        self.mapping_calls.append(request_seq)
+        return CommandResult(AckStatus.ACCEPTED)
 
     def send(self, frame):
         self.event.clear()
@@ -114,6 +120,31 @@ class FleetCarNodeTests(unittest.TestCase):
         ))
         self.assertNotEqual(self.h.callback_threads[-1], caller)
         self.assertEqual(decode_ack(unpack_frame(raw).payload).status, AckStatus.ACCEPTED)
+
+    def test_async_navigation_completion_is_published_in_poll_report(self):
+        body = encode_car_navigate(CarNavigateCommand(50, 60, None))
+        self.h.send(self.request(
+            MessageKind.COMMAND,
+            encode_command(CommandPayload(CommandId.CAR_NAVIGATE_TO, 0, body)),
+            seq=7,
+        ))
+        self.h.node.set_active_command_result(CommandResult(AckStatus.COMPLETED))
+        raw = self.h.send(
+            self.request(MessageKind.POLL, encode_poll(PollPayload()), seq=8)
+        )
+        report = decode_report(unpack_frame(raw).payload)
+        self.assertEqual(7, report.active_command_seq)
+        self.assertEqual(AckStatus.COMPLETED, report.active_command_status)
+
+    def test_mapping_only_starts_after_explicit_command(self):
+        self.assertEqual([], self.h.mapping_calls)
+        raw = self.h.send(self.request(
+            MessageKind.COMMAND,
+            encode_command(CommandPayload(CommandId.CAR_START_MAPPING)),
+            seq=9,
+        ))
+        self.assertEqual(AckStatus.ACCEPTED, decode_ack(unpack_frame(raw).payload).status)
+        self.assertEqual([9], self.h.mapping_calls)
 
     def test_disaster_rescue_is_decoded_by_optional_task_handler(self):
         self.h.node.close()

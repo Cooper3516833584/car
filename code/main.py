@@ -254,6 +254,9 @@ class CarMainApplication:
         self._post_command_acks: list[bytes] = []
         self._handling_link_frame = False
         self._console_mission_active = False
+        self._fleet_mission_active = False
+        self._fleet_mapping_active = False
+        self._fleet_mapping_thread: threading.Thread | None = None
         self._console_thread: threading.Thread | None = None
         self._started_at = time.monotonic()
         self._fleet_alignment: DroneGlobalAlignment | None = None
@@ -339,6 +342,7 @@ class CarMainApplication:
                 on_set_coordinate_frame=self._fleet_set_coordinate_frame,
                 on_navigate=self._fleet_navigate,
                 on_stop=self._fleet_stop,
+                on_start_mapping=self._fleet_start_mapping,
             )
         elif hmac_key is not None:
             self.protocol = GroundNavigationProtocol(
@@ -376,18 +380,22 @@ class CarMainApplication:
             os.getpid(),
             sys.version.split()[0],
         )
-        calibration = self.coordinate_navigation.start()
-        with self._lock:
-            self._ready = True
-        if self.link is not None:
-            if self.fleet_node is not None:
-                self.fleet_node.start()
+        if self.fleet_node is not None:
+            self.fleet_node.start()
+            assert self.link is not None
             self.link.start()
             LOG.info(
-                "HC-14 %s command input enabled",
-                "FleetBus" if self.fleet_node is not None else "authenticated legacy",
+                "FleetBus command input enabled; waiting for CAR_START_MAPPING "
+                "while the vehicle remains stationary"
             )
-        self._print_map_ready(calibration)
+        else:
+            calibration = self.coordinate_navigation.start()
+            with self._lock:
+                self._ready = True
+            if self.link is not None:
+                self.link.start()
+                LOG.info("HC-14 authenticated legacy command input enabled")
+            self._print_map_ready(calibration)
         self._start_console_if_available()
         self._stop_event.wait()
 
@@ -401,10 +409,14 @@ class CarMainApplication:
         with self._lock:
             self._ready = False
         try:
+            self.coordinate_navigation.request_stop()
             if self.fleet_node is not None:
                 self.fleet_node.close()
             if self.link is not None:
                 self.link.close()
+            mapping_thread = self._fleet_mapping_thread
+            if mapping_thread is not None:
+                mapping_thread.join(timeout=2.0)
         finally:
             self.coordinate_navigation.close()
         LOG.info("application closed; hardware outputs are safe")
@@ -444,7 +456,11 @@ class CarMainApplication:
         receipt: NavigationCommandReceipt,
     ) -> None:
         with self._lock:
-            if self._active_receipt is not None or self._console_mission_active:
+            if (
+                self._active_receipt is not None
+                or self._console_mission_active
+                or self._fleet_mission_active
+            ):
                 raise NavigationCommandRejected(RejectReason.TASK_BUSY, "navigation already active")
             self._active_receipt = receipt
         try:
@@ -495,11 +511,29 @@ class CarMainApplication:
         if state not in (NavigationState.ARRIVED, NavigationState.FAILED, NavigationState.BLOCKED):
             return
         with self._lock:
+            fleet_mission = self._fleet_mission_active
+            self._fleet_mission_active = False
             receipt = self._active_receipt
             self._active_receipt = None
             console_mission = self._console_mission_active
             self._console_mission_active = False
         ready_reason = "ready for next goal; startup map and origin retained"
+        if fleet_mission:
+            if self.fleet_node is not None:
+                self.fleet_node.set_active_command_result(
+                    FleetCommandResult(
+                        FleetAckStatus.COMPLETED
+                        if state is NavigationState.ARRIVED
+                        else FleetAckStatus.FAILED,
+                        FleetAckReason.NONE
+                        if state is NavigationState.ARRIVED
+                        else FleetAckReason.INTERNAL_ERROR,
+                        "" if state is NavigationState.ARRIVED else reason,
+                    )
+                )
+            self.navigation.cancel(reason=ready_reason)
+            LOG.info("terminal FleetBus mission published; startup origin retained")
+            return
         if console_mission:
             if state is NavigationState.ARRIVED:
                 self._console_print("已到达目标，位置与可选车头方向均满足容差。")
@@ -678,6 +712,48 @@ class CarMainApplication:
             path_points=path_points,
         )
 
+    def _fleet_start_mapping(self, request_seq: int) -> FleetCommandResult:
+        with self._lock:
+            if self._ready:
+                return FleetCommandResult(FleetAckStatus.COMPLETED)
+            if self._fleet_mapping_active:
+                return FleetCommandResult(
+                    FleetAckStatus.REJECTED, FleetAckReason.BUSY
+                )
+            self._fleet_mapping_active = True
+            self._fleet_mapping_thread = threading.Thread(
+                target=self._run_fleet_mapping,
+                args=(request_seq,),
+                name="fleet-car-mapping",
+                daemon=True,
+            )
+            self._fleet_mapping_thread.start()
+        LOG.info(
+            "CAR_START_MAPPING accepted seq=%d; starting stationary D500 calibration",
+            request_seq,
+        )
+        return FleetCommandResult(FleetAckStatus.ACCEPTED)
+
+    def _run_fleet_mapping(self, request_seq: int) -> None:
+        try:
+            calibration = self.coordinate_navigation.start()
+            with self._lock:
+                self._ready = True
+            self._print_map_ready(calibration)
+            result = FleetCommandResult(FleetAckStatus.COMPLETED)
+        except Exception as exc:
+            LOG.exception("FleetBus mapping startup failed: %s", exc)
+            result = FleetCommandResult(
+                FleetAckStatus.FAILED,
+                FleetAckReason.INTERNAL_ERROR,
+                str(exc),
+            )
+        finally:
+            with self._lock:
+                self._fleet_mapping_active = False
+        if self.fleet_node is not None:
+            self.fleet_node.set_active_command_result(result, request_seq)
+
     def _fleet_set_coordinate_frame(
         self, command: CoordinateFrameCommand
     ) -> FleetCommandResult:
@@ -732,28 +808,54 @@ class CarMainApplication:
                 world_yaw_cw - alignment.yaw_offset_cw_deg
             ) % 360.0
             local_heading = (-local_yaw_cw) % 360.0
+        with self._lock:
+            if (
+                self._fleet_mission_active
+                or self._console_mission_active
+                or self._active_receipt is not None
+            ):
+                return FleetCommandResult(
+                    FleetAckStatus.REJECTED, FleetAckReason.BUSY
+                )
+            self._fleet_mission_active = True
         try:
-            self._submit_console_goal(
+            self.coordinate_navigation.navigate(
                 NavigationGoal(local_x, local_y, local_heading)
             )
-        except NavigationCommandRejected as exc:
+        except CoordinateGoalRejected as exc:
+            with self._lock:
+                self._fleet_mission_active = False
             reason = (
-                FleetAckReason.OUTSIDE_FIELD
-                if "场地外" in str(exc) or "boundary" in str(exc)
-                else FleetAckReason.BUSY
+                FleetAckReason.BUSY
+                if exc.reason in (
+                    CoordinateGoalRejectReason.NOT_READY,
+                    CoordinateGoalRejectReason.BUSY,
+                )
+                else FleetAckReason.OUTSIDE_FIELD
             )
             return FleetCommandResult(
                 FleetAckStatus.REJECTED, reason, str(exc)
             )
         except (NavigationError, ValueError) as exc:
+            with self._lock:
+                self._fleet_mission_active = False
             return FleetCommandResult(
                 FleetAckStatus.REJECTED,
                 FleetAckReason.LOCALIZATION_INVALID,
                 str(exc),
             )
+        except BaseException:
+            with self._lock:
+                self._fleet_mission_active = False
+            raise
         return FleetCommandResult(FleetAckStatus.ACCEPTED)
 
     def _fleet_stop(self) -> FleetCommandResult:
+        with self._lock:
+            self._fleet_mission_active = False
+            mapping_active = self._fleet_mapping_active
+        if mapping_active:
+            self.coordinate_navigation.request_stop()
         self._cancel_from_console()
         return FleetCommandResult(FleetAckStatus.COMPLETED)
 
@@ -875,7 +977,11 @@ class CarMainApplication:
             and math.hypot(goal.x_cm, goal.y_cm) <= 1.0
         )
         with self._lock:
-            if self._console_mission_active or self._active_receipt is not None:
+            if (
+                self._console_mission_active
+                or self._active_receipt is not None
+                or self._fleet_mission_active
+            ):
                 raise NavigationCommandRejected(RejectReason.TASK_BUSY, "已有任务，先输入 stop")
             self._console_mission_active = True
         try:

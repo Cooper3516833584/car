@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -259,6 +260,26 @@ class MainCoordinatorTests(unittest.TestCase):
     def test_main_initializes_radar_as_stationary(self) -> None:
         app = self.make_app()
         self.assertFalse(app.radar.odometry._vehicle_moving)
+
+    def test_fleet_mapping_waits_for_explicit_start_command(self) -> None:
+        app = CarMainApplication(MainConfig(), hmac_key=None, fleet_bus=True)
+        started = threading.Event()
+
+        def start_mapping():
+            started.set()
+            return make_calibration()
+
+        app.coordinate_navigation.start = start_mapping  # type: ignore[method-assign]
+        app._print_map_ready = lambda _calibration: None  # type: ignore[method-assign]
+        self.assertFalse(app.ready)
+        self.assertFalse(started.is_set())
+
+        result = app._fleet_start_mapping(7)
+        self.assertEqual(AckStatus.ACCEPTED, result.status)
+        self.assertTrue(started.wait(0.5))
+        assert app._fleet_mapping_thread is not None
+        app._fleet_mapping_thread.join(0.5)
+        self.assertTrue(app.ready)
 
     def test_default_and_detailed_log_file(self) -> None:
         previous = os.environ.pop("CAR_LOG_DIR", None)

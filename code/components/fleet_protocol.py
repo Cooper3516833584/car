@@ -362,7 +362,7 @@ def encode_survey_report(value: SurveyReportPayload) -> bytes:
             _range(name + "_col", col, 0, 4)
         elif row != 0xFF or col != 0xFF:
             raise ProtocolError("payload", name + " event cell must be 255 when absent")
-    return SURVEY_REPORT_HEADER.pack(
+    encoded = SURVEY_REPORT_HEADER.pack(
         _u32("request_session", value.request_session),
         _u16("request_seq", value.request_seq),
         _u16("survey_revision", value.survey_revision),
@@ -374,14 +374,36 @@ def encode_survey_report(value: SurveyReportPayload) -> bytes:
         value.debris_row,
         value.debris_col,
     ) + _terrain_codes(value.terrain_codes)
+    has_positions = bool(value.survey_flags & 0x02)
+    if has_positions != bool(value.cell_positions_cm):
+        raise ProtocolError("payload", "survey absolute-position flag/data mismatch")
+    if has_positions:
+        if len(value.cell_positions_cm) != SURVEY_CELL_COUNT:
+            raise ProtocolError("payload", "survey positions must contain 15 cells")
+        encoded += b"".join(
+            POINT.pack(_i32("cell_x_cm", x), _i32("cell_y_cm", y))
+            for x, y in value.cell_positions_cm
+        )
+    return encoded
 
 
 def decode_survey_report(data: bytes) -> SurveyReportPayload:
-    if len(data) != SURVEY_REPORT_HEADER.size + SURVEY_CELL_COUNT:
+    base_size = SURVEY_REPORT_HEADER.size + SURVEY_CELL_COUNT
+    if len(data) < base_size:
         raise ProtocolError("payload", "SURVEY_REPORT payload has invalid length")
+    values = SURVEY_REPORT_HEADER.unpack_from(data)
+    has_positions = bool(values[3] & 0x02)
+    expected = base_size + (SURVEY_CELL_COUNT * POINT.size if has_positions else 0)
+    if len(data) != expected:
+        raise ProtocolError("payload", "SURVEY_REPORT payload has invalid length")
+    positions = tuple(
+        POINT.unpack_from(data, base_size + index * POINT.size)
+        for index in range(SURVEY_CELL_COUNT)
+    ) if has_positions else ()
     value = SurveyReportPayload(
-        *SURVEY_REPORT_HEADER.unpack_from(data),
-        tuple(data[SURVEY_REPORT_HEADER.size:]),
+        *values,
+        tuple(data[SURVEY_REPORT_HEADER.size:base_size]),
+        positions,
     )
     encode_survey_report(value)
     return value

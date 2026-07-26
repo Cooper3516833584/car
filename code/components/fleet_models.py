@@ -31,9 +31,11 @@ class CommandId(IntEnum):
     SET_COORDINATE_FRAME = 0x10
     CAR_NAVIGATE_TO = 0x11
     CAR_DISASTER_RESCUE = 0x12
+    CAR_START_MAPPING = 0x13
     DRONE_GOTO = 0x20
     DRONE_HOLD = 0x21
     CANCEL_TASK = 0x22
+    DRONE_START_MISSION = 0x23
 
 
 class AckStatus(IntEnum):
@@ -97,6 +99,7 @@ class TerrainCode(IntEnum):
 
 class SurveyFlags(IntFlag):
     COMPLETE = 0x01
+    ABSOLUTE_POSITIONS = 0x02
 
 
 @dataclass(frozen=True)
@@ -223,6 +226,7 @@ class SurveyReportPayload:
     debris_row: int
     debris_col: int
     terrain_codes: Tuple[int, ...]
+    cell_positions_cm: Tuple[Tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
