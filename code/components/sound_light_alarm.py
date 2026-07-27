@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Active-low sound/light alarm on ROCK 5A GPIO4_B3 (physical Pin 11)."""
+"""Active-high sound/light alarm on ROCK 5A GPIO4_B3 (physical Pin 11)."""
 
 from __future__ import annotations
 
@@ -46,9 +46,9 @@ def resolve_gpio_number(
 
 
 class SoundLightAlarm:
-    """Control the low-level-triggered alarm through the GPIO sysfs ABI.
+    """Control the high-level-triggered alarm through the GPIO sysfs ABI.
 
-    ``initialize()`` atomically selects output-high, so the alarm is off while
+    ``initialize()`` atomically selects output-low, so the alarm is off while
     the pin direction changes.  The pin remains exported and keeps its last
     output after this object is discarded; this is intentional for startup use.
     """
@@ -81,12 +81,12 @@ class SoundLightAlarm:
     def is_active(self) -> bool:
         self._require_initialized()
         try:
-            return (self._gpio / "value").read_text(encoding="ascii").strip() == "0"
+            return (self._gpio / "value").read_text(encoding="ascii").strip() == "1"
         except OSError as exc:
             raise AlarmGPIOError(f"cannot read GPIO {self._gpio_number}: {exc}") from exc
 
     def initialize(self, *, active: bool = False) -> "SoundLightAlarm":
-        """Export GPIO4_B3 and select output-high before any optional alarm-on."""
+        """Export GPIO4_B3 and select output-low before any optional alarm-on."""
 
         if not self._gpio.exists():
             try:
@@ -103,30 +103,30 @@ class SoundLightAlarm:
         if not self._gpio.exists():
             raise AlarmGPIOError(f"export did not create {self._gpio}")
 
-        # The sysfs "high" direction value makes output selection and the safe
-        # inactive level one operation, avoiding a short low pulse.
+        # The sysfs "low" direction value makes output selection and the safe
+        # inactive level one operation, avoiding a short high pulse.
         try:
-            self._write(self._gpio / "direction", "high")
+            self._write(self._gpio / "direction", "low")
         except OSError as exc:
             raise AlarmGPIOError(
-                f"cannot configure GPIO {self._gpio_number} as output-high: {exc}"
+                f"cannot configure GPIO {self._gpio_number} as output-low: {exc}"
             ) from exc
         if active:
             self.on()
         return self
 
     def on(self) -> None:
-        """Enable sound and light by driving the active-low input low."""
-
-        self._set_raw_value(0)
-
-    def off(self) -> None:
-        """Silence the alarm by driving its input high."""
+        """Enable sound and light by driving the active-high input high."""
 
         self._set_raw_value(1)
 
+    def off(self) -> None:
+        """Silence the alarm by driving its input low."""
+
+        self._set_raw_value(0)
+
     def set_active(self, active: bool) -> None:
-        self._set_raw_value(0 if active else 1)
+        self._set_raw_value(1 if active else 0)
 
     def grant_group_access(self, group: str = "gpio") -> None:
         """Allow members of *group* to control the initialized output."""
@@ -184,8 +184,8 @@ def alarm_off() -> SoundLightAlarm:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     state = parser.add_mutually_exclusive_group()
-    state.add_argument("--on", action="store_true", help="drive low and enable alarm")
-    state.add_argument("--off", action="store_true", help="drive high and silence alarm")
+    state.add_argument("--on", action="store_true", help="drive high and enable alarm")
+    state.add_argument("--off", action="store_true", help="drive low and silence alarm")
     parser.add_argument(
         "--grant-group",
         metavar="GROUP",
@@ -200,7 +200,7 @@ def main() -> int:
         alarm.grant_group_access(args.grant_group)
     print(
         f"GPIO{alarm.gpio_number} GPIO4_B3 alarm "
-        f"{'ON (low)' if alarm.is_active else 'OFF (high)'}"
+        f"{'ON (high)' if alarm.is_active else 'OFF (low)'}"
     )
     return 0
 
