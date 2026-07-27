@@ -31,10 +31,18 @@ LOG = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class GridLayout:
-    x_centres_cm: Tuple[float, ...] = (0.0, 70.0, 140.0, 210.0, 280.0)
-    y_centres_cm: Tuple[float, ...] = (0.0, 70.0, 140.0)
+    # Car-local origin is the centre of the 40 cm start box.  The 3x5 terrain
+    # grid starts 125 cm ahead of it and extends 45 cm to its left.
+    x_centres_cm: Tuple[float, ...] = (-45.0, 25.0, 95.0, 165.0, 235.0)
+    y_centres_cm: Tuple[float, ...] = (125.0, 195.0, 265.0)
     start_point_cm: Tuple[float, float] = (0.0, 0.0)
-    start_entry_cells: Tuple[Cell, ...] = ((0, 0),)
+    start_entry_cells: Tuple[Cell, ...] = (
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (0, 3),
+        (0, 4),
+    )
     terrain_half_size_cm: float = 35.0
 
     def __post_init__(self) -> None:

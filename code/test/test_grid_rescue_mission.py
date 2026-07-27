@@ -59,9 +59,13 @@ class AdjacentGridPlannerTests(unittest.TestCase):
 
     def test_layout_uses_five_x_columns_and_three_y_rows(self):
         layout = GridLayout()
-        self.assertEqual((0.0, 0.0), layout.centre((0, 0)))
-        self.assertEqual((70.0, 0.0), layout.centre((0, 1)))
-        self.assertEqual((140.0, 70.0), layout.centre((1, 2)))
+        self.assertEqual((-45.0, 125.0), layout.centre((0, 0)))
+        self.assertEqual((25.0, 125.0), layout.centre((0, 1)))
+        self.assertEqual((95.0, 195.0), layout.centre((1, 2)))
+        self.assertEqual(
+            ((0, 0), (0, 1), (0, 2), (0, 3), (0, 4)),
+            layout.start_entry_cells,
+        )
         self.assertEqual(0.0, layout.step_heading_deg((1, 1), (1, 2)))
         self.assertEqual(90.0, layout.step_heading_deg((1, 1), (2, 1)))
         self.assertEqual(180.0, layout.step_heading_deg((1, 1), (1, 0)))
@@ -93,6 +97,24 @@ class AdjacentGridPlannerTests(unittest.TestCase):
                 1,
                 abs(first[0] - second[0]) + abs(first[1] - second[1]),
             )
+
+    def test_latest_survey_can_start_outside_grid_and_return_without_second_water(self):
+        terrain = (
+            TerrainCode.RIVER, TerrainCode.LAKE, TerrainCode.SNOW_MOUNTAIN,
+            TerrainCode.SNOW_MOUNTAIN, TerrainCode.RIVER,
+            TerrainCode.FIELD, TerrainCode.SETTLEMENTS, TerrainCode.WILDFIRE,
+            TerrainCode.LAKE, TerrainCode.FIELD,
+            TerrainCode.SNOW_MOUNTAIN, TerrainCode.DEBRIS_FLOW,
+            TerrainCode.SETTLEMENTS, TerrainCode.SETTLEMENTS, TerrainCode.FIELD,
+        )
+        plan = self.planner().plan(
+            DisasterRescueCommand(9, 1, 2, tuple(int(value) for value in terrain))
+        )
+        actual_water = {(0, 0), (0, 1), (0, 4), (1, 3)}
+        self.assertIn(plan.water_cell, actual_water)
+        self.assertEqual((1, 2), plan.wildfire_cell)
+        self.assertEqual(1, sum(cell in actual_water for cell in plan.driven_cells))
+        self.assertIn(plan.to_start_entry[-1], GridLayout().start_entry_cells)
 
     def test_configured_field_can_be_used_as_water(self):
         planner = AdjacentGridRescuePlanner(
@@ -151,8 +173,9 @@ class ControllerTests(unittest.TestCase):
         )
         self.assertEqual(AckStatus.ACCEPTED, controller.submit(command()).status)
         self.assertTrue(result_event.wait(1.0))
-        self.assertEqual((None, (0, 0)), moves[0])
-        self.assertEqual(((0, 0), None), moves[-1])
+        self.assertEqual((None, (0, 1)), moves[0])
+        self.assertIn(moves[-1][0], GridLayout().start_entry_cells)
+        self.assertIsNone(moves[-1][1])
 
     def test_stop_interrupts_three_second_hold(self):
         planner = AdjacentGridPlannerTests().planner()
@@ -269,7 +292,7 @@ class AdjacentGridMotionTests(unittest.TestCase):
 
         self.assertTrue(navigator.move((1, 1), (1, 2)))
         self.assertEqual([0.0], turns)
-        self.assertEqual([(140.0, 70.0, 0.0)], goals)
+        self.assertEqual([(95.0, 195.0, 0.0)], goals)
 
         with self.assertRaises(ValueError):
             navigator.move((1, 1), (2, 2))
