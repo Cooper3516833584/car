@@ -1,4 +1,4 @@
-"""Hardware-free tests for the active-high sound/light alarm component."""
+"""Hardware-free tests for the active-low sound/light alarm component."""
 
 from __future__ import annotations
 
@@ -27,19 +27,19 @@ class SoundLightAlarmTests(unittest.TestCase):
     def test_resolves_gpio4_b3_to_global_139(self) -> None:
         self.assertEqual(resolve_gpio_number(self.root), 139)
 
-    def test_initialize_drives_safe_low_then_active_high_controls_alarm(self) -> None:
+    def test_initialize_drives_safe_high_then_active_low_controls_alarm(self) -> None:
         alarm = SoundLightAlarm(sysfs_gpio_root=self.root).initialize()
-        self.assertEqual((self.root / "gpio139/direction").read_text().strip(), "low")
+        self.assertEqual((self.root / "gpio139/direction").read_text().strip(), "high")
 
         alarm.off()
         self.assertFalse(alarm.is_active)
-        self.assertEqual((self.root / "gpio139/value").read_text().strip(), "0")
+        self.assertEqual((self.root / "gpio139/value").read_text().strip(), "1")
 
         alarm.on()
         self.assertTrue(alarm.is_active)
-        self.assertEqual((self.root / "gpio139/value").read_text().strip(), "1")
+        self.assertEqual((self.root / "gpio139/value").read_text().strip(), "0")
 
-    def test_set_active_uses_active_high_polarity(self) -> None:
+    def test_set_active_uses_active_low_polarity(self) -> None:
         alarm = SoundLightAlarm(sysfs_gpio_root=self.root).initialize()
         alarm.set_active(True)
         self.assertTrue(alarm.is_active)
