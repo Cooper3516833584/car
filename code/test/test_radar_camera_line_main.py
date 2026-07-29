@@ -75,7 +75,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
                 heading_error_deg=0.0,
             )
         )
-        self.assertEqual(application._final_da_trim(), 0.0)
+        self.assertIsNone(application._final_da_trim())
 
         application._on_follower_state(
             TrackFollowerState(
@@ -120,7 +120,30 @@ class RadarCameraLineMainTests(unittest.TestCase):
                 heading_error_deg=0.0,
             )
         )
-        self.assertEqual(application._final_da_trim(), 0.0)
+        self.assertIsNone(application._final_da_trim())
+
+    def test_inactive_final_trim_does_not_clamp_negative_camera_correction(self):
+        correction = CameraLineCorrectionConfig(
+            required_consecutive_frames=1,
+            large_error_required_frames=1,
+            lateral_deadband_cm=10.0,
+            steering_gain_rad_per_cm=0.010,
+            maximum_abs_correction_rad=0.140,
+            correction_filter_time_constant_s=0.0,
+            maximum_correction_rate_rad_s=100.0,
+        )
+        application = RadarCameraLineApplication(
+            MainConfig(camera_correction=correction)
+        )
+        application.camera_corrector.update_from_observation(
+            observation(lateral_cm=-25.0),
+            now_s=time.monotonic(),
+        )
+
+        adjusted = application._adjust_radar_steering(0.020, 20.0)
+
+        self.assertLess(adjusted, 0.020)
+        self.assertAlmostEqual(adjusted, -0.120)
 
     def test_fusion_config_preserves_fixed_track_inputs(self):
         config = MainConfig(

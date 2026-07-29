@@ -536,7 +536,11 @@ class RadarCameraLineApplication:
                 now_s=time.monotonic(),
             )
             final_da_trim = self._final_da_trim()
-            correction = max(observed_correction, final_da_trim)
+            correction = (
+                observed_correction
+                if final_da_trim is None
+                else max(observed_correction, final_da_trim)
+            )
             combined = float(radar_steering_rad) + correction
             adjusted = max(
                 MIN_VEHICLE_STEERING_RAD,
@@ -552,7 +556,7 @@ class RadarCameraLineApplication:
                 correction,
                 adjusted,
                 observed_correction,
-                final_da_trim,
+                0.0 if final_da_trim is None else final_da_trim,
                 state.active,
                 state.lateral_error_cm,
                 state.confidence,
@@ -564,7 +568,7 @@ class RadarCameraLineApplication:
             )
             return float(radar_steering_rad)
 
-    def _final_da_trim(self) -> float:
+    def _final_da_trim(self) -> float | None:
         with self._lock:
             state = self._follower_state
         if (
@@ -573,7 +577,7 @@ class RadarCameraLineApplication:
             or state.segment is not TrackSegment.DA
             or state.progress_cm < FINAL_DA_TRIM_START_PROGRESS_CM
         ):
-            return 0.0
+            return None
         span_cm = (
             FINAL_DA_TRIM_FULL_PROGRESS_CM
             - FINAL_DA_TRIM_START_PROGRESS_CM
