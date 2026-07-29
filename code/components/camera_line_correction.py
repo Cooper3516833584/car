@@ -40,9 +40,11 @@ class CameraLineCorrectionConfig:
     large_error_fast_activate_cm: float = 18.0
     large_error_required_frames: int = 2
     large_error_max_step_cm: float = 6.0
-    curve_round_marker_minimum_confidence: float = 0.78
-    curve_round_marker_minimum_visible_bands: int = 9
-    curve_round_marker_maximum_fit_rmse_cm: float = 2.0
+    curve_round_marker_minimum_confidence: float = 0.45
+    curve_round_marker_minimum_visible_bands: int = 3
+    curve_round_marker_maximum_fit_rmse_cm: float = 1.25
+    curve_round_marker_required_frames: int = 5
+    curve_round_marker_maximum_abs_correction_rad: float = 0.030
     curve_invalid_grace_frames: int = 4
     lateral_deadband_cm: float = 10.0
     steering_gain_rad_per_cm: float = 0.006
@@ -69,6 +71,10 @@ class CameraLineCorrectionConfig:
             raise ValueError(
                 "curve_round_marker_minimum_visible_bands must be positive"
             )
+        if self.curve_round_marker_required_frames <= 0:
+            raise ValueError(
+                "curve_round_marker_required_frames must be positive"
+            )
         if self.curve_invalid_grace_frames < 0:
             raise ValueError("curve_invalid_grace_frames cannot be negative")
         if not 0.0 < self.curve_round_marker_minimum_confidence <= 1.0:
@@ -83,6 +89,11 @@ class CameraLineCorrectionConfig:
             )
             or self.large_error_max_step_cm <= 0.0
             or self.curve_round_marker_maximum_fit_rmse_cm <= 0.0
+            or self.curve_round_marker_maximum_abs_correction_rad <= 0.0
+            or (
+                self.curve_round_marker_maximum_abs_correction_rad
+                > self.maximum_abs_correction_rad
+            )
             or self.steering_gain_rad_per_cm < 0.0
             or self.maximum_abs_correction_rad <= 0.0
             or self.correction_filter_time_constant_s < 0.0
@@ -273,9 +284,13 @@ class CameraLineSteeringCorrector:
             self._last_accepted_error_cm = lateral_error
             self._invalid_grace_frames = 0
             required_frames = (
-                self.correction_config.large_error_required_frames
-                if large_error
-                else self.correction_config.required_consecutive_frames
+                self.correction_config.curve_round_marker_required_frames
+                if marker_recovery
+                else (
+                    self.correction_config.large_error_required_frames
+                    if large_error
+                    else self.correction_config.required_consecutive_frames
+                )
             )
             qualifying_frames = (
                 self._large_error_frames
@@ -285,7 +300,15 @@ class CameraLineSteeringCorrector:
             active = qualifying_frames >= required_frames
             recovery_mode = active and (large_error or marker_recovery)
             if active:
-                target = self._target_correction(lateral_error)
+                target = self._target_correction(
+                    lateral_error,
+                    maximum_abs_correction_rad=(
+                        self.correction_config
+                        .curve_round_marker_maximum_abs_correction_rad
+                        if marker_recovery
+                        else None
+                    ),
+                )
         else:
             # A real end-line can fill the camera near A.  It must never
             # create a correction, but it may briefly preserve an already
@@ -304,7 +327,10 @@ class CameraLineSteeringCorrector:
                 active = True
                 recovery_mode = True
                 lateral_error = self._last_accepted_error_cm
-                target = self._target_correction(lateral_error)
+                # Keep the last established soft correction steady while the
+                # marker/end-line temporarily hides the longitudinal line.
+                # Do not let an untrusted frame ramp it toward a larger limit.
+                target = self._filtered_correction_rad
             else:
                 self._candidate_error_cm = None
                 self._valid_frames = 0
@@ -376,19 +402,21 @@ class CameraLineSteeringCorrector:
         curve_mode: bool,
     ) -> tuple[bool, bool]:
         config = self.correction_config
-        basic_quality = (
+        structurally_valid = (
             observation.detected
             and math.isfinite(observation.near_lateral_error_cm)
-            and observation.confidence >= config.minimum_confidence
+            and not observation.transverse_line_detected
+        )
+        if not structurally_valid:
+            return False, False
+        basic_quality = (
+            observation.confidence >= config.minimum_confidence
             and observation.visible_band_count
             >= config.minimum_visible_bands
             and observation.fit_rmse_cm <= config.maximum_fit_rmse_cm
-            and not observation.transverse_line_detected
         )
-        if not basic_quality:
-            return False, False
         if not observation.round_marker_detected:
-            return True, False
+            return basic_quality, False
         marker_recovery = (
             curve_mode
             and abs(observation.near_lateral_error_cm)
@@ -420,7 +448,12 @@ class CameraLineSteeringCorrector:
         )
         return same_side and small_step
 
-    def _target_correction(self, lateral_error_cm: float) -> float:
+    def _target_correction(
+        self,
+        lateral_error_cm: float,
+        *,
+        maximum_abs_correction_rad: float | None = None,
+    ) -> float:
         magnitude = max(
             0.0,
             abs(float(lateral_error_cm))
@@ -430,11 +463,19 @@ class CameraLineSteeringCorrector:
             self.correction_config.steering_gain_rad_per_cm * magnitude,
             lateral_error_cm,
         )
+        limit = (
+            self.correction_config.maximum_abs_correction_rad
+            if maximum_abs_correction_rad is None
+            else min(
+                self.correction_config.maximum_abs_correction_rad,
+                float(maximum_abs_correction_rad),
+            )
+        )
         return float(
             np.clip(
                 requested,
-                -self.correction_config.maximum_abs_correction_rad,
-                self.correction_config.maximum_abs_correction_rad,
+                -limit,
+                limit,
             )
         )
 

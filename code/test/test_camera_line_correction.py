@@ -65,6 +65,13 @@ class CameraLineSteeringCorrectorTests(unittest.TestCase):
         self.assertEqual(config.correction_filter_time_constant_s, 0.20)
         self.assertEqual(config.maximum_correction_rate_rad_s, 0.20)
         self.assertEqual(config.curve_invalid_grace_frames, 4)
+        self.assertEqual(config.curve_round_marker_minimum_confidence, 0.45)
+        self.assertEqual(config.curve_round_marker_minimum_visible_bands, 3)
+        self.assertEqual(config.curve_round_marker_required_frames, 5)
+        self.assertEqual(
+            config.curve_round_marker_maximum_abs_correction_rad,
+            0.030,
+        )
         self.assertEqual(config.maximum_abs_correction_rad, 0.055)
 
     def test_small_error_inside_deadband_does_not_change_steering(self):
@@ -252,7 +259,9 @@ class CameraLineSteeringCorrectorTests(unittest.TestCase):
         self.assertEqual(second_large.large_error_frames, 2)
 
     def test_curve_can_recover_stable_large_error_from_round_false_positive(self):
-        corrector = self.make_corrector()
+        corrector = self.make_corrector(
+            curve_round_marker_required_frames=2,
+        )
         marker_frame = observation(
             lateral_cm=24.0,
             confidence=0.85,
@@ -287,6 +296,74 @@ class CameraLineSteeringCorrectorTests(unittest.TestCase):
         self.assertTrue(second_curve.curve_mode)
         self.assertTrue(second_curve.recovery_mode)
         self.assertGreater(second_curve.correction_rad, 0.0)
+
+    def test_curve_sparse_round_marker_needs_five_stable_frames(self):
+        corrector = CameraLineSteeringCorrector()
+        corrector.set_curve_mode(True)
+
+        states = []
+        for index in range(5):
+            states.append(
+                corrector.update_from_observation(
+                    observation(
+                        lateral_cm=24.0 + 0.2 * index,
+                        confidence=0.52,
+                        visible_bands=3,
+                        rmse_cm=0.5,
+                        round_marker=True,
+                    ),
+                    now_s=1.0 + 0.06 * index,
+                )
+            )
+
+        self.assertTrue(all(not state.active for state in states[:4]))
+        self.assertTrue(states[4].active)
+        self.assertTrue(states[4].recovery_mode)
+        self.assertGreater(states[4].correction_rad, 0.0)
+        self.assertLessEqual(
+            states[4].correction_rad,
+            0.030,
+        )
+
+    def test_sparse_round_marker_still_rejected_on_straight(self):
+        corrector = CameraLineSteeringCorrector()
+
+        for index in range(6):
+            state = corrector.update_from_observation(
+                observation(
+                    lateral_cm=24.0,
+                    confidence=0.52,
+                    visible_bands=3,
+                    rmse_cm=0.5,
+                    round_marker=True,
+                ),
+                now_s=1.0 + 0.06 * index,
+            )
+
+        self.assertFalse(state.active)
+        self.assertEqual(state.correction_rad, 0.0)
+
+    def test_sparse_round_marker_correction_has_its_own_lower_limit(self):
+        corrector = self.make_corrector(
+            curve_round_marker_required_frames=2,
+            steering_gain_rad_per_cm=0.02,
+        )
+        corrector.set_curve_mode(True)
+
+        for index in range(2):
+            state = corrector.update_from_observation(
+                observation(
+                    lateral_cm=35.0,
+                    confidence=0.52,
+                    visible_bands=3,
+                    rmse_cm=0.5,
+                    round_marker=True,
+                ),
+                now_s=1.0 + 0.06 * index,
+            )
+
+        self.assertTrue(state.active)
+        self.assertEqual(state.correction_rad, 0.030)
 
     def test_transverse_line_cannot_start_curve_recovery(self):
         corrector = self.make_corrector()

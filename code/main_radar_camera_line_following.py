@@ -565,7 +565,8 @@ class RadarCameraLineApplication:
         LOG.debug(
             "camera correction running=%s active=%s curve=%s recovery=%s "
             "valid_frames=%d large_frames=%d "
-            "confidence=%.2f lateral_cm=%.2f correction_rad=%.4f "
+            "confidence=%.2f used_lateral_cm=%.2f raw_lateral_cm=%.2f "
+            "correction_rad=%.4f "
             "detected=%s bands=%d rmse_cm=%.2f "
             "round=%s transverse=%s",
             state.running,
@@ -576,6 +577,11 @@ class RadarCameraLineApplication:
             state.large_error_frames,
             state.confidence,
             state.lateral_error_cm,
+            (
+                0.0
+                if state.observation is None
+                else state.observation.near_lateral_error_cm
+            ),
             state.correction_rad,
             (
                 False
