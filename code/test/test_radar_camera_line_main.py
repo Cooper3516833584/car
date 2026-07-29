@@ -10,15 +10,23 @@ from main_radar_camera_line_following import (
     AB_START_ALIGNMENT_FADE_END_PROGRESS_CM,
     AB_START_ALIGNMENT_FULL_END_PROGRESS_CM,
     AB_START_HEADING_GAIN,
+    AB_START_INVALID_GRACE_FRAMES,
+    AB_START_LATERAL_DEADBAND_CM,
+    AB_START_LATERAL_GAIN_RAD_PER_CM,
+    AB_START_MAX_FIT_RMSE_CM,
     AB_START_MAX_HEADING_CORRECTION_RAD,
     AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD,
+    AB_START_MIN_CONFIDENCE,
     AB_START_MIN_VALID_FRAMES,
+    AB_START_MIN_VISIBLE_BANDS,
+    AB_START_OBSERVATION_SMOOTHING_ALPHA,
     BC_ENTRY_LIMIT_END_PROGRESS_CM,
     BC_ENTRY_MIN_RIGHT_CORRECTION_RAD,
     CAMERA_CORRECTION_ENABLED,
     CAMERA_LATERAL_DEADBAND_CM,
     CAMERA_MAX_STEERING_CORRECTION_RAD,
     CAMERA_STEERING_GAIN_RAD_PER_CM,
+    CAMERA_STARTUP_FRAME_TIMEOUT_S,
     FINAL_DA_MIN_LEFT_CORRECTION_RAD,
     FINAL_DA_TRIM_FULL_PROGRESS_CM,
     FINAL_DA_TRIM_START_PROGRESS_CM,
@@ -71,12 +79,20 @@ class RadarCameraLineMainTests(unittest.TestCase):
         self.assertEqual(AB_START_ALIGNMENT_FULL_END_PROGRESS_CM, 30.0)
         self.assertEqual(AB_START_ALIGNMENT_FADE_END_PROGRESS_CM, 80.0)
         self.assertEqual(AB_START_HEADING_GAIN, 1.30)
+        self.assertEqual(AB_START_LATERAL_DEADBAND_CM, 8.0)
+        self.assertEqual(AB_START_LATERAL_GAIN_RAD_PER_CM, 0.020)
         self.assertEqual(AB_START_MAX_HEADING_CORRECTION_RAD, 0.180)
         self.assertEqual(
             AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD,
             0.220,
         )
         self.assertEqual(AB_START_MIN_VALID_FRAMES, 2)
+        self.assertEqual(AB_START_MIN_CONFIDENCE, 0.70)
+        self.assertEqual(AB_START_MIN_VISIBLE_BANDS, 9)
+        self.assertEqual(AB_START_MAX_FIT_RMSE_CM, 4.0)
+        self.assertEqual(AB_START_OBSERVATION_SMOOTHING_ALPHA, 0.45)
+        self.assertEqual(AB_START_INVALID_GRACE_FRAMES, 3)
+        self.assertEqual(CAMERA_STARTUP_FRAME_TIMEOUT_S, 4.0)
         self.assertEqual(BC_ENTRY_LIMIT_END_PROGRESS_CM, 210.0)
         self.assertEqual(BC_ENTRY_MIN_RIGHT_CORRECTION_RAD, -0.012)
         self.assertEqual(FINAL_DA_TRIM_START_PROGRESS_CM, 725.0)
@@ -264,6 +280,102 @@ class RadarCameraLineMainTests(unittest.TestCase):
             -0.065,
         )
 
+    def test_ab_start_alignment_uses_large_lateral_error_directly(self):
+        application = RadarCameraLineApplication(MainConfig())
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.AB,
+                progress_cm=20.0,
+                target_speed_cm_s=30.0,
+                commanded_speed_cm_s=30.0,
+                steering_angle_rad=0.0,
+                cross_track_error_cm=0.0,
+                heading_error_deg=0.0,
+            )
+        )
+        for index in range(2):
+            application.camera_corrector.update_from_observation(
+                observation(lateral_cm=-14.0),
+                now_s=1.0 + 0.06 * index,
+            )
+
+        self.assertAlmostEqual(
+            application._ab_start_alignment_correction(now_s=1.06),
+            -0.120,
+        )
+
+    def test_ab_start_lateral_alignment_reaches_the_actual_steering_command(self):
+        application = RadarCameraLineApplication(MainConfig())
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.AB,
+                progress_cm=20.0,
+                target_speed_cm_s=30.0,
+                commanded_speed_cm_s=30.0,
+                steering_angle_rad=0.0,
+                cross_track_error_cm=0.0,
+                heading_error_deg=0.0,
+            )
+        )
+        now = time.monotonic()
+        for index in range(2):
+            application.camera_corrector.update_from_observation(
+                observation(lateral_cm=-14.0),
+                now_s=now + 0.01 * index,
+            )
+
+        adjusted = application._adjust_radar_steering(0.0, 30.0)
+
+        self.assertAlmostEqual(adjusted, -0.120, places=2)
+
+    def test_camera_frame_wait_accepts_a_processed_observation(self):
+        application = RadarCameraLineApplication(MainConfig())
+        application.camera_corrector.update_from_observation(
+            observation(),
+            now_s=time.monotonic(),
+        )
+
+        self.assertTrue(application._wait_for_camera_frame(0.0))
+
+    def test_camera_frame_wait_fails_closed_when_camera_is_not_running(self):
+        application = RadarCameraLineApplication(MainConfig())
+
+        self.assertFalse(application._wait_for_camera_frame(0.0))
+
+    def test_ab_start_alignment_bridges_brief_bad_observation(self):
+        application = RadarCameraLineApplication(MainConfig())
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.AB,
+                progress_cm=20.0,
+                target_speed_cm_s=30.0,
+                commanded_speed_cm_s=30.0,
+                steering_angle_rad=0.0,
+                cross_track_error_cm=0.0,
+                heading_error_deg=0.0,
+            )
+        )
+        for index in range(2):
+            application.camera_corrector.update_from_observation(
+                observation(lateral_cm=-14.0),
+                now_s=1.0 + 0.06 * index,
+            )
+        application.camera_corrector.update_from_observation(
+            observation(transverse=True),
+            now_s=1.12,
+        )
+
+        self.assertAlmostEqual(
+            application._ab_start_alignment_correction(now_s=1.12),
+            -0.120,
+        )
+
     def test_ab_start_alignment_rejects_start_line_and_marker(self):
         correction = CameraLineCorrectionConfig(
             required_consecutive_frames=2,
@@ -298,7 +410,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
                 )
 
             self.assertEqual(
-                application._ab_start_alignment_correction(),
+                application._ab_start_alignment_correction(now_s=1.06),
                 0.0,
             )
 
