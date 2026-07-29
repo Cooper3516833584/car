@@ -73,17 +73,9 @@ CAMERA_MAX_STEERING_CORRECTION_RAD = 0.140
 AB_START_ALIGNMENT_FULL_END_PROGRESS_CM = 30.0
 AB_START_ALIGNMENT_FADE_END_PROGRESS_CM = 80.0
 AB_START_HEADING_GAIN = 1.30
-AB_START_LATERAL_DEADBAND_CM = 8.0
-AB_START_LATERAL_GAIN_RAD_PER_CM = 0.020
 AB_START_MAX_HEADING_CORRECTION_RAD = 0.180
 AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD = 0.220
 AB_START_MIN_VALID_FRAMES = 2
-AB_START_MIN_CONFIDENCE = 0.70
-AB_START_MIN_VISIBLE_BANDS = 9
-AB_START_MAX_FIT_RMSE_CM = 4.0
-AB_START_OBSERVATION_SMOOTHING_ALPHA = 0.45
-AB_START_INVALID_GRACE_FRAMES = 3
-CAMERA_STARTUP_FRAME_TIMEOUT_S = 4.0
 
 # The 60-degree camera mount makes the entrance of the first right semicircle
 # look like a persistent right-side line offset.  Keep that ambiguous
@@ -291,10 +283,6 @@ class RadarCameraLineApplication:
         self._fleet_error_code = 0
         self._closed = False
         self._last_camera_error: str | None = None
-        self._ab_alignment_valid_frames = 0
-        self._ab_alignment_invalid_frames = 0
-        self._ab_alignment_heading_rad = 0.0
-        self._ab_alignment_lateral_cm = 0.0
 
         max_wheel_speed_mm_s = max(300.0, config.speed_cm_s * 12.0)
         self.drive = AckermannDrive(
@@ -414,37 +402,6 @@ class RadarCameraLineApplication:
                         self.config.camera_correction.lateral_deadband_cm,
                         self.config.camera_correction.maximum_abs_correction_rad,
                     )
-                    if self._wait_for_camera_frame(
-                        CAMERA_STARTUP_FRAME_TIMEOUT_S
-                    ):
-                        state = self.camera_corrector.state
-                        observation = state.observation
-                        LOG.info(
-                            "camera frame stream ready before motion "
-                            "confidence=%.2f detected=%s bands=%d "
-                            "round=%s transverse=%s",
-                            state.confidence,
-                            bool(observation and observation.detected),
-                            (
-                                0
-                                if observation is None
-                                else observation.visible_band_count
-                            ),
-                            bool(
-                                observation
-                                and observation.round_marker_detected
-                            ),
-                            bool(
-                                observation
-                                and observation.transverse_line_detected
-                            ),
-                        )
-                    else:
-                        LOG.warning(
-                            "camera produced no processed frame within %.1fs; "
-                            "starting with radar and waiting for live frames",
-                            CAMERA_STARTUP_FRAME_TIMEOUT_S,
-                        )
                 except Exception as exc:
                     # Camera is supplemental. A camera problem must never
                     # prevent the known-good radar-only lap from starting.
@@ -474,20 +431,6 @@ class RadarCameraLineApplication:
                 pass
         finally:
             self.close()
-
-    def _wait_for_camera_frame(self, timeout_s: float) -> bool:
-        deadline = time.monotonic() + max(0.0, float(timeout_s))
-        while not self._stop_event.is_set():
-            state = self.camera_corrector.state
-            if state.observation is not None:
-                return True
-            if not self.camera_corrector.is_running:
-                return False
-            remaining = deadline - time.monotonic()
-            if remaining <= 0.0:
-                return False
-            self._stop_event.wait(min(0.02, remaining))
-        return False
 
     def _calibrate_radar(self) -> None:
         with self._lock:
@@ -668,10 +611,8 @@ class RadarCameraLineApplication:
         now = time.monotonic() if now_s is None else float(now_s)
         with self._lock:
             follower_state = self._follower_state
-            valid_frames = self._ab_alignment_valid_frames
-            heading_error_rad = self._ab_alignment_heading_rad
-            lateral_error_cm = self._ab_alignment_lateral_cm
         camera_state = self.camera_corrector.state
+        observation = camera_state.observation
         if (
             not follower_state.running
             or follower_state.completed
@@ -680,7 +621,18 @@ class RadarCameraLineApplication:
             >= AB_START_ALIGNMENT_FADE_END_PROGRESS_CM
             or now - camera_state.timestamp_s
             > self.config.camera_correction.stale_timeout_s
-            or valid_frames < AB_START_MIN_VALID_FRAMES
+            or camera_state.valid_frames < AB_START_MIN_VALID_FRAMES
+            or observation is None
+            or not observation.detected
+            or not math.isfinite(observation.heading_error_rad)
+            or observation.confidence
+            < self.config.camera_correction.minimum_confidence
+            or observation.visible_band_count
+            < self.config.camera_correction.minimum_visible_bands
+            or observation.fit_rmse_cm
+            > self.config.camera_correction.maximum_fit_rmse_cm
+            or observation.round_marker_detected
+            or observation.transverse_line_detected
         ):
             return 0.0
 
@@ -701,30 +653,13 @@ class RadarCameraLineApplication:
                 / fade_span_cm,
             )
         )
-        heading_requested = (
-            AB_START_HEADING_GAIN * heading_error_rad
-        )
-        heading_correction = max(
-            -AB_START_MAX_HEADING_CORRECTION_RAD,
-            min(
-                AB_START_MAX_HEADING_CORRECTION_RAD,
-                heading_requested,
-            ),
-        )
-        lateral_magnitude = max(
-            0.0,
-            abs(lateral_error_cm) - AB_START_LATERAL_DEADBAND_CM,
-        )
-        lateral_correction = math.copysign(
-            AB_START_LATERAL_GAIN_RAD_PER_CM * lateral_magnitude,
-            lateral_error_cm,
+        requested = (
+            AB_START_HEADING_GAIN
+            * float(observation.heading_error_rad)
         )
         bounded = max(
             -AB_START_MAX_HEADING_CORRECTION_RAD,
-            min(
-                AB_START_MAX_HEADING_CORRECTION_RAD,
-                heading_correction + lateral_correction,
-            ),
+            min(AB_START_MAX_HEADING_CORRECTION_RAD, requested),
         )
         return bounded * fade_scale
 
@@ -774,56 +709,6 @@ class RadarCameraLineApplication:
         self,
         state: CameraLineCorrectionState,
     ) -> None:
-        observation = state.observation
-        reliable_ab_observation = (
-            observation is not None
-            and observation.detected
-            and math.isfinite(observation.heading_error_rad)
-            and math.isfinite(observation.near_lateral_error_cm)
-            and observation.confidence >= AB_START_MIN_CONFIDENCE
-            and observation.visible_band_count
-            >= AB_START_MIN_VISIBLE_BANDS
-            and observation.fit_rmse_cm <= AB_START_MAX_FIT_RMSE_CM
-            and not observation.round_marker_detected
-            and not observation.transverse_line_detected
-        )
-        with self._lock:
-            if reliable_ab_observation:
-                alpha = AB_START_OBSERVATION_SMOOTHING_ALPHA
-                self._ab_alignment_invalid_frames = 0
-                if self._ab_alignment_valid_frames == 0:
-                    self._ab_alignment_heading_rad = (
-                        observation.heading_error_rad
-                    )
-                    self._ab_alignment_lateral_cm = (
-                        observation.near_lateral_error_cm
-                    )
-                else:
-                    self._ab_alignment_heading_rad += alpha * (
-                        observation.heading_error_rad
-                        - self._ab_alignment_heading_rad
-                    )
-                    self._ab_alignment_lateral_cm += alpha * (
-                        observation.near_lateral_error_cm
-                        - self._ab_alignment_lateral_cm
-                    )
-                self._ab_alignment_valid_frames += 1
-            elif (
-                self._ab_alignment_valid_frames
-                >= AB_START_MIN_VALID_FRAMES
-                and self._ab_alignment_invalid_frames
-                < AB_START_INVALID_GRACE_FRAMES
-            ):
-                self._ab_alignment_invalid_frames += 1
-            else:
-                self._ab_alignment_valid_frames = 0
-                self._ab_alignment_invalid_frames = 0
-                self._ab_alignment_heading_rad = 0.0
-                self._ab_alignment_lateral_cm = 0.0
-            ab_alignment_valid_frames = self._ab_alignment_valid_frames
-            ab_alignment_invalid_frames = self._ab_alignment_invalid_frames
-            ab_alignment_heading_rad = self._ab_alignment_heading_rad
-            ab_alignment_lateral_cm = self._ab_alignment_lateral_cm
         if state.error and state.error != self._last_camera_error:
             LOG.warning(
                 "camera correction degraded; radar remains authoritative: %s",
@@ -834,8 +719,6 @@ class RadarCameraLineApplication:
             "camera correction running=%s active=%s curve=%s recovery=%s "
             "valid_frames=%d large_frames=%d "
             "confidence=%.2f used_lateral_cm=%.2f raw_lateral_cm=%.2f "
-            "raw_heading_deg=%.2f ab_align_frames=%d ab_align_bad_frames=%d "
-            "ab_align_heading_deg=%.2f ab_align_lateral_cm=%.2f "
             "correction_rad=%.4f "
             "detected=%s bands=%d rmse_cm=%.2f "
             "round=%s transverse=%s",
@@ -852,15 +735,6 @@ class RadarCameraLineApplication:
                 if state.observation is None
                 else state.observation.near_lateral_error_cm
             ),
-            (
-                0.0
-                if state.observation is None
-                else math.degrees(state.observation.heading_error_rad)
-            ),
-            ab_alignment_valid_frames,
-            ab_alignment_invalid_frames,
-            math.degrees(ab_alignment_heading_rad),
-            ab_alignment_lateral_cm,
             state.correction_rad,
             (
                 False
