@@ -19,6 +19,56 @@ class FleetProtocolTests(unittest.TestCase):
         self.assertEqual(HEADER.format, "<2sBBBBBIHH")
         self.assertEqual(REPORT.format, "<IHHIiiiHhhhHBBHBB")
 
+    def test_payload_vectors_match_golden(self):
+        terrain = tuple(range(1, 8)) + tuple(range(1, 8)) + (1,)
+        positions = tuple(
+            (115 + 70 * col, 175 + 70 * row)
+            for row in range(3)
+            for col in range(5)
+        )
+        encoded = {
+            "poll": encode_poll(PollPayload(7)).hex(),
+            "report": encode_report(
+                ReportPayload(1, 2, 3, 4, -5, 6, 7, 800, 9, -10, 11, 1200, 4, 3, 12, 2, 0)
+            ).hex(),
+            "ack": encode_ack(
+                AckPayload(1, 2, CommandId.PING, AckStatus.COMPLETED, AckReason.NONE, "ok")
+            ).hex(),
+            "coordinate_frame": encode_coordinate_frame(
+                CoordinateFrameCommand(10, -20, 35999)
+            ).hex(),
+            "car_navigate": encode_car_navigate(
+                CarNavigateCommand(100, -50, 9000)
+            ).hex(),
+            "drone_goto": encode_drone_goto(
+                DroneGotoCommand(100, -50, 120, None)
+            ).hex(),
+            "map_report": encode_map_report(
+                MapReportPayload(1, 2, 3, ((0, 0), (1, 0), (1, 1), (0, 1)))
+            ).hex(),
+            "path_report": encode_path_report(
+                PathReportPayload(1, 2, 3, ((0, 0), (5, 6)))
+            ).hex(),
+            "survey_report": encode_survey_report(
+                SurveyReportPayload(
+                    1, 2, 3, int(SurveyFlags.COMPLETE), 4, 2, 3, 5, 1, 4, terrain
+                )
+            ).hex(),
+            "survey_report_positions": encode_survey_report(
+                SurveyReportPayload(
+                    1, 2, 4,
+                    int(SurveyFlags.COMPLETE | SurveyFlags.ABSOLUTE_POSITIONS),
+                    4, 2, 3, 5, 1, 4, terrain, positions,
+                )
+            ).hex(),
+            "disaster_rescue": encode_disaster_rescue(
+                DisasterRescueCommand(4, 2, 3, terrain)
+            ).hex(),
+        }
+        self.assertEqual(set(encoded), set(DATA["payload_vectors"]))
+        for name, expected in DATA["payload_vectors"].items():
+            self.assertEqual(encoded[name], expected, name)
+
     def test_crc_and_golden_frames(self):
         self.assertEqual(crc16_ccitt_false(b"123456789"), 0x29B1)
         for item in DATA["valid_frames"]:
