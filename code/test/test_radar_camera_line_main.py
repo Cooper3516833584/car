@@ -11,6 +11,9 @@ from main_radar_camera_line_following import (
     CAMERA_LATERAL_DEADBAND_CM,
     CAMERA_MAX_STEERING_CORRECTION_RAD,
     CAMERA_STEERING_GAIN_RAD_PER_CM,
+    FINAL_DA_MIN_LEFT_CORRECTION_RAD,
+    FINAL_DA_TRIM_FULL_PROGRESS_CM,
+    FINAL_DA_TRIM_START_PROGRESS_CM,
     RADAR_CENTER_BEHIND_A_ALONG_AB_CM,
     TRACK_SPEED_CM_S,
     MainConfig,
@@ -50,8 +53,74 @@ class RadarCameraLineMainTests(unittest.TestCase):
         self.assertEqual(CAMERA_LATERAL_DEADBAND_CM, 10.0)
         self.assertEqual(CAMERA_STEERING_GAIN_RAD_PER_CM, 0.010)
         self.assertEqual(CAMERA_MAX_STEERING_CORRECTION_RAD, 0.140)
+        self.assertEqual(FINAL_DA_TRIM_START_PROGRESS_CM, 725.0)
+        self.assertEqual(FINAL_DA_TRIM_FULL_PROGRESS_CM, 740.0)
+        self.assertEqual(FINAL_DA_MIN_LEFT_CORRECTION_RAD, 0.100)
         self.assertEqual(config.speed_cm_s, 30.0)
         self.assertEqual(config.radar_center_behind_a_cm, 20.0)
+
+    def test_final_da_trim_is_smooth_and_limited_to_lap_end(self):
+        application = RadarCameraLineApplication(MainConfig())
+
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.DA,
+                progress_cm=724.0,
+                target_speed_cm_s=30.0,
+                commanded_speed_cm_s=30.0,
+                steering_angle_rad=-0.2,
+                cross_track_error_cm=0.0,
+                heading_error_deg=0.0,
+            )
+        )
+        self.assertEqual(application._final_da_trim(), 0.0)
+
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.DA,
+                progress_cm=732.5,
+                target_speed_cm_s=30.0,
+                commanded_speed_cm_s=30.0,
+                steering_angle_rad=-0.2,
+                cross_track_error_cm=0.0,
+                heading_error_deg=0.0,
+            )
+        )
+        self.assertAlmostEqual(application._final_da_trim(), 0.050)
+
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.DA,
+                progress_cm=750.0,
+                target_speed_cm_s=30.0,
+                commanded_speed_cm_s=30.0,
+                steering_angle_rad=-0.2,
+                cross_track_error_cm=0.0,
+                heading_error_deg=0.0,
+            )
+        )
+        self.assertAlmostEqual(application._final_da_trim(), 0.100)
+
+        application._on_follower_state(
+            TrackFollowerState(
+                running=False,
+                completed=True,
+                segment=TrackSegment.DA,
+                progress_cm=773.0,
+                target_speed_cm_s=0.0,
+                commanded_speed_cm_s=0.0,
+                steering_angle_rad=0.0,
+                cross_track_error_cm=0.0,
+                heading_error_deg=0.0,
+            )
+        )
+        self.assertEqual(application._final_da_trim(), 0.0)
 
     def test_fusion_config_preserves_fixed_track_inputs(self):
         config = MainConfig(

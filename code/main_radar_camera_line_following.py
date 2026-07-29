@@ -66,6 +66,13 @@ CAMERA_LATERAL_DEADBAND_CM = 10.0
 CAMERA_STEERING_GAIN_RAD_PER_CM = 0.010
 CAMERA_MAX_STEERING_CORRECTION_RAD = 0.140
 
+# Fixed-course trim for the final DA approach.  The end marker progressively
+# hides the longitudinal line while radar tends to command full right lock, so
+# preserve a known-good left correction over only the last part of the lap.
+FINAL_DA_TRIM_START_PROGRESS_CM = 725.0
+FINAL_DA_TRIM_FULL_PROGRESS_CM = 740.0
+FINAL_DA_MIN_LEFT_CORRECTION_RAD = 0.100
+
 
 LOG = logging.getLogger("radar-camera-line-main")
 LOG_FILENAME = "car-main.log"
@@ -519,15 +526,17 @@ class RadarCameraLineApplication:
         radar_steering_rad: float,
         speed_cm_s: float,
     ) -> float:
-        """Add a small visual correction without weakening radar safety."""
+        """Fuse camera correction and the fixed-course final-DA trim."""
 
         if not self.config.camera_correction_enabled:
             return float(radar_steering_rad)
         try:
-            correction = self.camera_corrector.correction_for_speed(
+            observed_correction = self.camera_corrector.correction_for_speed(
                 speed_cm_s,
                 now_s=time.monotonic(),
             )
+            final_da_trim = self._final_da_trim()
+            correction = max(observed_correction, final_da_trim)
             combined = float(radar_steering_rad) + correction
             adjusted = max(
                 MIN_VEHICLE_STEERING_RAD,
@@ -536,11 +545,14 @@ class RadarCameraLineApplication:
             state = self.camera_corrector.state
             LOG.debug(
                 "steering fusion radar_rad=%.4f camera_rad=%.4f "
-                "final_rad=%.4f camera_active=%s camera_error_cm=%.2f "
-                "camera_confidence=%.2f",
+                "final_rad=%.4f observed_camera_rad=%.4f "
+                "final_da_trim_rad=%.4f camera_active=%s "
+                "camera_error_cm=%.2f camera_confidence=%.2f",
                 radar_steering_rad,
                 correction,
                 adjusted,
+                observed_correction,
+                final_da_trim,
                 state.active,
                 state.lateral_error_cm,
                 state.confidence,
@@ -551,6 +563,33 @@ class RadarCameraLineApplication:
                 "camera steering adjustment failed; using radar command"
             )
             return float(radar_steering_rad)
+
+    def _final_da_trim(self) -> float:
+        with self._lock:
+            state = self._follower_state
+        if (
+            not state.running
+            or state.completed
+            or state.segment is not TrackSegment.DA
+            or state.progress_cm < FINAL_DA_TRIM_START_PROGRESS_CM
+        ):
+            return 0.0
+        span_cm = (
+            FINAL_DA_TRIM_FULL_PROGRESS_CM
+            - FINAL_DA_TRIM_START_PROGRESS_CM
+        )
+        blend = min(
+            1.0,
+            max(
+                0.0,
+                (
+                    state.progress_cm
+                    - FINAL_DA_TRIM_START_PROGRESS_CM
+                )
+                / span_cm,
+            ),
+        )
+        return FINAL_DA_MIN_LEFT_CORRECTION_RAD * blend
 
     def _on_camera_state(
         self,
