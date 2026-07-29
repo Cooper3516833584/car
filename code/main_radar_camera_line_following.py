@@ -24,10 +24,12 @@ import time
 
 from components import (
     AckermannDrive,
+    BlackLineDetector,
     CompetitionTrack,
     CompetitionTrackFollower,
     DEFAULT_D500_PORT,
     D500RadarComponent,
+    LineObservation,
     LineVisionConfig,
     PerspectiveConfig,
     Pose2D,
@@ -67,6 +69,27 @@ CAMERA_LATERAL_DEADBAND_CM = 10.0
 CAMERA_STEERING_GAIN_RAD_PER_CM = 0.010
 CAMERA_MAX_STEERING_CORRECTION_RAD = 0.140
 
+# The camera now looks 30 degrees below horizontal.  A second, inexpensive
+# perspective profile uses the farther visible path only on the two straights.
+# It contributes heading only (never lateral position), waits for a stable
+# longitudinal line, and is reset before either semicircle.
+STRAIGHT_FAR_MARGIN_CM = 25.0
+STRAIGHT_FAR_MIN_CONFIDENCE = 0.78
+STRAIGHT_FAR_MIN_VISIBLE_BANDS = 8
+STRAIGHT_FAR_MAX_RMSE_CM = 1.20
+STRAIGHT_FAR_MAX_HEADING_CHANGE_RAD = 0.14
+STRAIGHT_FAR_REQUIRED_FRAMES = 5
+STRAIGHT_FAR_MAX_FRAME_STEP_RAD = 0.035
+STRAIGHT_FAR_HEADING_DEADBAND_RAD = 0.018
+STRAIGHT_FAR_HEADING_GAIN = 0.90
+STRAIGHT_FAR_MAX_CORRECTION_RAD = 0.055
+STRAIGHT_FAR_FILTER_TIME_CONSTANT_S = 0.30
+STRAIGHT_FAR_MAX_CORRECTION_RATE_RAD_S = 0.18
+STRAIGHT_FAR_NEAR_PROBE_CM = 35.0
+STRAIGHT_FAR_PROBE_CM = 95.0
+TRACK_STRAIGHT_LENGTH_CM = 150.0
+TRACK_SEMICIRCLE_LENGTH_CM = math.pi * 75.0
+
 # Strong camera-heading alignment for an imperfect initial pose at A.  The
 # start line/marker is explicitly rejected; once the longitudinal AB line is
 # reliable, use its fitted heading to square the car before the first curve.
@@ -77,8 +100,8 @@ AB_START_MAX_HEADING_CORRECTION_RAD = 0.180
 AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD = 0.220
 AB_START_MIN_VALID_FRAMES = 2
 
-# The 60-degree camera mount makes the entrance of the first right semicircle
-# look like a persistent right-side line offset.  Keep that ambiguous
+# The near-field camera profile can make the entrance of the first right
+# semicircle look like a persistent right-side line offset. Keep that ambiguous
 # same-direction correction weak instead of adding it fully to radar steering.
 BC_ENTRY_LIMIT_END_PROGRESS_CM = 210.0
 BC_ENTRY_MIN_RIGHT_CORRECTION_RAD = -0.012
@@ -283,6 +306,12 @@ class RadarCameraLineApplication:
         self._fleet_error_code = 0
         self._closed = False
         self._last_camera_error: str | None = None
+        self._straight_far_valid_frames = 0
+        self._straight_far_candidate_rad: float | None = None
+        self._straight_far_last_observation_s: float | None = None
+        self._straight_far_last_filter_s: float | None = None
+        self._straight_far_filtered_rad = 0.0
+        self._straight_far_heading_error_rad = 0.0
 
         max_wheel_speed_mm_s = max(300.0, config.speed_cm_s * 12.0)
         self.drive = AckermannDrive(
@@ -295,6 +324,10 @@ class RadarCameraLineApplication:
             camera_index=config.camera_source,
             vision_config=self._front_camera_vision_config(),
             correction_config=config.camera_correction,
+            supplemental_detector=BlackLineDetector(
+                self._straight_far_vision_config()
+            ),
+            supplemental_in_curve_mode=False,
             on_state_changed=self._on_camera_state,
         )
         self._corrected_drive = _CameraCorrectedDrive(
@@ -354,7 +387,7 @@ class RadarCameraLineApplication:
 
     @staticmethod
     def _front_camera_vision_config() -> LineVisionConfig:
-        """Calibration for the current low-mounted, steep front camera."""
+        """Retain the proven near-field profile used by curve correction."""
 
         return LineVisionConfig(
             perspective=PerspectiveConfig(
@@ -381,6 +414,41 @@ class RadarCameraLineApplication:
             maximum_center_jump_cm=18.0,
             morphology_close_size=9,
             polynomial_smoothing_alpha=0.32,
+            transverse_stop_max_height_cm=8.0,
+            round_marker_min_height_cm=12.0,
+            continuity_weight=0.12,
+        )
+
+    @staticmethod
+    def _straight_far_vision_config() -> LineVisionConfig:
+        """Far-path profile calibrated from the current 30-degree camera."""
+
+        return LineVisionConfig(
+            perspective=PerspectiveConfig(
+                source_points_norm=(
+                    (0.100, 0.950),
+                    (0.900, 0.950),
+                    (0.556, 0.100),
+                    (0.413, 0.100),
+                ),
+                output_width_px=200,
+                output_height_px=250,
+                ground_width_cm=80.0,
+                ground_depth_cm=120.0,
+            ),
+            require_adaptive_confirmation=False,
+            scan_near_cm=18.0,
+            scan_far_cm=105.0,
+            minimum_band_fill_ratio=0.20,
+            use_expected_width_window=True,
+            expected_line_width_cm=20.0,
+            minimum_line_width_cm=7.0,
+            maximum_line_width_cm=34.0,
+            maximum_line_internal_gap_cm=8.0,
+            maximum_center_jump_cm=18.0,
+            morphology_close_size=9,
+            polynomial_smoothing_alpha=0.32,
+            transverse_stop_max_forward_cm=105.0,
             transverse_stop_max_height_cm=8.0,
             round_marker_min_height_cm=12.0,
             continuity_weight=0.12,
@@ -556,11 +624,18 @@ class RadarCameraLineApplication:
             ab_start_alignment = self._ab_start_alignment_correction(
                 now_s=now_s
             )
+            straight_far_heading = self._straight_far_heading_correction(
+                now_s=now_s
+            )
             camera_correction = max(
                 -AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD,
                 min(
                     AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD,
-                    observed_correction + ab_start_alignment,
+                    (
+                        observed_correction
+                        + ab_start_alignment
+                        + straight_far_heading
+                    ),
                 ),
             )
             course_limited_correction = self._apply_course_camera_limit(
@@ -582,6 +657,8 @@ class RadarCameraLineApplication:
                 "steering fusion radar_rad=%.4f camera_rad=%.4f "
                 "final_rad=%.4f observed_camera_rad=%.4f "
                 "ab_start_alignment_rad=%.4f "
+                "straight_far_heading_rad=%.4f "
+                "straight_far_error_deg=%.2f "
                 "course_limited_camera_rad=%.4f final_da_trim_rad=%.4f "
                 "camera_active=%s "
                 "camera_error_cm=%.2f camera_confidence=%.2f",
@@ -590,6 +667,8 @@ class RadarCameraLineApplication:
                 adjusted,
                 observed_correction,
                 ab_start_alignment,
+                straight_far_heading,
+                math.degrees(self._straight_far_heading_error_rad),
                 course_limited_correction,
                 0.0 if final_da_trim is None else final_da_trim,
                 state.active,
@@ -662,6 +741,164 @@ class RadarCameraLineApplication:
             min(AB_START_MAX_HEADING_CORRECTION_RAD, requested),
         )
         return bounded * fade_scale
+
+    def _straight_far_heading_correction(
+        self,
+        *,
+        now_s: float | None = None,
+        observation: LineObservation | None = None,
+    ) -> float:
+        """Return a slow heading-only correction on the middle of AB/CD."""
+
+        now = time.monotonic() if now_s is None else float(now_s)
+        with self._lock:
+            follower_state = self._follower_state
+        if not self._straight_far_window_active(follower_state):
+            self._reset_straight_far_heading()
+            return 0.0
+
+        current = (
+            self.camera_corrector.supplemental_observation
+            if observation is None
+            else observation
+        )
+        if current is None or now - current.timestamp_s > (
+            self.config.camera_correction.stale_timeout_s
+        ):
+            self._reset_straight_far_heading()
+            return 0.0
+        if current.timestamp_s == self._straight_far_last_observation_s:
+            return self._straight_far_filtered_rad
+        self._straight_far_last_observation_s = current.timestamp_s
+
+        heading_error = self._far_path_heading_error(current)
+        usable = (
+            current.detected
+            and math.isfinite(heading_error)
+            and current.confidence >= STRAIGHT_FAR_MIN_CONFIDENCE
+            and current.visible_band_count >= STRAIGHT_FAR_MIN_VISIBLE_BANDS
+            and current.fit_rmse_cm <= STRAIGHT_FAR_MAX_RMSE_CM
+            and abs(current.forward_heading_change_rad)
+            <= STRAIGHT_FAR_MAX_HEADING_CHANGE_RAD
+            and not current.round_marker_detected
+            and not current.transverse_line_detected
+        )
+        if not usable:
+            self._reset_straight_far_candidate()
+            return self._filter_straight_far_heading(0.0, current.timestamp_s)
+
+        previous = self._straight_far_candidate_rad
+        stable = (
+            previous is not None
+            and abs(heading_error - previous)
+            <= STRAIGHT_FAR_MAX_FRAME_STEP_RAD
+        )
+        self._straight_far_valid_frames = (
+            self._straight_far_valid_frames + 1 if stable else 1
+        )
+        self._straight_far_candidate_rad = heading_error
+        self._straight_far_heading_error_rad = heading_error
+        if self._straight_far_valid_frames < STRAIGHT_FAR_REQUIRED_FRAMES:
+            return self._filter_straight_far_heading(
+                0.0,
+                current.timestamp_s,
+            )
+
+        magnitude = max(
+            0.0,
+            abs(heading_error) - STRAIGHT_FAR_HEADING_DEADBAND_RAD,
+        )
+        requested = math.copysign(
+            STRAIGHT_FAR_HEADING_GAIN * magnitude,
+            heading_error,
+        )
+        requested = max(
+            -STRAIGHT_FAR_MAX_CORRECTION_RAD,
+            min(STRAIGHT_FAR_MAX_CORRECTION_RAD, requested),
+        )
+        return self._filter_straight_far_heading(
+            requested,
+            current.timestamp_s,
+        )
+
+    @staticmethod
+    def _straight_far_window_active(state: TrackFollowerState) -> bool:
+        if not state.running or state.completed:
+            return False
+        if state.segment is TrackSegment.AB:
+            local_progress = state.progress_cm
+        elif state.segment is TrackSegment.CD:
+            local_progress = (
+                state.progress_cm
+                - TRACK_STRAIGHT_LENGTH_CM
+                - TRACK_SEMICIRCLE_LENGTH_CM
+            )
+        else:
+            return False
+        return (
+            STRAIGHT_FAR_MARGIN_CM
+            <= local_progress
+            <= TRACK_STRAIGHT_LENGTH_CM - STRAIGHT_FAR_MARGIN_CM
+        )
+
+    @staticmethod
+    def _far_path_heading_error(observation: LineObservation) -> float:
+        polynomial = observation.polynomial_y_left_by_x
+        if polynomial is None:
+            return math.nan
+        near_y = (
+            polynomial[0] * STRAIGHT_FAR_NEAR_PROBE_CM**2
+            + polynomial[1] * STRAIGHT_FAR_NEAR_PROBE_CM
+            + polynomial[2]
+        )
+        far_y = (
+            polynomial[0] * STRAIGHT_FAR_PROBE_CM**2
+            + polynomial[1] * STRAIGHT_FAR_PROBE_CM
+            + polynomial[2]
+        )
+        return math.atan2(
+            far_y - near_y,
+            STRAIGHT_FAR_PROBE_CM - STRAIGHT_FAR_NEAR_PROBE_CM,
+        )
+
+    def _filter_straight_far_heading(
+        self,
+        requested_rad: float,
+        timestamp_s: float,
+    ) -> float:
+        previous_time = self._straight_far_last_filter_s
+        dt = (
+            1.0 / 30.0
+            if previous_time is None
+            else max(1e-3, min(0.25, timestamp_s - previous_time))
+        )
+        self._straight_far_last_filter_s = timestamp_s
+        alpha = 1.0 - math.exp(
+            -dt / STRAIGHT_FAR_FILTER_TIME_CONSTANT_S
+        )
+        low_passed = self._straight_far_filtered_rad + alpha * (
+            requested_rad - self._straight_far_filtered_rad
+        )
+        maximum_delta = STRAIGHT_FAR_MAX_CORRECTION_RATE_RAD_S * dt
+        self._straight_far_filtered_rad = max(
+            self._straight_far_filtered_rad - maximum_delta,
+            min(
+                self._straight_far_filtered_rad + maximum_delta,
+                low_passed,
+            ),
+        )
+        return self._straight_far_filtered_rad
+
+    def _reset_straight_far_candidate(self) -> None:
+        self._straight_far_valid_frames = 0
+        self._straight_far_candidate_rad = None
+        self._straight_far_heading_error_rad = 0.0
+
+    def _reset_straight_far_heading(self) -> None:
+        self._reset_straight_far_candidate()
+        self._straight_far_last_observation_s = None
+        self._straight_far_last_filter_s = None
+        self._straight_far_filtered_rad = 0.0
 
     def _apply_course_camera_limit(self, correction_rad: float) -> float:
         with self._lock:
