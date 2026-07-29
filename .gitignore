@@ -4,3 +4,8 @@ __pycache__/
 .venv/
 venv/
 logs/
+
+# Local state created by coding agents; never commit it to the project.
+.agents/
+.claude/
+.codex/
