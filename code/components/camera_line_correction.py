@@ -287,10 +287,13 @@ class CameraLineSteeringCorrector:
             if active:
                 target = self._target_correction(lateral_error)
         else:
+            # A real end-line can fill the camera near A.  It must never
+            # create a correction, but it may briefly preserve an already
+            # established large-error curve correction from the last
+            # trustworthy longitudinal-line observation.
             can_hold_large_curve_recovery = (
                 curve_mode
                 and previous_active
-                and not observation.transverse_line_detected
                 and abs(self._last_accepted_error_cm)
                 >= self.correction_config.large_error_fast_activate_cm
                 and self._invalid_grace_frames

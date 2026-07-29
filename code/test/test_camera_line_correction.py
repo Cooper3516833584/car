@@ -288,7 +288,23 @@ class CameraLineSteeringCorrectorTests(unittest.TestCase):
         self.assertTrue(second_curve.recovery_mode)
         self.assertGreater(second_curve.correction_rad, 0.0)
 
-    def test_transverse_line_never_uses_curve_recovery_or_grace(self):
+    def test_transverse_line_cannot_start_curve_recovery(self):
+        corrector = self.make_corrector()
+        corrector.set_curve_mode(True)
+
+        for index in range(3):
+            rejected = corrector.update_from_observation(
+                observation(lateral_cm=24.0, transverse=True),
+                now_s=1.0 + 0.06 * index,
+            )
+
+        self.assertFalse(rejected.active)
+        self.assertFalse(rejected.recovery_mode)
+        self.assertEqual(rejected.valid_frames, 0)
+        self.assertEqual(rejected.large_error_frames, 0)
+        self.assertEqual(rejected.correction_rad, 0.0)
+
+    def test_transverse_line_can_bridge_existing_large_curve_recovery(self):
         corrector = self.make_corrector()
         corrector.set_curve_mode(True)
         for index in range(2):
@@ -296,6 +312,29 @@ class CameraLineSteeringCorrectorTests(unittest.TestCase):
                 observation(lateral_cm=24.0),
                 now_s=1.0 + 0.06 * index,
             )
+        held = corrector.update_from_observation(
+            observation(lateral_cm=24.0, transverse=True),
+            now_s=1.12,
+        )
+
+        self.assertTrue(active.active)
+        self.assertTrue(held.active)
+        self.assertTrue(held.recovery_mode)
+        self.assertEqual(held.lateral_error_cm, 24.0)
+        self.assertEqual(held.valid_frames, 2)
+        self.assertEqual(held.large_error_frames, 2)
+        self.assertTrue(held.observation.transverse_line_detected)
+        self.assertGreaterEqual(held.correction_rad, active.correction_rad)
+
+    def test_transverse_line_on_straight_clears_curve_recovery(self):
+        corrector = self.make_corrector()
+        corrector.set_curve_mode(True)
+        for index in range(2):
+            active = corrector.update_from_observation(
+                observation(lateral_cm=24.0),
+                now_s=1.0 + 0.06 * index,
+            )
+        corrector.set_curve_mode(False)
         rejected = corrector.update_from_observation(
             observation(lateral_cm=24.0, transverse=True),
             now_s=1.12,
@@ -306,7 +345,6 @@ class CameraLineSteeringCorrectorTests(unittest.TestCase):
         self.assertFalse(rejected.recovery_mode)
         self.assertEqual(rejected.valid_frames, 0)
         self.assertEqual(rejected.large_error_frames, 0)
-        self.assertLess(rejected.correction_rad, active.correction_rad)
 
     def test_curve_large_recovery_bridges_four_bad_frames(self):
         corrector = self.make_corrector()
