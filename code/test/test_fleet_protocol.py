@@ -11,6 +11,14 @@ DATA = json.loads((Path(__file__).parent / "data" / "fleetbus_v1_golden.json").r
 
 
 class FleetProtocolTests(unittest.TestCase):
+    def test_v1_wire_contract_constants(self):
+        self.assertEqual(MAGIC, b"\xd3\x91")
+        self.assertEqual(TAIL, b"\x1d\x0f")
+        self.assertEqual(VERSION, 1)
+        self.assertEqual(MAX_PAYLOAD_LEN, 220)
+        self.assertEqual(HEADER.format, "<2sBBBBBIHH")
+        self.assertEqual(REPORT.format, "<IHHIiiiHhhhHBBHBB")
+
     def test_crc_and_golden_frames(self):
         self.assertEqual(crc16_ccitt_false(b"123456789"), 0x29B1)
         for item in DATA["valid_frames"]:
