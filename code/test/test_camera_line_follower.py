@@ -35,8 +35,18 @@ class FakeDrive:
         self.stops += 1
 
 
-def observation(*, y_left=0.0, confidence=0.9, detected=True, timestamp=10.0):
+def observation(
+    *,
+    y_left=0.0,
+    confidence=0.9,
+    detected=True,
+    timestamp=10.0,
+    polynomial=None,
+    forward_heading_change_rad=0.0,
+):
     # y(x) = constant lateral offset.
+    if polynomial is None and detected:
+        polynomial = (0.0, 0.0, y_left)
     return LineObservation(
         timestamp_s=timestamp,
         detected=detected,
@@ -50,8 +60,9 @@ def observation(*, y_left=0.0, confidence=0.9, detected=True, timestamp=10.0):
         visible_band_count=12,
         total_band_count=13,
         median_line_width_cm=5.0,
-        polynomial_y_left_by_x=(0.0, 0.0, y_left) if detected else None,
+        polynomial_y_left_by_x=polynomial if detected else None,
         dark_threshold=90.0,
+        forward_heading_change_rad=forward_heading_change_rad,
     )
 
 
@@ -129,6 +140,89 @@ class DetectorTests(unittest.TestCase):
         result = self.detector.process(self.synthetic_frame(curve=0.002), timestamp_s=1.0)
         self.assertTrue(result.detected)
         self.assertGreater(result.heading_error_rad, 0.0)
+
+    def test_new_curve_is_followed_from_near_to_far_in_current_frame(self):
+        self.detector.process(self.synthetic_frame(), timestamp_s=1.0)
+        result = self.detector.process(
+            self.synthetic_frame(curve=0.006),
+            timestamp_s=1.1,
+        )
+
+        self.assertTrue(result.detected)
+        self.assertGreaterEqual(result.visible_band_count, 8)
+        self.assertGreater(result.lookahead_y_left_cm, 1.5)
+        self.assertGreater(result.forward_heading_change_rad, 0.10)
+
+
+class BandTrackingTests(unittest.TestCase):
+    def test_rows_follow_current_curve_instead_of_previous_straight_fit(self):
+        perspective = PerspectiveConfig(
+            source_points_norm=((0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)),
+            output_width_px=320,
+            output_height_px=400,
+            ground_width_cm=80.0,
+            ground_depth_cm=100.0,
+        )
+        config = LineVisionConfig(
+            perspective=perspective,
+            scan_near_cm=8.0,
+            scan_far_cm=78.0,
+            maximum_center_jump_cm=8.0,
+        )
+        detector = BlackLineDetector(config)
+        detector._previous_polynomial = np.asarray((0.0, 0.0, 0.0))
+        mask = np.zeros((400, 320), dtype=np.uint8)
+        for row in range(400):
+            forward_cm = (399 - row) * 0.25
+            y_left_cm = 0.006 * forward_cm * forward_cm
+            centre = int(round(159.5 - y_left_cm / 0.25))
+            start = max(0, centre - 10)
+            end = min(320, centre + 10)
+            mask[row, start:end] = 255
+
+        points, _ = detector._extract_band_centres(
+            mask,
+            np.where(mask > 0, 20, 225).astype(np.uint8),
+        )
+
+        self.assertEqual(len(points), config.scan_count)
+        self.assertGreater(points[-1][1], 30.0)
+
+    def test_round_marker_rows_are_excluded_and_far_track_can_seed_startup(self):
+        perspective = PerspectiveConfig(
+            source_points_norm=((0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)),
+            output_width_px=320,
+            output_height_px=400,
+            ground_width_cm=80.0,
+            ground_depth_cm=100.0,
+        )
+        config = LineVisionConfig(
+            perspective=perspective,
+            scan_near_cm=8.0,
+            scan_far_cm=78.0,
+        )
+        detector = BlackLineDetector(config)
+        mask = np.zeros((400, 320), dtype=np.uint8)
+        mask[:, 150:170] = 255
+        mask[270:330, 20:300] = 255
+
+        points, widths = detector._extract_band_centres(
+            mask,
+            np.where(mask > 0, 20, 225).astype(np.uint8),
+            ignore_wide_bands=True,
+        )
+        result = detector._fit_observation(
+            points,
+            widths,
+            timestamp_s=1.0,
+            dark_threshold=90.0,
+            minimum_fit_points=3,
+        )
+
+        self.assertGreaterEqual(len(points), 3)
+        self.assertLess(len(points), config.scan_count)
+        self.assertTrue(result.detected)
+        self.assertAlmostEqual(result.lookahead_y_left_cm, 0.0, delta=1.0)
 
 
 class ControllerTests(unittest.TestCase):
@@ -223,6 +317,84 @@ class ControllerTests(unittest.TestCase):
             abs(second.steering_angle_rad - first.steering_angle_rad),
             self.follower.control_config.maximum_steering_rate_rad_s * 0.01 + 1e-9,
         )
+
+    def test_circle_target_uses_ackermann_pure_pursuit_steering(self):
+        radius_cm = 75.0
+        follower = CameraLineFollower(
+            drive=FakeDrive(),
+            control_config=LineControlConfig(
+                recovery_good_frames=1,
+                steering_low_pass_time_constant_s=0.0,
+                maximum_steering_rate_rad_s=100.0,
+            ),
+        )
+        curve = observation(
+            polynomial=(1.0 / (2.0 * radius_cm), 0.0, 0.0),
+            forward_heading_change_rad=0.6,
+        )
+
+        command = follower.compute_command(curve, now_s=10.0)
+
+        self.assertGreater(command.steering_angle_rad, 0.14)
+        self.assertLess(command.steering_angle_rad, 0.23)
+
+    def test_upcoming_curve_slows_before_filtered_steering_catches_up(self):
+        config = LineControlConfig(
+            recovery_good_frames=1,
+            maximum_acceleration_mm_s2=1_000_000.0,
+            maximum_deceleration_mm_s2=1_000_000.0,
+        )
+        straight_follower = CameraLineFollower(
+            drive=FakeDrive(),
+            control_config=config,
+        )
+        curve_follower = CameraLineFollower(
+            drive=FakeDrive(),
+            control_config=config,
+        )
+
+        straight = straight_follower.compute_command(
+            observation(),
+            now_s=10.0,
+        )
+        curve = curve_follower.compute_command(
+            observation(forward_heading_change_rad=0.7),
+            now_s=10.0,
+        )
+
+        self.assertLess(curve.speed_mm_s, straight.speed_mm_s)
+        self.assertAlmostEqual(
+            curve.speed_mm_s,
+            config.minimum_tracking_speed_mm_s,
+        )
+
+    def test_speed_ramps_up_instead_of_starting_abruptly(self):
+        command = self.follower.compute_command(observation(), now_s=10.0)
+
+        expected_maximum = (
+            self.follower.control_config.maximum_acceleration_mm_s2
+            / self.follower.vision_config.camera_fps
+        )
+        self.assertLessEqual(command.speed_mm_s, expected_maximum + 1e-9)
+
+    def test_single_frame_target_spike_does_not_reverse_steering(self):
+        follower = CameraLineFollower(
+            drive=FakeDrive(),
+            control_config=LineControlConfig(
+                recovery_good_frames=1,
+                lateral_gain=0.0,
+                heading_gain=0.0,
+                curvature_feedforward_gain=0.0,
+                steering_low_pass_time_constant_s=0.0,
+                maximum_steering_rate_rad_s=100.0,
+            ),
+        )
+
+        before = follower.compute_command(observation(y_left=20.0), now_s=10.0)
+        spike = follower.compute_command(observation(y_left=-20.0), now_s=10.01)
+
+        self.assertGreater(before.steering_angle_rad, 0.0)
+        self.assertGreater(spike.steering_angle_rad, 0.0)
 
 
 if __name__ == "__main__":

@@ -58,6 +58,22 @@ class CameraLineMainTests(unittest.TestCase):
         self.assertEqual(profile.scan_far_cm, 72.0)
         self.assertEqual(profile.expected_line_width_cm, 28.0)
         self.assertEqual(profile.maximum_line_internal_gap_cm, 8.0)
+        self.assertEqual(profile.maximum_center_jump_cm, 18.0)
+        self.assertEqual(profile.polynomial_smoothing_alpha, 0.32)
+
+    def test_controller_uses_predictive_smooth_ackermann_tracking(self):
+        control = CameraLineApplication._control_config_for_speed(40.0)
+
+        self.assertEqual(control.minimum_lookahead_cm, 38.0)
+        self.assertEqual(control.maximum_lookahead_cm, 68.0)
+        self.assertEqual(control.pure_pursuit_gain, 1.0)
+        self.assertEqual(control.curvature_feedforward_gain, 0.0)
+        self.assertGreaterEqual(control.maximum_steering_rate_rad_s, 0.8)
+        self.assertLessEqual(control.steering_low_pass_time_constant_s, 0.15)
+        self.assertLess(
+            control.curvature_slowdown_start_rad,
+            control.curvature_full_slowdown_rad,
+        )
 
     def test_round_markers_select_the_four_independent_segment_speeds(self):
         app = CameraLineApplication(

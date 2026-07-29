@@ -175,6 +175,7 @@ class LineVisionConfig:
     transverse_stop_min_height_cm: float = 1.2
     transverse_stop_max_height_cm: float = 10.0
     round_marker_min_height_cm: float = 12.0
+    round_marker_fit_exclusion_margin_cm: float = 15.0
 
     # Candidate association weights. Larger continuity weight makes temporal
     # tracking stronger and rejects unrelated dark objects/shadows.
@@ -225,6 +226,7 @@ class LineVisionConfig:
             <= self.transverse_stop_min_height_cm
             or self.round_marker_min_height_cm
             <= self.transverse_stop_max_height_cm
+            or self.round_marker_fit_exclusion_margin_cm < 0.0
         ):
             raise ValueError("transverse stop dimensions are invalid")
 
@@ -239,15 +241,31 @@ class LineControlConfig:
 
     minimum_lookahead_cm: float = 25.0
     maximum_lookahead_cm: float = 48.0
-    lookahead_speed_gain_s: float = 0.09
-    lateral_gain: float = 0.35
-    heading_gain: float = 0.30
-    curvature_feedforward_gain: float = 1.0
+    # Adaptive pursuit horizon. Speed is converted to cm/s before applying
+    # these time-like gains. The latency term explicitly projects the car
+    # forward over one camera/control delay.
+    lookahead_speed_gain_s: float = 0.35
+    latency_compensation_s: float = 0.12
+    pure_pursuit_gain: float = 1.0
+    lateral_gain: float = 0.10
+    heading_gain: float = 0.05
+    curvature_feedforward_gain: float = 0.0
     maximum_abs_steering_rad: float = 0.28
     maximum_steering_rate_rad_s: float = 1.05
     steering_low_pass_time_constant_s: float = 0.10
     steering_deadband_rad: float = 0.006
-    curvature_speed_gain: float = 1.8
+    target_filter_time_constant_s: float = 0.12
+    target_filter_max_rate_cm_s: float = 120.0
+    heading_filter_time_constant_s: float = 0.15
+    heading_filter_max_rate_rad_s: float = 2.0
+
+    # Slow before the steering actuator catches up by looking at the raw
+    # pursuit demand and the heading change visible farther along the line.
+    curvature_slowdown_start_rad: float = math.radians(7.0)
+    curvature_full_slowdown_rad: float = math.radians(32.0)
+    curvature_speed_gain: float = 1.2
+    maximum_acceleration_mm_s2: float = 500.0
+    maximum_deceleration_mm_s2: float = 900.0
 
     tracking_confidence: float = 0.58
     degraded_confidence: float = 0.36
@@ -277,6 +295,28 @@ class LineControlConfig:
             raise ValueError("speeds cannot be negative")
         if not 0.0 < self.minimum_lookahead_cm <= self.maximum_lookahead_cm:
             raise ValueError("lookahead limits are invalid")
+        if (
+            self.lookahead_speed_gain_s < 0.0
+            or self.latency_compensation_s < 0.0
+            or self.pure_pursuit_gain < 0.0
+            or self.target_filter_time_constant_s < 0.0
+            or self.target_filter_max_rate_cm_s < 0.0
+            or self.heading_filter_time_constant_s < 0.0
+            or self.heading_filter_max_rate_rad_s < 0.0
+        ):
+            raise ValueError("lookahead and observation filters cannot be negative")
+        if not (
+            0.0
+            <= self.curvature_slowdown_start_rad
+            < self.curvature_full_slowdown_rad
+        ):
+            raise ValueError("curvature slowdown thresholds are invalid")
+        if (
+            self.curvature_speed_gain < 0.0
+            or self.maximum_acceleration_mm_s2 <= 0.0
+            or self.maximum_deceleration_mm_s2 <= 0.0
+        ):
+            raise ValueError("speed shaping parameters are invalid")
         if not 0.0 < self.degraded_confidence < self.tracking_confidence <= 1.0:
             raise ValueError("confidence thresholds are invalid")
         if self.recovery_good_frames <= 0 or self.short_loss_frames < 0:
@@ -310,6 +350,7 @@ class LineObservation:
     median_line_width_cm: float
     polynomial_y_left_by_x: tuple[float, float, float] | None
     dark_threshold: float
+    forward_heading_change_rad: float = 0.0
     transverse_line_detected: bool = False
     round_marker_detected: bool = False
 
@@ -393,14 +434,23 @@ class BlackLineDetector:
             borderMode=cv2.BORDER_REPLICATE,
         )
         mask, enhanced_lightness, dark_threshold = self._segment_black_line(bird)
-        points, widths = self._extract_band_centres(mask, enhanced_lightness)
+        transverse, round_marker = self._classify_track_markers(mask)
+        points, widths = self._extract_band_centres(
+            mask,
+            enhanced_lightness,
+            ignore_wide_bands=round_marker,
+        )
         observation = self._fit_observation(
             points,
             widths,
             timestamp_s=timestamp,
             dark_threshold=dark_threshold,
+            minimum_fit_points=(
+                min(3, self.config.minimum_fit_points)
+                if round_marker
+                else self.config.minimum_fit_points
+            ),
         )
-        transverse, round_marker = self._classify_track_markers(mask)
         observation = replace(
             observation,
             transverse_line_detected=transverse,
@@ -511,6 +561,8 @@ class BlackLineDetector:
         self,
         mask: np.ndarray,
         enhanced_lightness: np.ndarray,
+        *,
+        ignore_wide_bands: bool = False,
     ) -> tuple[list[tuple[float, float]], list[float]]:
         perspective = self.config.perspective
         h, w = mask.shape
@@ -519,6 +571,40 @@ class BlackLineDetector:
         min_width_px = max(2, round(self.config.minimum_line_width_cm / cm_per_px_x))
         max_width_px = max(min_width_px + 1, round(self.config.maximum_line_width_cm / cm_per_px_x))
         expected_width_px = self.config.expected_line_width_cm / cm_per_px_x
+        marker_width_px = max(
+            1,
+            math.ceil(
+                self.config.transverse_stop_min_width_cm / cm_per_px_x
+            ),
+        )
+        ignored_marker_rows = np.zeros(h, dtype=bool)
+        if ignore_wide_bands:
+            wide_rows = np.zeros(h, dtype=bool)
+            for row_index, row in enumerate(mask):
+                wide_rows[row_index] = any(
+                    end - start >= marker_width_px
+                    for start, end in self._true_runs(row > 0)
+                )
+            minimum_round_height_px = max(
+                1,
+                math.ceil(
+                    self.config.round_marker_min_height_cm / cm_per_px_y
+                ),
+            )
+            exclusion_margin_px = max(
+                0,
+                math.ceil(
+                    self.config.round_marker_fit_exclusion_margin_cm
+                    / cm_per_px_y
+                ),
+            )
+            for start, end in self._true_runs(wide_rows):
+                if end - start < minimum_round_height_px:
+                    continue
+                ignored_marker_rows[
+                    max(0, start - exclusion_margin_px) :
+                    min(h, end + exclusion_margin_px)
+                ] = True
         max_internal_gap_px = round(
             self.config.maximum_line_internal_gap_cm / cm_per_px_x
         )
@@ -540,14 +626,21 @@ class BlackLineDetector:
             y1 = min(h, y + half + 1)
             if y0 >= y1:
                 continue
+            if ignore_wide_bands and np.any(
+                ignored_marker_rows[y0:y1]
+            ):
+                continue
             fill = np.mean(mask[y0:y1] > 0, axis=0)
-            expected_u = self._expected_u(forward_cm, w)
+            # Follow the current frame from the near field toward the horizon.
+            # The previous frame is only the seed for the first row. Using the
+            # old polynomial independently on every row makes a newly visible
+            # bend look like an unrelated dark object and delays steering until
+            # the curve is already under the car.
+            expected_u = last_selected_u
             if expected_u is None:
-                expected_u = (
-                    last_selected_u
-                    if last_selected_u is not None
-                    else (w - 1) / 2.0
-                )
+                expected_u = self._expected_u(forward_cm, w)
+            if expected_u is None:
+                expected_u = (w - 1) / 2.0
             if self.config.use_expected_width_window:
                 centre = self._expected_width_window_center(
                     fill,
@@ -752,9 +845,15 @@ class BlackLineDetector:
         *,
         timestamp_s: float,
         dark_threshold: float,
+        minimum_fit_points: int | None = None,
     ) -> LineObservation:
         total = self.config.scan_count
-        if len(points) < self.config.minimum_fit_points:
+        required_fit_points = (
+            self.config.minimum_fit_points
+            if minimum_fit_points is None
+            else max(2, int(minimum_fit_points))
+        )
+        if len(points) < required_fit_points:
             return self._empty_observation(
                 timestamp_s,
                 visible_band_count=len(points),
@@ -767,8 +866,9 @@ class BlackLineDetector:
         y = array[:, 1]
         keep = np.ones(len(array), dtype=bool)
         polynomial: np.ndarray | None = None
+        fit_degree = 2 if len(points) >= self.config.minimum_fit_points else 1
         for _ in range(3):
-            if np.count_nonzero(keep) < self.config.minimum_fit_points:
+            if np.count_nonzero(keep) < required_fit_points:
                 break
             # Near points have more control relevance, but far points still
             # contribute to curvature prediction.
@@ -776,7 +876,12 @@ class BlackLineDetector:
                 (x[keep] - self.config.scan_near_cm)
                 / max(1e-6, self.config.scan_far_cm - self.config.scan_near_cm)
             )
-            polynomial = np.polyfit(x[keep], y[keep], deg=2, w=weights)
+            fitted = np.polyfit(x[keep], y[keep], deg=fit_degree, w=weights)
+            polynomial = (
+                fitted
+                if fit_degree == 2
+                else np.asarray((0.0, fitted[0], fitted[1]))
+            )
             residual = y - np.polyval(polynomial, x)
             kept_residual = residual[keep]
             median = float(np.median(kept_residual))
@@ -791,7 +896,7 @@ class BlackLineDetector:
                 break
             keep = new_keep
 
-        if polynomial is None or np.count_nonzero(keep) < self.config.minimum_fit_points:
+        if polynomial is None or np.count_nonzero(keep) < required_fit_points:
             return self._empty_observation(
                 timestamp_s,
                 visible_band_count=int(np.count_nonzero(keep)),
@@ -844,8 +949,19 @@ class BlackLineDetector:
         heading = math.atan(derivative)
         second = float(2.0 * polynomial[0])
         curvature = second / max(1e-9, (1.0 + derivative * derivative) ** 1.5)
+        heading_probe_x = np.linspace(
+            float(np.min(x_kept)),
+            float(np.max(x_kept)),
+            min(7, max(2, visible_count)),
+        )
+        heading_probes = np.arctan(
+            2.0 * polynomial[0] * heading_probe_x + polynomial[1]
+        )
+        forward_heading_change = float(
+            np.max(heading_probes) - np.min(heading_probes)
+        )
         detected = (
-            visible_count >= self.config.minimum_fit_points
+            visible_count >= required_fit_points
             and rmse <= self.config.maximum_fit_rmse_cm
         )
         if not detected:
@@ -870,6 +986,7 @@ class BlackLineDetector:
                 float(polynomial[2]),
             ),
             dark_threshold=dark_threshold,
+            forward_heading_change_rad=forward_heading_change,
         )
 
     def _temporal_fit_score(self, polynomial: np.ndarray) -> float:
@@ -993,6 +1110,9 @@ class CameraLineFollower:
         self._thread: threading.Thread | None = None
         self._capture = None
         self._last_steering = 0.0
+        self._last_speed_mm_s = 0.0
+        self._filtered_target_y_left_cm: float | None = None
+        self._filtered_heading_error_rad: float | None = None
         self._last_control_time: float | None = None
         self._lost_frames = 0
         self._good_frames = 0
@@ -1044,6 +1164,7 @@ class CameraLineFollower:
             self._active_cruise_speed_mm_s = (
                 self.control_config.cruise_speed_mm_s
             )
+            self._reset_control_history()
             self._state = replace(
                 self._state,
                 status=LineFollowerStatus.STARTING,
@@ -1137,17 +1258,25 @@ class CameraLineFollower:
             self._lost_frames += 1
 
         if good or degraded:
-            raw_steering = self._steering_from_observation(observation)
+            raw_steering = self._steering_from_observation(observation, dt)
             steering = self._filter_steering(raw_steering, dt)
+            tracking_speed = self._tracking_speed(
+                observation,
+                raw_steering,
+            )
             if good and self._good_frames >= self.control_config.recovery_good_frames:
-                speed = self._tracking_speed(observation, steering)
+                speed = self._filter_speed(tracking_speed, dt)
                 return _ControlCommand(True, speed, steering, LineFollowerStatus.TRACKING)
             if degraded or self._good_frames < self.control_config.recovery_good_frames:
-                return _ControlCommand(
-                    True,
+                degraded_speed = min(
+                    tracking_speed,
                     self._scaled_speed(
                         self.control_config.degraded_speed_mm_s
                     ),
+                )
+                return _ControlCommand(
+                    True,
+                    self._filter_speed(degraded_speed, dt),
                     steering,
                     LineFollowerStatus.DEGRADED,
                 )
@@ -1156,29 +1285,70 @@ class CameraLineFollower:
             steering = self._filter_steering(self._last_steering * 0.82, dt)
             return _ControlCommand(
                 True,
-                self._scaled_speed(
-                    self.control_config.short_loss_speed_mm_s
+                self._filter_speed(
+                    self._scaled_speed(
+                        self.control_config.short_loss_speed_mm_s
+                    ),
+                    dt,
                 ),
                 steering,
                 LineFollowerStatus.DEGRADED,
             )
-        self._last_steering = 0.0
+        self._reset_control_history()
         return _ControlCommand(False, 0.0, 0.0, LineFollowerStatus.LOST)
 
-    def _steering_from_observation(self, observation: LineObservation) -> float:
-        speed = max(
-            self._scaled_speed(
-                self.control_config.minimum_tracking_speed_mm_s
-            ),
-            self._active_cruise_speed_mm_s,
-        )
+    def _steering_from_observation(
+        self,
+        observation: LineObservation,
+        dt: float,
+    ) -> float:
+        speed_cm_s = self._last_speed_mm_s / 10.0
         lookahead = float(
             np.clip(
                 self.control_config.minimum_lookahead_cm
-                + self.control_config.lookahead_speed_gain_s * speed,
+                + (
+                    self.control_config.lookahead_speed_gain_s
+                    + self.control_config.latency_compensation_s
+                )
+                * speed_cm_s,
                 self.control_config.minimum_lookahead_cm,
                 self.control_config.maximum_lookahead_cm,
             )
+        )
+
+        polynomial = observation.polynomial_y_left_by_x
+        if polynomial is None:
+            target_y_left = observation.lookahead_y_left_cm
+            target_heading = observation.heading_error_rad
+        else:
+            target_y_left = float(np.polyval(polynomial, lookahead))
+            target_heading = math.atan(
+                2.0 * polynomial[0] * lookahead + polynomial[1]
+            )
+        target_y_left = self._filter_observation(
+            target_y_left,
+            previous=self._filtered_target_y_left_cm,
+            tau_s=self.control_config.target_filter_time_constant_s,
+            max_rate_per_s=self.control_config.target_filter_max_rate_cm_s,
+            dt=dt,
+        )
+        target_heading = self._filter_observation(
+            target_heading,
+            previous=self._filtered_heading_error_rad,
+            tau_s=self.control_config.heading_filter_time_constant_s,
+            max_rate_per_s=self.control_config.heading_filter_max_rate_rad_s,
+            dt=dt,
+        )
+        self._filtered_target_y_left_cm = target_y_left
+        self._filtered_heading_error_rad = target_heading
+
+        target_distance_sq = max(
+            1.0,
+            lookahead * lookahead + target_y_left * target_y_left,
+        )
+        pursuit_curvature = 2.0 * target_y_left / target_distance_sq
+        pursuit_steering = self.control_config.pure_pursuit_gain * math.atan(
+            self.control_config.wheelbase_cm * pursuit_curvature
         )
         curvature_feedforward = (
             self.control_config.curvature_feedforward_gain
@@ -1193,9 +1363,14 @@ class CameraLineFollower:
         )
         heading_feedback = (
             self.control_config.heading_gain
-            * observation.heading_error_rad
+            * target_heading
         )
-        raw = curvature_feedforward + lateral_feedback + heading_feedback
+        raw = (
+            pursuit_steering
+            + curvature_feedforward
+            + lateral_feedback
+            + heading_feedback
+        )
         raw = float(
             np.clip(
                 raw,
@@ -1210,22 +1385,38 @@ class CameraLineFollower:
     def _tracking_speed(
         self,
         observation: LineObservation,
-        steering_rad: float,
+        raw_steering_rad: float,
     ) -> float:
         steering_scale = 1.0 / (
             1.0
             + self.control_config.curvature_speed_gain
-            * abs(steering_rad)
+            * abs(raw_steering_rad)
             / max(1e-6, self.control_config.maximum_abs_steering_rad)
+        )
+        heading_change = abs(observation.forward_heading_change_rad)
+        curve_start = self.control_config.curvature_slowdown_start_rad
+        curve_full = self.control_config.curvature_full_slowdown_rad
+        curve_ratio = float(
+            np.clip(
+                (heading_change - curve_start)
+                / max(1e-6, curve_full - curve_start),
+                0.0,
+                1.0,
+            )
         )
         confidence_scale = 0.70 + 0.30 * observation.confidence
         minimum_speed = self._scaled_speed(
             self.control_config.minimum_tracking_speed_mm_s
         )
+        minimum_scale = min(
+            1.0,
+            minimum_speed / max(1e-6, self._active_cruise_speed_mm_s),
+        )
+        curve_scale = 1.0 - (1.0 - minimum_scale) * curve_ratio
         return float(
             np.clip(
                 self._active_cruise_speed_mm_s
-                * steering_scale
+                * min(steering_scale, curve_scale)
                 * confidence_scale,
                 minimum_speed,
                 self._active_cruise_speed_mm_s,
@@ -1261,6 +1452,64 @@ class CameraLineFollower:
         )
         self._last_steering = filtered
         return filtered
+
+    def _filter_speed(self, requested_mm_s: float, dt: float) -> float:
+        requested = float(
+            np.clip(requested_mm_s, 0.0, self._active_cruise_speed_mm_s)
+        )
+        if requested >= self._last_speed_mm_s:
+            maximum_delta = (
+                self.control_config.maximum_acceleration_mm_s2 * dt
+            )
+        else:
+            maximum_delta = (
+                self.control_config.maximum_deceleration_mm_s2 * dt
+            )
+        filtered = float(
+            np.clip(
+                requested,
+                self._last_speed_mm_s - maximum_delta,
+                self._last_speed_mm_s + maximum_delta,
+            )
+        )
+        self._last_speed_mm_s = max(0.0, filtered)
+        return self._last_speed_mm_s
+
+    @staticmethod
+    def _filter_observation(
+        requested: float,
+        *,
+        previous: float | None,
+        tau_s: float,
+        max_rate_per_s: float,
+        dt: float,
+    ) -> float:
+        requested = float(requested)
+        if previous is None:
+            return requested
+        alpha = (
+            1.0
+            if tau_s <= 0.0
+            else 1.0 - math.exp(-max(0.0, dt) / tau_s)
+        )
+        low_passed = previous + alpha * (requested - previous)
+        maximum_delta = max(0.0, max_rate_per_s) * max(0.0, dt)
+        if maximum_delta <= 0.0:
+            return low_passed
+        return float(
+            np.clip(
+                low_passed,
+                previous - maximum_delta,
+                previous + maximum_delta,
+            )
+        )
+
+    def _reset_control_history(self) -> None:
+        self._last_steering = 0.0
+        self._last_speed_mm_s = 0.0
+        self._filtered_target_y_left_cm = None
+        self._filtered_heading_error_rad = None
+        self._last_control_time = None
 
     def _run(self) -> None:
         capture_failures = 0
