@@ -36,10 +36,10 @@ from main_fixed_track_test import (
 
 # Per-segment fixed-track speeds.  AB/CD are the 150 cm straights; BC/DA are
 # the two 75 cm-radius semicircles.
-TRACK_AB_SPEED_CM_S = 40.0
-TRACK_BC_SPEED_CM_S = 40.0
-TRACK_CD_SPEED_CM_S = 40.0
-TRACK_DA_SPEED_CM_S = 40.0
+TRACK_AB_SPEED_CM_S = 20.0
+TRACK_BC_SPEED_CM_S = 20.0
+TRACK_CD_SPEED_CM_S = 20.0
+TRACK_DA_SPEED_CM_S = 20.0
 
 # Backward-compatible uniform-speed name and CLI override.
 TRACK_SPEED_CM_S = TRACK_AB_SPEED_CM_S

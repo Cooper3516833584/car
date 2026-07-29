@@ -39,11 +39,11 @@ from components.navigation import (
 
 
 # Fixed-track test speed. Change this one value for the next real-car run.
-TRACK_SPEED_CM_S = 8.0
+TRACK_SPEED_CM_S = 30.0
 
 # At startup the car faces AB with its front reference at A. The radar centre
 # is this far behind A; after driving forward this distance, it passes A.
-RADAR_CENTER_BEHIND_A_ALONG_AB_CM = 0.0
+RADAR_CENTER_BEHIND_A_ALONG_AB_CM = 20.0
 
 LOG = logging.getLogger("car-main")
 LOG_FILENAME = "car-main.log"
