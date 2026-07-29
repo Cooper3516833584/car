@@ -14,11 +14,11 @@ if str(CODE_ROOT) not in sys.path:
     sys.path.insert(0, str(CODE_ROOT))
 
 from components.camera_line_follower import BlackLineDetector
-from main_camera_line_following import CameraLineApplication
+from main_radar_camera_line_following import RadarCameraLineApplication
 
 
 def main() -> int:
-    config = CameraLineApplication._front_camera_vision_config()
+    config = RadarCameraLineApplication._front_camera_vision_config()
     detector = BlackLineDetector(config)
     capture = cv2.VideoCapture(0, cv2.CAP_V4L2)
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, config.frame_width)

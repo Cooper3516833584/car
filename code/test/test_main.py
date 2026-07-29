@@ -15,10 +15,10 @@ from main_fixed_track_test import (
 class CompetitionMainTests(unittest.TestCase):
     def test_defaults_are_for_one_low_speed_lap(self):
         config = MainConfig()
-        self.assertEqual(config.radar_center_behind_a_cm, 0.0)
-        self.assertEqual(config.speed_cm_s, 8.0)
-        self.assertEqual(RADAR_CENTER_BEHIND_A_ALONG_AB_CM, 0.0)
-        self.assertEqual(TRACK_SPEED_CM_S, 8.0)
+        self.assertEqual(config.radar_center_behind_a_cm, 20.0)
+        self.assertEqual(config.speed_cm_s, 30.0)
+        self.assertEqual(RADAR_CENTER_BEHIND_A_ALONG_AB_CM, 20.0)
+        self.assertEqual(TRACK_SPEED_CM_S, 30.0)
 
     def test_cli_only_contains_radar_and_track_parameters(self):
         parser = build_argument_parser()

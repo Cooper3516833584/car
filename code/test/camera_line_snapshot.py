@@ -17,7 +17,7 @@ if str(CODE_ROOT) not in sys.path:
     sys.path.insert(0, str(CODE_ROOT))
 
 from components.camera_line_follower import BlackLineDetector
-from main_camera_line_following import CameraLineApplication
+from main_radar_camera_line_following import RadarCameraLineApplication
 
 
 def main() -> int:
@@ -29,7 +29,7 @@ def main() -> int:
     if args.frames <= 0:
         parser.error("--frames must be positive")
 
-    config = CameraLineApplication._front_camera_vision_config()
+    config = RadarCameraLineApplication._front_camera_vision_config()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     capture = cv2.VideoCapture(args.camera, cv2.CAP_V4L2)
