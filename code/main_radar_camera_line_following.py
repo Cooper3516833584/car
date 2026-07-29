@@ -35,6 +35,7 @@ from components import (
     RadarScan,
     RectangleFieldCalibrator,
     TrackFollowerState,
+    TrackSegment,
     WallFusionConfig,
     WallLineConfig,
     rebase_calibration_to_start_pose,
@@ -500,6 +501,9 @@ class RadarCameraLineApplication:
             self.request_stop()
 
     def _on_follower_state(self, state: TrackFollowerState) -> None:
+        self.camera_corrector.set_curve_mode(
+            state.segment in (TrackSegment.BC, TrackSegment.DA)
+        )
         with self._lock:
             self._follower_state = state
         if state.completed:
@@ -559,12 +563,16 @@ class RadarCameraLineApplication:
             )
         self._last_camera_error = state.error
         LOG.debug(
-            "camera correction running=%s active=%s valid_frames=%d "
+            "camera correction running=%s active=%s curve=%s recovery=%s "
+            "valid_frames=%d large_frames=%d "
             "confidence=%.2f lateral_cm=%.2f correction_rad=%.4f "
             "round=%s transverse=%s",
             state.running,
             state.active,
+            state.curve_mode,
+            state.recovery_mode,
             state.valid_frames,
+            state.large_error_frames,
             state.confidence,
             state.lateral_error_cm,
             state.correction_rad,

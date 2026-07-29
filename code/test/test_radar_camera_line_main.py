@@ -5,6 +5,7 @@ import time
 
 from components.camera_line_correction import CameraLineCorrectionConfig
 from components.camera_line_follower import LineObservation
+from components.competition_track import TrackFollowerState, TrackSegment
 from main_radar_camera_line_following import (
     CAMERA_CORRECTION_ENABLED,
     CAMERA_LATERAL_DEADBAND_CM,
@@ -99,6 +100,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
     def test_large_visual_error_only_adds_small_correction(self):
         correction = CameraLineCorrectionConfig(
             required_consecutive_frames=1,
+            large_error_required_frames=1,
             lateral_deadband_cm=10.0,
             steering_gain_rad_per_cm=0.006,
             maximum_abs_correction_rad=0.055,
@@ -158,6 +160,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
     def test_marker_never_creates_a_new_visual_correction(self):
         correction = CameraLineCorrectionConfig(
             required_consecutive_frames=1,
+            large_error_required_frames=1,
             correction_filter_time_constant_s=0.0,
             maximum_correction_rate_rad_s=100.0,
         )
@@ -184,6 +187,39 @@ class RadarCameraLineMainTests(unittest.TestCase):
             app._adjust_radar_steering(0.123, 30.0),
             0.123,
         )
+
+    def test_follower_segment_selects_curve_recovery_mode(self):
+        app = RadarCameraLineApplication(MainConfig())
+
+        app._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.BC,
+                progress_cm=150.0,
+                target_speed_cm_s=30.0,
+                commanded_speed_cm_s=30.0,
+                steering_angle_rad=-0.1,
+                cross_track_error_cm=2.0,
+                heading_error_deg=-3.0,
+            )
+        )
+        self.assertTrue(app.camera_corrector.state.curve_mode)
+
+        app._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.CD,
+                progress_cm=390.0,
+                target_speed_cm_s=30.0,
+                commanded_speed_cm_s=30.0,
+                steering_angle_rad=0.0,
+                cross_track_error_cm=1.0,
+                heading_error_deg=0.0,
+            )
+        )
+        self.assertFalse(app.camera_corrector.state.curve_mode)
 
     def test_invalid_values_are_rejected(self):
         with self.assertRaises(ValueError):

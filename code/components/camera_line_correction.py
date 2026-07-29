@@ -37,11 +37,18 @@ class CameraLineCorrectionConfig:
     minimum_visible_bands: int = 7
     maximum_fit_rmse_cm: float = 2.5
     required_consecutive_frames: int = 4
+    large_error_fast_activate_cm: float = 18.0
+    large_error_required_frames: int = 2
+    large_error_max_step_cm: float = 6.0
+    curve_round_marker_minimum_confidence: float = 0.78
+    curve_round_marker_minimum_visible_bands: int = 9
+    curve_round_marker_maximum_fit_rmse_cm: float = 2.0
+    curve_invalid_grace_frames: int = 2
     lateral_deadband_cm: float = 10.0
     steering_gain_rad_per_cm: float = 0.006
     maximum_abs_correction_rad: float = 0.055
-    correction_filter_time_constant_s: float = 0.40
-    maximum_correction_rate_rad_s: float = 0.12
+    correction_filter_time_constant_s: float = 0.20
+    maximum_correction_rate_rad_s: float = 0.20
     stale_timeout_s: float = 0.25
     stale_fade_out_s: float = 0.35
     full_correction_speed_cm_s: float = 25.0
@@ -56,8 +63,26 @@ class CameraLineCorrectionConfig:
             raise ValueError("maximum_fit_rmse_cm must be positive")
         if self.required_consecutive_frames <= 0:
             raise ValueError("required_consecutive_frames must be positive")
+        if self.large_error_required_frames <= 0:
+            raise ValueError("large_error_required_frames must be positive")
+        if self.curve_round_marker_minimum_visible_bands <= 0:
+            raise ValueError(
+                "curve_round_marker_minimum_visible_bands must be positive"
+            )
+        if self.curve_invalid_grace_frames < 0:
+            raise ValueError("curve_invalid_grace_frames cannot be negative")
+        if not 0.0 < self.curve_round_marker_minimum_confidence <= 1.0:
+            raise ValueError(
+                "curve_round_marker_minimum_confidence must be in (0, 1]"
+            )
         if (
             self.lateral_deadband_cm < 0.0
+            or (
+                self.large_error_fast_activate_cm
+                <= self.lateral_deadband_cm
+            )
+            or self.large_error_max_step_cm <= 0.0
+            or self.curve_round_marker_maximum_fit_rmse_cm <= 0.0
             or self.steering_gain_rad_per_cm < 0.0
             or self.maximum_abs_correction_rad <= 0.0
             or self.correction_filter_time_constant_s < 0.0
@@ -80,6 +105,9 @@ class CameraLineCorrectionState:
     lateral_error_cm: float = 0.0
     correction_rad: float = 0.0
     valid_frames: int = 0
+    large_error_frames: int = 0
+    curve_mode: bool = False
+    recovery_mode: bool = False
     observation: LineObservation | None = None
     error: str | None = None
 
@@ -112,6 +140,11 @@ class CameraLineSteeringCorrector:
         self._thread: threading.Thread | None = None
         self._capture = None
         self._valid_frames = 0
+        self._large_error_frames = 0
+        self._candidate_error_cm: float | None = None
+        self._last_accepted_error_cm = 0.0
+        self._invalid_grace_frames = 0
+        self._curve_mode = False
         self._last_update_s: float | None = None
         self._filtered_correction_rad = 0.0
 
@@ -132,10 +165,17 @@ class CameraLineSteeringCorrector:
                 raise RuntimeError("camera line corrector is already running")
             self._stop_event.clear()
             self._valid_frames = 0
+            self._large_error_frames = 0
+            self._candidate_error_cm = None
+            self._last_accepted_error_cm = 0.0
+            self._invalid_grace_frames = 0
             self._last_update_s = None
             self._filtered_correction_rad = 0.0
             self.detector.reset()
-            self._state = CameraLineCorrectionState(running=True)
+            self._state = CameraLineCorrectionState(
+                running=True,
+                curve_mode=self._curve_mode,
+            )
             self._thread = threading.Thread(
                 target=self._run,
                 name="camera-line-corrector",
@@ -154,6 +194,10 @@ class CameraLineSteeringCorrector:
         with self._lock:
             self._thread = None
             self._valid_frames = 0
+            self._large_error_frames = 0
+            self._candidate_error_cm = None
+            self._last_accepted_error_cm = 0.0
+            self._invalid_grace_frames = 0
             self._last_update_s = None
             self._filtered_correction_rad = 0.0
             self._state = replace(
@@ -162,11 +206,23 @@ class CameraLineSteeringCorrector:
                 active=False,
                 correction_rad=0.0,
                 valid_frames=0,
+                large_error_frames=0,
+                recovery_mode=False,
             )
             state = self._state
         self._notify(state)
 
     close = stop
+
+    def set_curve_mode(self, enabled: bool) -> None:
+        """Tell the corrector whether radar is currently on a semicircle."""
+
+        with self._lock:
+            self._curve_mode = bool(enabled)
+            self._state = replace(
+                self._state,
+                curve_mode=self._curve_mode,
+            )
 
     def update_from_observation(
         self,
@@ -183,19 +239,74 @@ class CameraLineSteeringCorrector:
             else max(1e-3, min(0.25, now - self._last_update_s))
         )
         self._last_update_s = now
-        usable = self._observation_is_usable(observation)
-        self._valid_frames = self._valid_frames + 1 if usable else 0
-        active = (
-            usable
-            and self._valid_frames
-            >= self.correction_config.required_consecutive_frames
+        with self._lock:
+            curve_mode = self._curve_mode
+            previous_active = self._state.active
+        usable, marker_recovery = self._classify_observation(
+            observation,
+            curve_mode=curve_mode,
         )
-        lateral_error = (
-            float(observation.near_lateral_error_cm) if usable else 0.0
-        )
-        target = (
-            self._target_correction(lateral_error) if active else 0.0
-        )
+        active = False
+        recovery_mode = False
+        lateral_error = 0.0
+        target = 0.0
+        if usable:
+            lateral_error = float(observation.near_lateral_error_cm)
+            previous_error = self._candidate_error_cm
+            stable = self._candidate_is_stable(lateral_error)
+            self._valid_frames = self._valid_frames + 1 if stable else 1
+            large_error = (
+                abs(lateral_error)
+                >= self.correction_config.large_error_fast_activate_cm
+            )
+            previous_was_large = (
+                previous_error is not None
+                and abs(previous_error)
+                >= self.correction_config.large_error_fast_activate_cm
+            )
+            self._large_error_frames = (
+                self._large_error_frames + 1
+                if large_error and stable and previous_was_large
+                else (1 if large_error else 0)
+            )
+            self._candidate_error_cm = lateral_error
+            self._last_accepted_error_cm = lateral_error
+            self._invalid_grace_frames = 0
+            required_frames = (
+                self.correction_config.large_error_required_frames
+                if large_error
+                else self.correction_config.required_consecutive_frames
+            )
+            qualifying_frames = (
+                self._large_error_frames
+                if large_error
+                else self._valid_frames
+            )
+            active = qualifying_frames >= required_frames
+            recovery_mode = active and (large_error or marker_recovery)
+            if active:
+                target = self._target_correction(lateral_error)
+        else:
+            self._candidate_error_cm = None
+            self._valid_frames = 0
+            self._large_error_frames = 0
+            can_hold_large_curve_recovery = (
+                curve_mode
+                and previous_active
+                and not observation.transverse_line_detected
+                and abs(self._last_accepted_error_cm)
+                >= self.correction_config.large_error_fast_activate_cm
+                and self._invalid_grace_frames
+                < self.correction_config.curve_invalid_grace_frames
+            )
+            if can_hold_large_curve_recovery:
+                self._invalid_grace_frames += 1
+                active = True
+                recovery_mode = True
+                lateral_error = self._last_accepted_error_cm
+                target = self._target_correction(lateral_error)
+            else:
+                self._invalid_grace_frames = 0
         self._filtered_correction_rad = self._filter_correction(
             target,
             dt,
@@ -209,6 +320,9 @@ class CameraLineSteeringCorrector:
                 lateral_error_cm=lateral_error,
                 correction_rad=self._filtered_correction_rad,
                 valid_frames=self._valid_frames,
+                large_error_frames=self._large_error_frames,
+                curve_mode=curve_mode,
+                recovery_mode=recovery_mode,
                 observation=observation,
                 error=None,
             )
@@ -252,21 +366,56 @@ class CameraLineSteeringCorrector:
             )
         )
 
-    def _observation_is_usable(
+    def _classify_observation(
         self,
         observation: LineObservation,
-    ) -> bool:
+        *,
+        curve_mode: bool,
+    ) -> tuple[bool, bool]:
         config = self.correction_config
-        return (
+        basic_quality = (
             observation.detected
             and math.isfinite(observation.near_lateral_error_cm)
             and observation.confidence >= config.minimum_confidence
             and observation.visible_band_count
             >= config.minimum_visible_bands
             and observation.fit_rmse_cm <= config.maximum_fit_rmse_cm
-            and not observation.round_marker_detected
             and not observation.transverse_line_detected
         )
+        if not basic_quality:
+            return False, False
+        if not observation.round_marker_detected:
+            return True, False
+        marker_recovery = (
+            curve_mode
+            and abs(observation.near_lateral_error_cm)
+            >= config.large_error_fast_activate_cm
+            and observation.confidence
+            >= config.curve_round_marker_minimum_confidence
+            and observation.visible_band_count
+            >= config.curve_round_marker_minimum_visible_bands
+            and observation.fit_rmse_cm
+            <= config.curve_round_marker_maximum_fit_rmse_cm
+        )
+        return marker_recovery, marker_recovery
+
+    def _candidate_is_stable(self, lateral_error_cm: float) -> bool:
+        previous = self._candidate_error_cm
+        if previous is None:
+            return False
+        same_side = (
+            previous * lateral_error_cm > 0.0
+            or (
+                abs(previous) <= self.correction_config.lateral_deadband_cm
+                and abs(lateral_error_cm)
+                <= self.correction_config.lateral_deadband_cm
+            )
+        )
+        small_step = (
+            abs(lateral_error_cm - previous)
+            <= self.correction_config.large_error_max_step_cm
+        )
+        return same_side and small_step
 
     def _target_correction(self, lateral_error_cm: float) -> float:
         magnitude = max(
@@ -352,6 +501,7 @@ class CameraLineSteeringCorrector:
                     self._state,
                     running=False,
                     active=False,
+                    recovery_mode=False,
                 )
                 state = self._state
             self._notify(state)
@@ -364,6 +514,9 @@ class CameraLineSteeringCorrector:
         )
         self._last_update_s = now_s
         self._valid_frames = 0
+        self._large_error_frames = 0
+        self._candidate_error_cm = None
+        self._invalid_grace_frames = 0
         self._filtered_correction_rad = self._filter_correction(0.0, dt)
         with self._lock:
             self._state = replace(
@@ -372,6 +525,8 @@ class CameraLineSteeringCorrector:
                 timestamp_s=now_s,
                 correction_rad=self._filtered_correction_rad,
                 valid_frames=0,
+                large_error_frames=0,
+                recovery_mode=False,
                 error=error,
             )
             state = self._state
