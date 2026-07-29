@@ -44,13 +44,13 @@ class CameraLineCorrectionConfig:
     curve_round_marker_minimum_visible_bands: int = 3
     curve_round_marker_maximum_fit_rmse_cm: float = 1.25
     curve_round_marker_required_frames: int = 5
-    curve_round_marker_maximum_abs_correction_rad: float = 0.030
+    curve_round_marker_maximum_abs_correction_rad: float = 0.100
     curve_invalid_grace_frames: int = 4
     lateral_deadband_cm: float = 10.0
-    steering_gain_rad_per_cm: float = 0.006
-    maximum_abs_correction_rad: float = 0.055
-    correction_filter_time_constant_s: float = 0.20
-    maximum_correction_rate_rad_s: float = 0.20
+    steering_gain_rad_per_cm: float = 0.010
+    maximum_abs_correction_rad: float = 0.140
+    correction_filter_time_constant_s: float = 0.10
+    maximum_correction_rate_rad_s: float = 0.60
     stale_timeout_s: float = 0.25
     stale_fade_out_s: float = 0.35
     full_correction_speed_cm_s: float = 25.0
@@ -90,10 +90,6 @@ class CameraLineCorrectionConfig:
             or self.large_error_max_step_cm <= 0.0
             or self.curve_round_marker_maximum_fit_rmse_cm <= 0.0
             or self.curve_round_marker_maximum_abs_correction_rad <= 0.0
-            or (
-                self.curve_round_marker_maximum_abs_correction_rad
-                > self.maximum_abs_correction_rad
-            )
             or self.steering_gain_rad_per_cm < 0.0
             or self.maximum_abs_correction_rad <= 0.0
             or self.correction_filter_time_constant_s < 0.0

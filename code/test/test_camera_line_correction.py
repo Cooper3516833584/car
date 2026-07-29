@@ -57,22 +57,23 @@ class CameraLineSteeringCorrectorTests(unittest.TestCase):
             correction_config=CameraLineCorrectionConfig(**values)
         )
 
-    def test_tuned_defaults_are_faster_but_keep_the_same_soft_limit(self):
+    def test_tuned_defaults_allow_decisive_but_filtered_correction(self):
         config = CameraLineCorrectionConfig()
 
         self.assertEqual(config.large_error_fast_activate_cm, 18.0)
         self.assertEqual(config.large_error_required_frames, 2)
-        self.assertEqual(config.correction_filter_time_constant_s, 0.20)
-        self.assertEqual(config.maximum_correction_rate_rad_s, 0.20)
+        self.assertEqual(config.steering_gain_rad_per_cm, 0.010)
+        self.assertEqual(config.correction_filter_time_constant_s, 0.10)
+        self.assertEqual(config.maximum_correction_rate_rad_s, 0.60)
         self.assertEqual(config.curve_invalid_grace_frames, 4)
         self.assertEqual(config.curve_round_marker_minimum_confidence, 0.45)
         self.assertEqual(config.curve_round_marker_minimum_visible_bands, 3)
         self.assertEqual(config.curve_round_marker_required_frames, 5)
         self.assertEqual(
             config.curve_round_marker_maximum_abs_correction_rad,
-            0.030,
+            0.100,
         )
-        self.assertEqual(config.maximum_abs_correction_rad, 0.055)
+        self.assertEqual(config.maximum_abs_correction_rad, 0.140)
 
     def test_small_error_inside_deadband_does_not_change_steering(self):
         corrector = self.make_corrector()
@@ -322,7 +323,7 @@ class CameraLineSteeringCorrectorTests(unittest.TestCase):
         self.assertGreater(states[4].correction_rad, 0.0)
         self.assertLessEqual(
             states[4].correction_rad,
-            0.030,
+            0.100,
         )
 
     def test_sparse_round_marker_still_rejected_on_straight(self):
@@ -347,6 +348,8 @@ class CameraLineSteeringCorrectorTests(unittest.TestCase):
         corrector = self.make_corrector(
             curve_round_marker_required_frames=2,
             steering_gain_rad_per_cm=0.02,
+            maximum_abs_correction_rad=0.140,
+            curve_round_marker_maximum_abs_correction_rad=0.100,
         )
         corrector.set_curve_mode(True)
 
@@ -363,7 +366,7 @@ class CameraLineSteeringCorrectorTests(unittest.TestCase):
             )
 
         self.assertTrue(state.active)
-        self.assertEqual(state.correction_rad, 0.030)
+        self.assertEqual(state.correction_rad, 0.100)
 
     def test_transverse_line_cannot_start_curve_recovery(self):
         corrector = self.make_corrector()

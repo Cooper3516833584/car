@@ -59,12 +59,12 @@ TRACK_SPEED_CM_S = 30.0
 # is this far behind A; after driving forward this distance, it passes A.
 RADAR_CENTER_BEHIND_A_ALONG_AB_CM = 20.0
 
-# Camera correction is deliberately weak. It does nothing inside this
-# cross-track deadband, then adds only a small, filtered steering increment.
+# Camera correction stays filtered and gated, but must be strong enough to
+# overcome the repeatable radar bias once the line error is already large.
 CAMERA_CORRECTION_ENABLED = True
 CAMERA_LATERAL_DEADBAND_CM = 10.0
-CAMERA_STEERING_GAIN_RAD_PER_CM = 0.006
-CAMERA_MAX_STEERING_CORRECTION_RAD = 0.055
+CAMERA_STEERING_GAIN_RAD_PER_CM = 0.010
+CAMERA_MAX_STEERING_CORRECTION_RAD = 0.140
 
 
 LOG = logging.getLogger("radar-camera-line-main")

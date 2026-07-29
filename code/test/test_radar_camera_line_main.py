@@ -48,8 +48,8 @@ class RadarCameraLineMainTests(unittest.TestCase):
         self.assertEqual(RADAR_CENTER_BEHIND_A_ALONG_AB_CM, 20.0)
         self.assertTrue(CAMERA_CORRECTION_ENABLED)
         self.assertEqual(CAMERA_LATERAL_DEADBAND_CM, 10.0)
-        self.assertEqual(CAMERA_STEERING_GAIN_RAD_PER_CM, 0.006)
-        self.assertEqual(CAMERA_MAX_STEERING_CORRECTION_RAD, 0.055)
+        self.assertEqual(CAMERA_STEERING_GAIN_RAD_PER_CM, 0.010)
+        self.assertEqual(CAMERA_MAX_STEERING_CORRECTION_RAD, 0.140)
         self.assertEqual(config.speed_cm_s, 30.0)
         self.assertEqual(config.radar_center_behind_a_cm, 20.0)
 
