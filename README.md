@@ -717,3 +717,19 @@ SE(2) 坐标变换。
 发送端可以复用 `pack_navigation_command(NavigationGoal(...))` 生成完整内部
 `AA 22` 帧。当前 `ground_station` 原代码尚无 `0x20` 坐标命令，地面站/无人机发送端
 必须按上述 payload 增加该命令后才能下发坐标；车端接收和 ACK 已完成。
+
+# 固定赛道单圈入口
+
+正式入口 `code/main.py` 当前只验证固定轨迹闭环，不包含比赛任务或 FleetBus。
+小车后轴位于 A 点（本阶段视为雷达中心也在 A 点）并保持静止完成 D500
+矩形标定后，程序自动以 `8 cm/s`
+沿 AB、BC、CD、DA 行驶一圈。控制只在 D500 提供已接受的新位姿时更新，
+转向复用 `PurePursuitController`，车速和舵角由 `AckermannDrive` 下发。
+进度越过 A 并进入重复 AB 采样段后停车并退出。
+
+```bash
+sudo python3 /home/radxa/car/main.py
+```
+
+旧的雷达建图/坐标导航入口原样归档为
+`code/former_code/radar_point_navigation.py`。

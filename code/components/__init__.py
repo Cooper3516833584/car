@@ -277,3 +277,25 @@ __all__ += [
     "pack_navigation_command",
     "unpack_authenticated_frame",
 ]
+
+from .competition_track import (
+    CompetitionTrack,
+    CompetitionTrackFollower,
+    FieldTransform,
+    TRACK_SPEED_CM_S,
+    TrackFollowerState,
+    TrackSegment,
+    TRACK_REFERENCE_OFFSET_CM,
+    build_competition_track,
+)
+
+__all__ += [
+    "CompetitionTrack",
+    "CompetitionTrackFollower",
+    "FieldTransform",
+    "TRACK_SPEED_CM_S",
+    "TrackFollowerState",
+    "TrackSegment",
+    "TRACK_REFERENCE_OFFSET_CM",
+    "build_competition_track",
+]
