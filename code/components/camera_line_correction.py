@@ -43,7 +43,7 @@ class CameraLineCorrectionConfig:
     curve_round_marker_minimum_confidence: float = 0.78
     curve_round_marker_minimum_visible_bands: int = 9
     curve_round_marker_maximum_fit_rmse_cm: float = 2.0
-    curve_invalid_grace_frames: int = 2
+    curve_invalid_grace_frames: int = 4
     lateral_deadband_cm: float = 10.0
     steering_gain_rad_per_cm: float = 0.006
     maximum_abs_correction_rad: float = 0.055
@@ -287,9 +287,6 @@ class CameraLineSteeringCorrector:
             if active:
                 target = self._target_correction(lateral_error)
         else:
-            self._candidate_error_cm = None
-            self._valid_frames = 0
-            self._large_error_frames = 0
             can_hold_large_curve_recovery = (
                 curve_mode
                 and previous_active
@@ -306,6 +303,9 @@ class CameraLineSteeringCorrector:
                 lateral_error = self._last_accepted_error_cm
                 target = self._target_correction(lateral_error)
             else:
+                self._candidate_error_cm = None
+                self._valid_frames = 0
+                self._large_error_frames = 0
                 self._invalid_grace_frames = 0
         self._filtered_correction_rad = self._filter_correction(
             target,

@@ -566,6 +566,7 @@ class RadarCameraLineApplication:
             "camera correction running=%s active=%s curve=%s recovery=%s "
             "valid_frames=%d large_frames=%d "
             "confidence=%.2f lateral_cm=%.2f correction_rad=%.4f "
+            "detected=%s bands=%d rmse_cm=%.2f "
             "round=%s transverse=%s",
             state.running,
             state.active,
@@ -576,6 +577,21 @@ class RadarCameraLineApplication:
             state.confidence,
             state.lateral_error_cm,
             state.correction_rad,
+            (
+                False
+                if state.observation is None
+                else state.observation.detected
+            ),
+            (
+                0
+                if state.observation is None
+                else state.observation.visible_band_count
+            ),
+            (
+                0.0
+                if state.observation is None
+                else state.observation.fit_rmse_cm
+            ),
             (
                 False
                 if state.observation is None

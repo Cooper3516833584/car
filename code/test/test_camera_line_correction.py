@@ -64,6 +64,7 @@ class CameraLineSteeringCorrectorTests(unittest.TestCase):
         self.assertEqual(config.large_error_required_frames, 2)
         self.assertEqual(config.correction_filter_time_constant_s, 0.20)
         self.assertEqual(config.maximum_correction_rate_rad_s, 0.20)
+        self.assertEqual(config.curve_invalid_grace_frames, 4)
         self.assertEqual(config.maximum_abs_correction_rad, 0.055)
 
     def test_small_error_inside_deadband_does_not_change_steering(self):
@@ -303,33 +304,65 @@ class CameraLineSteeringCorrectorTests(unittest.TestCase):
         self.assertTrue(active.active)
         self.assertFalse(rejected.active)
         self.assertFalse(rejected.recovery_mode)
+        self.assertEqual(rejected.valid_frames, 0)
+        self.assertEqual(rejected.large_error_frames, 0)
         self.assertLess(rejected.correction_rad, active.correction_rad)
 
-    def test_curve_large_recovery_bridges_only_two_bad_frames(self):
-        corrector = self.make_corrector(curve_invalid_grace_frames=2)
+    def test_curve_large_recovery_bridges_four_bad_frames(self):
+        corrector = self.make_corrector()
         corrector.set_curve_mode(True)
         for index in range(2):
             active = corrector.update_from_observation(
                 observation(lateral_cm=24.0),
                 now_s=1.0 + 0.06 * index,
             )
-        held_one = corrector.update_from_observation(
-            observation(lateral_cm=24.0, confidence=0.3),
-            now_s=1.12,
-        )
-        held_two = corrector.update_from_observation(
-            observation(lateral_cm=24.0, confidence=0.3),
-            now_s=1.18,
-        )
+        held = []
+        for index in range(4):
+            held.append(
+                corrector.update_from_observation(
+                    observation(lateral_cm=24.0, confidence=0.3),
+                    now_s=1.12 + 0.06 * index,
+                )
+            )
         released = corrector.update_from_observation(
             observation(lateral_cm=24.0, confidence=0.3),
-            now_s=1.24,
+            now_s=1.36,
         )
 
         self.assertTrue(active.active)
-        self.assertTrue(held_one.active)
-        self.assertTrue(held_two.active)
+        self.assertTrue(all(state.active for state in held))
+        self.assertTrue(
+            all(state.large_error_frames == 2 for state in held)
+        )
         self.assertFalse(released.active)
+
+    def test_valid_large_error_after_grace_continues_without_rearming(self):
+        corrector = self.make_corrector()
+        corrector.set_curve_mode(True)
+        for index in range(2):
+            active = corrector.update_from_observation(
+                observation(lateral_cm=24.0),
+                now_s=1.0 + 0.06 * index,
+            )
+        held = corrector.update_from_observation(
+            observation(lateral_cm=24.0, confidence=0.3),
+            now_s=1.12,
+        )
+        reacquired = corrector.update_from_observation(
+            observation(lateral_cm=24.5),
+            now_s=1.18,
+        )
+
+        self.assertTrue(active.active)
+        self.assertTrue(held.active)
+        self.assertEqual(held.large_error_frames, 2)
+        self.assertTrue(reacquired.active)
+        self.assertTrue(reacquired.recovery_mode)
+        self.assertEqual(reacquired.large_error_frames, 3)
+        self.assertGreaterEqual(
+            reacquired.correction_rad,
+            held.correction_rad,
+        )
 
 
 if __name__ == "__main__":
