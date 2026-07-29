@@ -31,6 +31,11 @@ from components import (
     WallLineConfig,
     rebase_calibration_to_start_pose,
 )
+from components.navigation import (
+    NavigationPose,
+    NavigationState,
+    radar_yaw_to_navigation_heading,
+)
 
 
 # Fixed-track test speed. Change this one value for the next real-car run.
@@ -135,6 +140,19 @@ class MainConfig:
             raise ValueError("speed_cm_s must be positive")
 
 
+@dataclass(frozen=True, slots=True)
+class CarRuntimeSnapshot:
+    """Atomic read-only FleetBus view of the local navigation runtime."""
+
+    ready: bool
+    map_ready: bool
+    pose: NavigationPose | None
+    navigation_state: NavigationState
+    localization_degraded: bool
+    error_code: int
+    localization_timeout_s: float = 0.5
+
+
 class CompetitionCarApplication:
     """Calibrate once, run one radar-driven lap, then stop."""
 
@@ -146,6 +164,10 @@ class CompetitionCarApplication:
         self._scan_event = threading.Event()
         self._startup_scans: list[RadarScan] = []
         self._ready = False
+        self._map_ready = False
+        self._latest_navigation_pose = None
+        self._localization_degraded = False
+        self._fleet_error_code = 0
         self._closed = False
 
         max_wheel_speed_mm_s = max(300.0, config.speed_cm_s * 12.0)
@@ -161,6 +183,7 @@ class CompetitionCarApplication:
             speed_cm_s=config.speed_cm_s,
             on_state_changed=self._on_follower_state,
         )
+        self._follower_state = self.follower.state
         self.calibrator = RectangleFieldCalibrator(
             mount=config.radar_mount,
         )
@@ -182,6 +205,25 @@ class CompetitionCarApplication:
     def ready(self) -> bool:
         with self._lock:
             return self._ready
+
+    def fleet_runtime_snapshot(self) -> CarRuntimeSnapshot:
+        """Return one lock-consistent local pose/status snapshot without I/O."""
+        with self._lock:
+            follower_state = self._follower_state
+            if follower_state.completed:
+                navigation_state = NavigationState.ARRIVED
+            elif follower_state.running:
+                navigation_state = NavigationState.FOLLOWING
+            else:
+                navigation_state = NavigationState.IDLE
+            return CarRuntimeSnapshot(
+                ready=self._ready,
+                map_ready=self._map_ready,
+                pose=self._latest_navigation_pose,
+                navigation_state=navigation_state,
+                localization_degraded=self._localization_degraded,
+                error_code=self._fleet_error_code,
+            )
 
     def run(self) -> None:
         LOG.info(
@@ -237,6 +279,8 @@ class CompetitionCarApplication:
                 position_gain=0.20,
             ),
         )
+        with self._lock:
+            self._map_ready = True
         LOG.info(
             "calibration complete; rear axle rebased to A=(0,0,0deg) "
             "bounds=x[%.1f,%.1f] y[%.1f,%.1f] fitted_lines=%d",
@@ -281,6 +325,18 @@ class CompetitionCarApplication:
                 del self._startup_scans[:-limit]
                 self._scan_event.set()
                 return
+            if update.global_pose is None or not update.odometry.accepted:
+                self._localization_degraded = True
+            else:
+                self._latest_navigation_pose = NavigationPose(
+                    x_cm=update.global_pose.x_cm,
+                    y_cm=update.global_pose.y_cm,
+                    heading_deg=radar_yaw_to_navigation_heading(
+                        update.global_pose.yaw_cw_deg
+                    ),
+                    timestamp_s=time.monotonic(),
+                )
+                self._localization_degraded = False
         try:
             self.follower.update_from_radar(update)
         except BaseException:
@@ -288,6 +344,8 @@ class CompetitionCarApplication:
             self.request_stop()
 
     def _on_follower_state(self, state: TrackFollowerState) -> None:
+        with self._lock:
+            self._follower_state = state
         if state.completed:
             self.radar.set_motion_hint(False)
             self._completed_event.set()
@@ -302,6 +360,7 @@ class CompetitionCarApplication:
                 return
             self._closed = True
             self._ready = False
+            self._map_ready = False
         self.follower.stop_mission()
         self.radar.set_motion_hint(False)
         self.radar.close()
