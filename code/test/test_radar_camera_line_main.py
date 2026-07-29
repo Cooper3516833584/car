@@ -7,6 +7,12 @@ from components.camera_line_correction import CameraLineCorrectionConfig
 from components.camera_line_follower import LineObservation
 from components.competition_track import TrackFollowerState, TrackSegment
 from main_radar_camera_line_following import (
+    AB_START_ALIGNMENT_FADE_END_PROGRESS_CM,
+    AB_START_ALIGNMENT_FULL_END_PROGRESS_CM,
+    AB_START_HEADING_GAIN,
+    AB_START_MAX_HEADING_CORRECTION_RAD,
+    AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD,
+    AB_START_MIN_VALID_FRAMES,
     BC_ENTRY_LIMIT_END_PROGRESS_CM,
     BC_ENTRY_MIN_RIGHT_CORRECTION_RAD,
     CAMERA_CORRECTION_ENABLED,
@@ -25,7 +31,13 @@ from main_radar_camera_line_following import (
 )
 
 
-def observation(*, lateral_cm=0.0, round_marker=False):
+def observation(
+    *,
+    lateral_cm=0.0,
+    heading_error_rad=0.0,
+    round_marker=False,
+    transverse=False,
+):
     return LineObservation(
         timestamp_s=1.0,
         detected=True,
@@ -33,7 +45,7 @@ def observation(*, lateral_cm=0.0, round_marker=False):
         lookahead_x_cm=35.0,
         lookahead_y_left_cm=lateral_cm,
         near_lateral_error_cm=lateral_cm,
-        heading_error_rad=0.0,
+        heading_error_rad=heading_error_rad,
         curvature_per_cm=0.0,
         fit_rmse_cm=0.5,
         visible_band_count=12,
@@ -42,6 +54,7 @@ def observation(*, lateral_cm=0.0, round_marker=False):
         polynomial_y_left_by_x=(0.0, 0.0, lateral_cm),
         dark_threshold=100.0,
         round_marker_detected=round_marker,
+        transverse_line_detected=transverse,
     )
 
 
@@ -55,6 +68,15 @@ class RadarCameraLineMainTests(unittest.TestCase):
         self.assertEqual(CAMERA_LATERAL_DEADBAND_CM, 10.0)
         self.assertEqual(CAMERA_STEERING_GAIN_RAD_PER_CM, 0.010)
         self.assertEqual(CAMERA_MAX_STEERING_CORRECTION_RAD, 0.140)
+        self.assertEqual(AB_START_ALIGNMENT_FULL_END_PROGRESS_CM, 30.0)
+        self.assertEqual(AB_START_ALIGNMENT_FADE_END_PROGRESS_CM, 80.0)
+        self.assertEqual(AB_START_HEADING_GAIN, 1.30)
+        self.assertEqual(AB_START_MAX_HEADING_CORRECTION_RAD, 0.180)
+        self.assertEqual(
+            AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD,
+            0.220,
+        )
+        self.assertEqual(AB_START_MIN_VALID_FRAMES, 2)
         self.assertEqual(BC_ENTRY_LIMIT_END_PROGRESS_CM, 210.0)
         self.assertEqual(BC_ENTRY_MIN_RIGHT_CORRECTION_RAD, -0.012)
         self.assertEqual(FINAL_DA_TRIM_START_PROGRESS_CM, 725.0)
@@ -173,6 +195,112 @@ class RadarCameraLineMainTests(unittest.TestCase):
             application._apply_course_camera_limit(0.080),
             0.080,
         )
+
+    def test_ab_start_uses_strong_camera_heading_alignment(self):
+        correction = CameraLineCorrectionConfig(
+            required_consecutive_frames=2,
+            large_error_required_frames=2,
+            correction_filter_time_constant_s=0.0,
+            maximum_correction_rate_rad_s=100.0,
+        )
+        application = RadarCameraLineApplication(
+            MainConfig(camera_correction=correction)
+        )
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.AB,
+                progress_cm=20.0,
+                target_speed_cm_s=30.0,
+                commanded_speed_cm_s=30.0,
+                steering_angle_rad=0.0,
+                cross_track_error_cm=0.0,
+                heading_error_deg=0.0,
+            )
+        )
+        for index in range(2):
+            application.camera_corrector.update_from_observation(
+                observation(heading_error_rad=0.10),
+                now_s=1.0 + 0.06 * index,
+            )
+
+        self.assertAlmostEqual(
+            application._ab_start_alignment_correction(now_s=1.06),
+            0.130,
+        )
+
+    def test_ab_start_alignment_fades_before_first_curve(self):
+        correction = CameraLineCorrectionConfig(
+            required_consecutive_frames=2,
+            large_error_required_frames=2,
+            correction_filter_time_constant_s=0.0,
+            maximum_correction_rate_rad_s=100.0,
+        )
+        application = RadarCameraLineApplication(
+            MainConfig(camera_correction=correction)
+        )
+        for index in range(2):
+            application.camera_corrector.update_from_observation(
+                observation(heading_error_rad=-0.10),
+                now_s=1.0 + 0.06 * index,
+            )
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.AB,
+                progress_cm=55.0,
+                target_speed_cm_s=30.0,
+                commanded_speed_cm_s=30.0,
+                steering_angle_rad=0.0,
+                cross_track_error_cm=0.0,
+                heading_error_deg=0.0,
+            )
+        )
+
+        self.assertAlmostEqual(
+            application._ab_start_alignment_correction(now_s=1.06),
+            -0.065,
+        )
+
+    def test_ab_start_alignment_rejects_start_line_and_marker(self):
+        correction = CameraLineCorrectionConfig(
+            required_consecutive_frames=2,
+            large_error_required_frames=2,
+            correction_filter_time_constant_s=0.0,
+            maximum_correction_rate_rad_s=100.0,
+        )
+        for rejected in (
+            observation(heading_error_rad=0.20, round_marker=True),
+            observation(heading_error_rad=0.20, transverse=True),
+        ):
+            application = RadarCameraLineApplication(
+                MainConfig(camera_correction=correction)
+            )
+            application._on_follower_state(
+                TrackFollowerState(
+                    running=True,
+                    completed=False,
+                    segment=TrackSegment.AB,
+                    progress_cm=10.0,
+                    target_speed_cm_s=30.0,
+                    commanded_speed_cm_s=30.0,
+                    steering_angle_rad=0.0,
+                    cross_track_error_cm=0.0,
+                    heading_error_deg=0.0,
+                )
+            )
+            for index in range(2):
+                application.camera_corrector.update_from_observation(
+                    rejected,
+                    now_s=1.0 + 0.06 * index,
+                )
+
+            self.assertEqual(
+                application._ab_start_alignment_correction(),
+                0.0,
+            )
 
     def test_first_curve_limit_does_not_affect_straights_or_late_curve(self):
         application = RadarCameraLineApplication(MainConfig())

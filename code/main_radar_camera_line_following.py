@@ -13,6 +13,7 @@ import argparse
 from dataclasses import dataclass
 import logging
 from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
+import math
 import os
 from pathlib import Path
 import queue
@@ -65,6 +66,16 @@ CAMERA_CORRECTION_ENABLED = True
 CAMERA_LATERAL_DEADBAND_CM = 10.0
 CAMERA_STEERING_GAIN_RAD_PER_CM = 0.010
 CAMERA_MAX_STEERING_CORRECTION_RAD = 0.140
+
+# Strong camera-heading alignment for an imperfect initial pose at A.  The
+# start line/marker is explicitly rejected; once the longitudinal AB line is
+# reliable, use its fitted heading to square the car before the first curve.
+AB_START_ALIGNMENT_FULL_END_PROGRESS_CM = 30.0
+AB_START_ALIGNMENT_FADE_END_PROGRESS_CM = 80.0
+AB_START_HEADING_GAIN = 1.30
+AB_START_MAX_HEADING_CORRECTION_RAD = 0.180
+AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD = 0.220
+AB_START_MIN_VALID_FRAMES = 2
 
 # The 60-degree camera mount makes the entrance of the first right semicircle
 # look like a persistent right-side line offset.  Keep that ambiguous
@@ -537,12 +548,23 @@ class RadarCameraLineApplication:
         if not self.config.camera_correction_enabled:
             return float(radar_steering_rad)
         try:
+            now_s = time.monotonic()
             observed_correction = self.camera_corrector.correction_for_speed(
                 speed_cm_s,
-                now_s=time.monotonic(),
+                now_s=now_s,
+            )
+            ab_start_alignment = self._ab_start_alignment_correction(
+                now_s=now_s
+            )
+            camera_correction = max(
+                -AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD,
+                min(
+                    AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD,
+                    observed_correction + ab_start_alignment,
+                ),
             )
             course_limited_correction = self._apply_course_camera_limit(
-                observed_correction
+                camera_correction
             )
             final_da_trim = self._final_da_trim()
             correction = (
@@ -559,6 +581,7 @@ class RadarCameraLineApplication:
             LOG.debug(
                 "steering fusion radar_rad=%.4f camera_rad=%.4f "
                 "final_rad=%.4f observed_camera_rad=%.4f "
+                "ab_start_alignment_rad=%.4f "
                 "course_limited_camera_rad=%.4f final_da_trim_rad=%.4f "
                 "camera_active=%s "
                 "camera_error_cm=%.2f camera_confidence=%.2f",
@@ -566,6 +589,7 @@ class RadarCameraLineApplication:
                 correction,
                 adjusted,
                 observed_correction,
+                ab_start_alignment,
                 course_limited_correction,
                 0.0 if final_da_trim is None else final_da_trim,
                 state.active,
@@ -578,6 +602,66 @@ class RadarCameraLineApplication:
                 "camera steering adjustment failed; using radar command"
             )
             return float(radar_steering_rad)
+
+    def _ab_start_alignment_correction(
+        self,
+        *,
+        now_s: float | None = None,
+    ) -> float:
+        now = time.monotonic() if now_s is None else float(now_s)
+        with self._lock:
+            follower_state = self._follower_state
+        camera_state = self.camera_corrector.state
+        observation = camera_state.observation
+        if (
+            not follower_state.running
+            or follower_state.completed
+            or follower_state.segment is not TrackSegment.AB
+            or follower_state.progress_cm
+            >= AB_START_ALIGNMENT_FADE_END_PROGRESS_CM
+            or now - camera_state.timestamp_s
+            > self.config.camera_correction.stale_timeout_s
+            or camera_state.valid_frames < AB_START_MIN_VALID_FRAMES
+            or observation is None
+            or not observation.detected
+            or not math.isfinite(observation.heading_error_rad)
+            or observation.confidence
+            < self.config.camera_correction.minimum_confidence
+            or observation.visible_band_count
+            < self.config.camera_correction.minimum_visible_bands
+            or observation.fit_rmse_cm
+            > self.config.camera_correction.maximum_fit_rmse_cm
+            or observation.round_marker_detected
+            or observation.transverse_line_detected
+        ):
+            return 0.0
+
+        fade_span_cm = (
+            AB_START_ALIGNMENT_FADE_END_PROGRESS_CM
+            - AB_START_ALIGNMENT_FULL_END_PROGRESS_CM
+        )
+        fade_scale = (
+            1.0
+            if follower_state.progress_cm
+            <= AB_START_ALIGNMENT_FULL_END_PROGRESS_CM
+            else max(
+                0.0,
+                (
+                    AB_START_ALIGNMENT_FADE_END_PROGRESS_CM
+                    - follower_state.progress_cm
+                )
+                / fade_span_cm,
+            )
+        )
+        requested = (
+            AB_START_HEADING_GAIN
+            * float(observation.heading_error_rad)
+        )
+        bounded = max(
+            -AB_START_MAX_HEADING_CORRECTION_RAD,
+            min(AB_START_MAX_HEADING_CORRECTION_RAD, requested),
+        )
+        return bounded * fade_scale
 
     def _apply_course_camera_limit(self, correction_rad: float) -> float:
         with self._lock:
