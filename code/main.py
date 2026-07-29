@@ -26,7 +26,6 @@ from components import (
     RadarMount,
     RadarScan,
     RectangleFieldCalibrator,
-    TRACK_REFERENCE_OFFSET_CM,
     TrackFollowerState,
     WallFusionConfig,
     WallLineConfig,
@@ -36,6 +35,10 @@ from components import (
 
 # Fixed-track test speed. Change this one value for the next real-car run.
 TRACK_SPEED_CM_S = 8.0
+
+# At startup the car faces AB with its front reference at A. The radar centre
+# is this far behind A; after driving forward this distance, it passes A.
+RADAR_CENTER_BEHIND_A_ALONG_AB_CM = 0.0
 
 LOG = logging.getLogger("car-main")
 LOG_FILENAME = "car-main.log"
@@ -118,7 +121,7 @@ class MainConfig:
     radar_mount: RadarMount = RadarMount()
     startup_scan_count: int = 3
     calibration_timeout_s: float = 30.0
-    track_reference_offset_cm: float = TRACK_REFERENCE_OFFSET_CM
+    radar_center_behind_a_cm: float = RADAR_CENTER_BEHIND_A_ALONG_AB_CM
     speed_cm_s: float = TRACK_SPEED_CM_S
 
     def __post_init__(self) -> None:
@@ -126,8 +129,8 @@ class MainConfig:
             raise ValueError("startup_scan_count must be positive")
         if self.calibration_timeout_s <= 0.0:
             raise ValueError("calibration_timeout_s must be positive")
-        if self.track_reference_offset_cm < 0.0:
-            raise ValueError("track_reference_offset_cm cannot be negative")
+        if self.radar_center_behind_a_cm < 0.0:
+            raise ValueError("radar_center_behind_a_cm cannot be negative")
         if self.speed_cm_s <= 0.0:
             raise ValueError("speed_cm_s must be positive")
 
@@ -150,7 +153,7 @@ class CompetitionCarApplication:
             max_wheel_speed_mm_s=max_wheel_speed_mm_s,
         )
         self.track = CompetitionTrack.build(
-            reference_offset_cm=config.track_reference_offset_cm,
+            reference_offset_cm=config.radar_center_behind_a_cm,
         )
         self.follower = CompetitionTrackFollower(
             drive=self.drive,
@@ -194,9 +197,9 @@ class CompetitionCarApplication:
             self.radar.start()
             LOG.info(
                 "one-lap tracking started speed_cm_s=%.1f "
-                "reference_offset_cm=%.1f",
+                "radar_center_behind_a_cm=%.1f",
                 self.config.speed_cm_s,
-                self.config.track_reference_offset_cm,
+                self.config.radar_center_behind_a_cm,
             )
             while (
                 not self._stop_event.is_set()
@@ -315,9 +318,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--startup-scans", type=int, default=3)
     parser.add_argument("--calibration-timeout", type=float, default=30.0)
     parser.add_argument(
-        "--track-reference-offset-cm",
+        "--radar-center-behind-a-cm",
         type=float,
-        default=TRACK_REFERENCE_OFFSET_CM,
+        default=RADAR_CENTER_BEHIND_A_ALONG_AB_CM,
     )
     parser.add_argument(
         "--speed-cm-s",
@@ -359,7 +362,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 startup_scan_count=args.startup_scans,
                 calibration_timeout_s=args.calibration_timeout,
-                track_reference_offset_cm=args.track_reference_offset_cm,
+                radar_center_behind_a_cm=args.radar_center_behind_a_cm,
                 speed_cm_s=args.speed_cm_s,
             )
         )

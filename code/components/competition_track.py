@@ -39,7 +39,6 @@ S_C_CM: Final[float] = S_B_CM + math.pi * TRACK_RADIUS_CM
 S_D_CM: Final[float] = 300.0 + math.pi * TRACK_RADIUS_CM
 S_FINISH_CM: Final[float] = 300.0 + 2.0 * math.pi * TRACK_RADIUS_CM
 
-TRACK_REFERENCE_OFFSET_CM: Final[float] = 0.0
 TRACK_SAMPLE_SPACING_CM: Final[float] = 2.5
 WRAP_EXTENSION_CM: Final[float] = 100.0
 
@@ -97,7 +96,7 @@ def line_reference_to_rear_axle(
     line_y_cm: float,
     heading_math_rad: float,
     *,
-    offset_cm: float = TRACK_REFERENCE_OFFSET_CM,
+    offset_cm: float = 0.0,
 ) -> tuple[float, float]:
     """Translate a measured black-line reference point to the rear axle."""
 
@@ -116,7 +115,7 @@ class FieldTransform:
 
     @classmethod
     def from_a_reference(
-        cls, *, offset_cm: float = TRACK_REFERENCE_OFFSET_CM
+        cls, *, offset_cm: float = 0.0
     ) -> "FieldTransform":
         rear = line_reference_to_rear_axle(
             *A_FIELD_CM,
@@ -346,7 +345,7 @@ def build_competition_track(
     *,
     sample_spacing_cm: float = TRACK_SAMPLE_SPACING_CM,
     wrap_extension_cm: float = WRAP_EXTENSION_CM,
-    reference_offset_cm: float = TRACK_REFERENCE_OFFSET_CM,
+    reference_offset_cm: float = 0.0,
     transform: FieldTransform | None = None,
 ) -> CompetitionTrack:
     if transform is not None:

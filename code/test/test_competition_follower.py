@@ -5,7 +5,6 @@ from components.competition_track import (
     CompetitionTrack,
     CompetitionTrackFollower,
     S_FINISH_CM,
-    TRACK_REFERENCE_OFFSET_CM,
     TrackSegment,
 )
 from components.navigation import TrackerCommand, navigation_heading_to_radar_yaw
@@ -80,7 +79,7 @@ class CompetitionTrackFollowerTests(unittest.TestCase):
     def setUp(self):
         self.drive = FakeDrive()
         self.track = CompetitionTrack.build(
-            reference_offset_cm=TRACK_REFERENCE_OFFSET_CM
+            reference_offset_cm=0.0
         )
         self.states = []
         self.follower = CompetitionTrackFollower(

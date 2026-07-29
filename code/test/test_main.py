@@ -3,10 +3,10 @@
 from types import SimpleNamespace
 import unittest
 
-from components import TRACK_REFERENCE_OFFSET_CM
 from main import (
     CompetitionCarApplication,
     MainConfig,
+    RADAR_CENTER_BEHIND_A_ALONG_AB_CM,
     TRACK_SPEED_CM_S,
     build_argument_parser,
 )
@@ -15,9 +15,9 @@ from main import (
 class CompetitionMainTests(unittest.TestCase):
     def test_defaults_are_for_one_low_speed_lap(self):
         config = MainConfig()
-        self.assertEqual(config.track_reference_offset_cm, 0.0)
+        self.assertEqual(config.radar_center_behind_a_cm, 0.0)
         self.assertEqual(config.speed_cm_s, 8.0)
-        self.assertEqual(TRACK_REFERENCE_OFFSET_CM, 0.0)
+        self.assertEqual(RADAR_CENTER_BEHIND_A_ALONG_AB_CM, 0.0)
         self.assertEqual(TRACK_SPEED_CM_S, 8.0)
 
     def test_cli_only_contains_radar_and_track_parameters(self):
@@ -32,7 +32,7 @@ class CompetitionMainTests(unittest.TestCase):
                 "-1.0",
                 "--radar-yaw-cw-deg",
                 "3.0",
-                "--track-reference-offset-cm",
+                "--radar-center-behind-a-cm",
                 "20.0",
                 "--speed-cm-s",
                 "6.0",
@@ -43,7 +43,7 @@ class CompetitionMainTests(unittest.TestCase):
             (args.radar_x_cm, args.radar_y_cm, args.radar_yaw_cw_deg),
             (2.5, -1.0, 3.0),
         )
-        self.assertEqual(args.track_reference_offset_cm, 20.0)
+        self.assertEqual(args.radar_center_behind_a_cm, 20.0)
         self.assertEqual(args.speed_cm_s, 6.0)
         option_names = parser._option_string_actions
         self.assertNotIn("--task", option_names)
@@ -53,7 +53,7 @@ class CompetitionMainTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             MainConfig(speed_cm_s=0.0)
         with self.assertRaises(ValueError):
-            MainConfig(track_reference_offset_cm=-1.0)
+            MainConfig(radar_center_behind_a_cm=-1.0)
         with self.assertRaises(ValueError):
             MainConfig(startup_scan_count=0)
 

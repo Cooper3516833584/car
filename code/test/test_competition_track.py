@@ -97,6 +97,21 @@ class CompetitionTrackGeometryTests(unittest.TestCase):
         self.assertAlmostEqual(start.y_cm, 0.0)
         self.assertAlmostEqual(start.heading_deg, 0.0)
 
+    def test_radar_behind_a_reaches_a_after_configured_forward_distance(self):
+        distance_cm = 20.0
+        track = CompetitionTrack.build(reference_offset_cm=distance_cm)
+        self.assertAlmostEqual(track.field_points_cm[0][0], 150.0)
+        self.assertAlmostEqual(track.field_points_cm[0][1], 180.0)
+        index = next(
+            index
+            for index, point in enumerate(track.points)
+            if math.isclose(point.progress_cm, distance_cm)
+        )
+        self.assertAlmostEqual(track.field_points_cm[index][0], 150.0)
+        self.assertAlmostEqual(track.field_points_cm[index][1], 200.0)
+        self.assertAlmostEqual(track.points[index].x_cm, distance_cm)
+        self.assertAlmostEqual(track.points[index].y_cm, 0.0)
+
     def test_navigation_path_is_forward_and_public_accessors_match(self):
         track = CompetitionTrack.build(reference_offset_cm=0.0)
         self.assertEqual(len(track.points), len(track.path.points))

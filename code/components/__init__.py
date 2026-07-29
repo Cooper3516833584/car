@@ -284,7 +284,6 @@ from .competition_track import (
     FieldTransform,
     TrackFollowerState,
     TrackSegment,
-    TRACK_REFERENCE_OFFSET_CM,
     build_competition_track,
 )
 
@@ -294,6 +293,5 @@ __all__ += [
     "FieldTransform",
     "TrackFollowerState",
     "TrackSegment",
-    "TRACK_REFERENCE_OFFSET_CM",
     "build_competition_track",
 ]

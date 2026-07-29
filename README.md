@@ -728,6 +728,9 @@ SE(2) 坐标变换。
 进度越过 A 并进入重复 AB 采样段后停车并退出。
 单圈速度集中定义在 `code/main.py` 文件前部的 `TRACK_SPEED_CM_S`，修改该值
 即可调整下一次实车测试速度，单位为 `cm/s`。
+启动时雷达中心位于 A 点后方的距离定义在同一位置的
+`RADAR_CENTER_BEHIND_A_ALONG_AB_CM`。该值沿 AB 前进方向计量；小车前进该距离后，
+雷达中心经过 A 点。
 
 ```bash
 sudo python3 /home/radxa/car/main.py
