@@ -66,6 +66,12 @@ CAMERA_LATERAL_DEADBAND_CM = 10.0
 CAMERA_STEERING_GAIN_RAD_PER_CM = 0.010
 CAMERA_MAX_STEERING_CORRECTION_RAD = 0.140
 
+# The 60-degree camera mount makes the entrance of the first right semicircle
+# look like a persistent right-side line offset.  Keep that ambiguous
+# same-direction correction weak instead of adding it fully to radar steering.
+BC_ENTRY_LIMIT_END_PROGRESS_CM = 210.0
+BC_ENTRY_MIN_RIGHT_CORRECTION_RAD = -0.012
+
 # Fixed-course trim for the final DA approach.  The end marker progressively
 # hides the longitudinal line while radar tends to command full right lock, so
 # preserve a known-good left correction over only the last part of the lap.
@@ -535,11 +541,14 @@ class RadarCameraLineApplication:
                 speed_cm_s,
                 now_s=time.monotonic(),
             )
+            course_limited_correction = self._apply_course_camera_limit(
+                observed_correction
+            )
             final_da_trim = self._final_da_trim()
             correction = (
-                observed_correction
+                course_limited_correction
                 if final_da_trim is None
-                else max(observed_correction, final_da_trim)
+                else max(course_limited_correction, final_da_trim)
             )
             combined = float(radar_steering_rad) + correction
             adjusted = max(
@@ -550,12 +559,14 @@ class RadarCameraLineApplication:
             LOG.debug(
                 "steering fusion radar_rad=%.4f camera_rad=%.4f "
                 "final_rad=%.4f observed_camera_rad=%.4f "
-                "final_da_trim_rad=%.4f camera_active=%s "
+                "course_limited_camera_rad=%.4f final_da_trim_rad=%.4f "
+                "camera_active=%s "
                 "camera_error_cm=%.2f camera_confidence=%.2f",
                 radar_steering_rad,
                 correction,
                 adjusted,
                 observed_correction,
+                course_limited_correction,
                 0.0 if final_da_trim is None else final_da_trim,
                 state.active,
                 state.lateral_error_cm,
@@ -567,6 +578,21 @@ class RadarCameraLineApplication:
                 "camera steering adjustment failed; using radar command"
             )
             return float(radar_steering_rad)
+
+    def _apply_course_camera_limit(self, correction_rad: float) -> float:
+        with self._lock:
+            state = self._follower_state
+        if (
+            state.running
+            and not state.completed
+            and state.segment is TrackSegment.BC
+            and state.progress_cm < BC_ENTRY_LIMIT_END_PROGRESS_CM
+        ):
+            return max(
+                float(correction_rad),
+                BC_ENTRY_MIN_RIGHT_CORRECTION_RAD,
+            )
+        return float(correction_rad)
 
     def _final_da_trim(self) -> float | None:
         with self._lock:

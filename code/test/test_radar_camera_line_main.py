@@ -7,6 +7,8 @@ from components.camera_line_correction import CameraLineCorrectionConfig
 from components.camera_line_follower import LineObservation
 from components.competition_track import TrackFollowerState, TrackSegment
 from main_radar_camera_line_following import (
+    BC_ENTRY_LIMIT_END_PROGRESS_CM,
+    BC_ENTRY_MIN_RIGHT_CORRECTION_RAD,
     CAMERA_CORRECTION_ENABLED,
     CAMERA_LATERAL_DEADBAND_CM,
     CAMERA_MAX_STEERING_CORRECTION_RAD,
@@ -53,6 +55,8 @@ class RadarCameraLineMainTests(unittest.TestCase):
         self.assertEqual(CAMERA_LATERAL_DEADBAND_CM, 10.0)
         self.assertEqual(CAMERA_STEERING_GAIN_RAD_PER_CM, 0.010)
         self.assertEqual(CAMERA_MAX_STEERING_CORRECTION_RAD, 0.140)
+        self.assertEqual(BC_ENTRY_LIMIT_END_PROGRESS_CM, 210.0)
+        self.assertEqual(BC_ENTRY_MIN_RIGHT_CORRECTION_RAD, -0.012)
         self.assertEqual(FINAL_DA_TRIM_START_PROGRESS_CM, 725.0)
         self.assertEqual(FINAL_DA_TRIM_FULL_PROGRESS_CM, 740.0)
         self.assertEqual(FINAL_DA_MIN_LEFT_CORRECTION_RAD, 0.100)
@@ -144,6 +148,69 @@ class RadarCameraLineMainTests(unittest.TestCase):
 
         self.assertLess(adjusted, 0.020)
         self.assertAlmostEqual(adjusted, -0.120)
+
+    def test_first_curve_entry_limits_ambiguous_right_camera_correction(self):
+        application = RadarCameraLineApplication(MainConfig())
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.BC,
+                progress_cm=180.0,
+                target_speed_cm_s=30.0,
+                commanded_speed_cm_s=30.0,
+                steering_angle_rad=-0.15,
+                cross_track_error_cm=4.0,
+                heading_error_deg=-10.0,
+            )
+        )
+
+        self.assertEqual(
+            application._apply_course_camera_limit(-0.080),
+            -0.012,
+        )
+        self.assertEqual(
+            application._apply_course_camera_limit(0.080),
+            0.080,
+        )
+
+    def test_first_curve_limit_does_not_affect_straights_or_late_curve(self):
+        application = RadarCameraLineApplication(MainConfig())
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.AB,
+                progress_cm=100.0,
+                target_speed_cm_s=30.0,
+                commanded_speed_cm_s=30.0,
+                steering_angle_rad=0.0,
+                cross_track_error_cm=0.0,
+                heading_error_deg=0.0,
+            )
+        )
+        self.assertEqual(
+            application._apply_course_camera_limit(-0.080),
+            -0.080,
+        )
+
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.BC,
+                progress_cm=220.0,
+                target_speed_cm_s=30.0,
+                commanded_speed_cm_s=30.0,
+                steering_angle_rad=-0.1,
+                cross_track_error_cm=4.0,
+                heading_error_deg=-10.0,
+            )
+        )
+        self.assertEqual(
+            application._apply_course_camera_limit(-0.080),
+            -0.080,
+        )
 
     def test_fusion_config_preserves_fixed_track_inputs(self):
         config = MainConfig(
