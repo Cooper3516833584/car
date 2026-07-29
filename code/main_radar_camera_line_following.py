@@ -72,6 +72,14 @@ CAMERA_MAX_STEERING_CORRECTION_RAD = 0.140
 BC_ENTRY_LIMIT_END_PROGRESS_CM = 210.0
 BC_ENTRY_MIN_RIGHT_CORRECTION_RAD = -0.012
 
+# Stabilize the heading before each straight-to-curve transition.  This is
+# applied to the final fused steering, so it damps both intermittent camera
+# corrections on AB and Pure Pursuit sign changes on CD.
+AB_END_STABILIZE_START_PROGRESS_CM = 90.0
+CD_END_STABILIZE_START_PROGRESS_CM = 470.0
+STRAIGHT_END_MAX_ABS_STEERING_RAD = 0.065
+STRAIGHT_END_MAX_STEERING_RATE_RAD_S = 0.30
+
 # Fixed-course trim for the final DA approach.  The end marker progressively
 # hides the longitudinal line while radar tends to command full right lock, so
 # preserve a known-good left correction over only the last part of the lap.
@@ -272,6 +280,8 @@ class RadarCameraLineApplication:
         self._fleet_error_code = 0
         self._closed = False
         self._last_camera_error: str | None = None
+        self._straight_end_last_steering_rad: float | None = None
+        self._straight_end_last_update_s: float | None = None
 
         max_wheel_speed_mm_s = max(300.0, config.speed_cm_s * 12.0)
         self.drive = AckermannDrive(
@@ -537,9 +547,10 @@ class RadarCameraLineApplication:
         if not self.config.camera_correction_enabled:
             return float(radar_steering_rad)
         try:
+            now_s = time.monotonic()
             observed_correction = self.camera_corrector.correction_for_speed(
                 speed_cm_s,
-                now_s=time.monotonic(),
+                now_s=now_s,
             )
             course_limited_correction = self._apply_course_camera_limit(
                 observed_correction
@@ -551,15 +562,22 @@ class RadarCameraLineApplication:
                 else max(course_limited_correction, final_da_trim)
             )
             combined = float(radar_steering_rad) + correction
+            stabilized, straight_end_stabilized = (
+                self._stabilize_straight_end_steering(
+                    combined,
+                    now_s=now_s,
+                )
+            )
             adjusted = max(
                 MIN_VEHICLE_STEERING_RAD,
-                min(MAX_VEHICLE_STEERING_RAD, combined),
+                min(MAX_VEHICLE_STEERING_RAD, stabilized),
             )
             state = self.camera_corrector.state
             LOG.debug(
                 "steering fusion radar_rad=%.4f camera_rad=%.4f "
                 "final_rad=%.4f observed_camera_rad=%.4f "
                 "course_limited_camera_rad=%.4f final_da_trim_rad=%.4f "
+                "pre_stabilized_rad=%.4f straight_end_stabilized=%s "
                 "camera_active=%s "
                 "camera_error_cm=%.2f camera_confidence=%.2f",
                 radar_steering_rad,
@@ -568,6 +586,8 @@ class RadarCameraLineApplication:
                 observed_correction,
                 course_limited_correction,
                 0.0 if final_da_trim is None else final_da_trim,
+                combined,
+                straight_end_stabilized,
                 state.active,
                 state.lateral_error_cm,
                 state.confidence,
@@ -593,6 +613,57 @@ class RadarCameraLineApplication:
                 BC_ENTRY_MIN_RIGHT_CORRECTION_RAD,
             )
         return float(correction_rad)
+
+    def _stabilize_straight_end_steering(
+        self,
+        steering_rad: float,
+        *,
+        now_s: float,
+    ) -> tuple[float, bool]:
+        with self._lock:
+            state = self._follower_state
+            active = (
+                state.running
+                and not state.completed
+                and (
+                    (
+                        state.segment is TrackSegment.AB
+                        and state.progress_cm
+                        >= AB_END_STABILIZE_START_PROGRESS_CM
+                    )
+                    or (
+                        state.segment is TrackSegment.CD
+                        and state.progress_cm
+                        >= CD_END_STABILIZE_START_PROGRESS_CM
+                    )
+                )
+            )
+            if not active:
+                self._straight_end_last_steering_rad = None
+                self._straight_end_last_update_s = None
+                return float(steering_rad), False
+
+            bounded = max(
+                -STRAIGHT_END_MAX_ABS_STEERING_RAD,
+                min(
+                    STRAIGHT_END_MAX_ABS_STEERING_RAD,
+                    float(steering_rad),
+                ),
+            )
+            previous = self._straight_end_last_steering_rad
+            previous_time = self._straight_end_last_update_s
+            if previous is not None and previous_time is not None:
+                dt = max(1e-3, min(0.25, float(now_s) - previous_time))
+                maximum_delta = (
+                    STRAIGHT_END_MAX_STEERING_RATE_RAD_S * dt
+                )
+                bounded = max(
+                    previous - maximum_delta,
+                    min(previous + maximum_delta, bounded),
+                )
+            self._straight_end_last_steering_rad = bounded
+            self._straight_end_last_update_s = float(now_s)
+            return bounded, True
 
     def _final_da_trim(self) -> float | None:
         with self._lock:

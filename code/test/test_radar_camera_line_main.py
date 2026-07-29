@@ -7,15 +7,19 @@ from components.camera_line_correction import CameraLineCorrectionConfig
 from components.camera_line_follower import LineObservation
 from components.competition_track import TrackFollowerState, TrackSegment
 from main_radar_camera_line_following import (
+    AB_END_STABILIZE_START_PROGRESS_CM,
     BC_ENTRY_LIMIT_END_PROGRESS_CM,
     BC_ENTRY_MIN_RIGHT_CORRECTION_RAD,
     CAMERA_CORRECTION_ENABLED,
     CAMERA_LATERAL_DEADBAND_CM,
     CAMERA_MAX_STEERING_CORRECTION_RAD,
     CAMERA_STEERING_GAIN_RAD_PER_CM,
+    CD_END_STABILIZE_START_PROGRESS_CM,
     FINAL_DA_MIN_LEFT_CORRECTION_RAD,
     FINAL_DA_TRIM_FULL_PROGRESS_CM,
     FINAL_DA_TRIM_START_PROGRESS_CM,
+    STRAIGHT_END_MAX_ABS_STEERING_RAD,
+    STRAIGHT_END_MAX_STEERING_RATE_RAD_S,
     RADAR_CENTER_BEHIND_A_ALONG_AB_CM,
     TRACK_SPEED_CM_S,
     MainConfig,
@@ -57,6 +61,10 @@ class RadarCameraLineMainTests(unittest.TestCase):
         self.assertEqual(CAMERA_MAX_STEERING_CORRECTION_RAD, 0.140)
         self.assertEqual(BC_ENTRY_LIMIT_END_PROGRESS_CM, 210.0)
         self.assertEqual(BC_ENTRY_MIN_RIGHT_CORRECTION_RAD, -0.012)
+        self.assertEqual(AB_END_STABILIZE_START_PROGRESS_CM, 90.0)
+        self.assertEqual(CD_END_STABILIZE_START_PROGRESS_CM, 470.0)
+        self.assertEqual(STRAIGHT_END_MAX_ABS_STEERING_RAD, 0.065)
+        self.assertEqual(STRAIGHT_END_MAX_STEERING_RATE_RAD_S, 0.30)
         self.assertEqual(FINAL_DA_TRIM_START_PROGRESS_CM, 725.0)
         self.assertEqual(FINAL_DA_TRIM_FULL_PROGRESS_CM, 740.0)
         self.assertEqual(FINAL_DA_MIN_LEFT_CORRECTION_RAD, 0.100)
@@ -193,6 +201,104 @@ class RadarCameraLineMainTests(unittest.TestCase):
             application._apply_course_camera_limit(-0.080),
             -0.080,
         )
+
+    def test_ab_end_stabilizer_limits_magnitude_and_sign_reversal(self):
+        application = RadarCameraLineApplication(MainConfig())
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.AB,
+                progress_cm=100.0,
+                target_speed_cm_s=30.0,
+                commanded_speed_cm_s=30.0,
+                steering_angle_rad=0.0,
+                cross_track_error_cm=0.0,
+                heading_error_deg=0.0,
+            )
+        )
+
+        first, first_active = application._stabilize_straight_end_steering(
+            0.120,
+            now_s=1.0,
+        )
+        reversed_value, second_active = (
+            application._stabilize_straight_end_steering(
+                -0.120,
+                now_s=1.1,
+            )
+        )
+
+        self.assertTrue(first_active)
+        self.assertTrue(second_active)
+        self.assertAlmostEqual(first, 0.065)
+        self.assertAlmostEqual(reversed_value, 0.035)
+
+    def test_cd_end_stabilizer_uses_the_same_limits(self):
+        application = RadarCameraLineApplication(MainConfig())
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.CD,
+                progress_cm=500.0,
+                target_speed_cm_s=30.0,
+                commanded_speed_cm_s=30.0,
+                steering_angle_rad=0.0,
+                cross_track_error_cm=0.0,
+                heading_error_deg=0.0,
+            )
+        )
+
+        stabilized, active = application._stabilize_straight_end_steering(
+            -0.100,
+            now_s=1.0,
+        )
+
+        self.assertTrue(active)
+        self.assertAlmostEqual(stabilized, -0.065)
+
+    def test_straight_end_stabilizer_is_inactive_in_straight_middle_and_curves(self):
+        application = RadarCameraLineApplication(MainConfig())
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.AB,
+                progress_cm=70.0,
+                target_speed_cm_s=30.0,
+                commanded_speed_cm_s=30.0,
+                steering_angle_rad=0.0,
+                cross_track_error_cm=0.0,
+                heading_error_deg=0.0,
+            )
+        )
+        unchanged, active = application._stabilize_straight_end_steering(
+            0.100,
+            now_s=1.0,
+        )
+        self.assertFalse(active)
+        self.assertEqual(unchanged, 0.100)
+
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.BC,
+                progress_cm=200.0,
+                target_speed_cm_s=30.0,
+                commanded_speed_cm_s=30.0,
+                steering_angle_rad=-0.1,
+                cross_track_error_cm=0.0,
+                heading_error_deg=0.0,
+            )
+        )
+        unchanged, active = application._stabilize_straight_end_steering(
+            -0.150,
+            now_s=1.1,
+        )
+        self.assertFalse(active)
+        self.assertEqual(unchanged, -0.150)
 
         application._on_follower_state(
             TrackFollowerState(
