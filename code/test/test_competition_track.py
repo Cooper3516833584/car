@@ -12,7 +12,6 @@ from components.competition_track import (
     S_FINISH_CM,
     TRACK_RADIUS_CM,
     TRACK_SAMPLE_SPACING_CM,
-    TRACK_SPEED_CM_S,
     WRAP_EXTENSION_CM,
     CompetitionTrack,
     TrackSegment,
@@ -116,11 +115,6 @@ class CompetitionTrackGeometryTests(unittest.TestCase):
         self.assertEqual(
             track.segment_at_progress(S_FINISH_CM), TrackSegment.AB
         )
-
-
-class CompetitionTrackSpeedTests(unittest.TestCase):
-    def test_initial_full_lap_speed_is_eight_cm_s(self):
-        self.assertEqual(TRACK_SPEED_CM_S, 8.0)
 
 
 if __name__ == "__main__":

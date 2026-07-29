@@ -726,6 +726,8 @@ SE(2) 坐标变换。
 沿 AB、BC、CD、DA 行驶一圈。控制只在 D500 提供已接受的新位姿时更新，
 转向复用 `PurePursuitController`，车速和舵角由 `AckermannDrive` 下发。
 进度越过 A 并进入重复 AB 采样段后停车并退出。
+单圈速度集中定义在 `code/main.py` 文件前部的 `TRACK_SPEED_CM_S`，修改该值
+即可调整下一次实车测试速度，单位为 `cm/s`。
 
 ```bash
 sudo python3 /home/radxa/car/main.py

@@ -27,13 +27,15 @@ from components import (
     RadarScan,
     RectangleFieldCalibrator,
     TRACK_REFERENCE_OFFSET_CM,
-    TRACK_SPEED_CM_S,
     TrackFollowerState,
     WallFusionConfig,
     WallLineConfig,
     rebase_calibration_to_start_pose,
 )
 
+
+# Fixed-track test speed. Change this one value for the next real-car run.
+TRACK_SPEED_CM_S = 8.0
 
 LOG = logging.getLogger("car-main")
 LOG_FILENAME = "car-main.log"

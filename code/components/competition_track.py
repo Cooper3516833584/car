@@ -42,7 +42,6 @@ S_FINISH_CM: Final[float] = 300.0 + 2.0 * math.pi * TRACK_RADIUS_CM
 TRACK_REFERENCE_OFFSET_CM: Final[float] = 0.0
 TRACK_SAMPLE_SPACING_CM: Final[float] = 2.5
 WRAP_EXTENSION_CM: Final[float] = 100.0
-TRACK_SPEED_CM_S: Final[float] = 8.0
 
 
 class TrackSegment(IntEnum):
@@ -373,7 +372,7 @@ class CompetitionTrackFollower:
         *,
         drive: AckermannDrive,
         track: CompetitionTrack,
-        speed_cm_s: float = TRACK_SPEED_CM_S,
+        speed_cm_s: float,
         controller: PurePursuitController | None = None,
         on_state_changed: Callable[[TrackFollowerState], None] | None = None,
     ) -> None:

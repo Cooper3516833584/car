@@ -3,10 +3,11 @@
 from types import SimpleNamespace
 import unittest
 
-from components import TRACK_REFERENCE_OFFSET_CM, TRACK_SPEED_CM_S
+from components import TRACK_REFERENCE_OFFSET_CM
 from main import (
     CompetitionCarApplication,
     MainConfig,
+    TRACK_SPEED_CM_S,
     build_argument_parser,
 )
 

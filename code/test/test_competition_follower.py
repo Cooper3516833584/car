@@ -6,7 +6,6 @@ from components.competition_track import (
     CompetitionTrackFollower,
     S_FINISH_CM,
     TRACK_REFERENCE_OFFSET_CM,
-    TRACK_SPEED_CM_S,
     TrackSegment,
 )
 from components.navigation import TrackerCommand, navigation_heading_to_radar_yaw
@@ -17,6 +16,8 @@ from components.radar_driver import (
     RadarOdometryUpdate,
     RadarScan,
 )
+
+TEST_SPEED_CM_S = 8.0
 
 
 class FakeDrive:
@@ -85,7 +86,7 @@ class CompetitionTrackFollowerTests(unittest.TestCase):
         self.follower = CompetitionTrackFollower(
             drive=self.drive,
             track=self.track,
-            speed_cm_s=TRACK_SPEED_CM_S,
+            speed_cm_s=TEST_SPEED_CM_S,
             on_state_changed=self.states.append,
         )
         self.follower.start_mission()
@@ -151,19 +152,19 @@ class CompetitionTrackFollowerTests(unittest.TestCase):
         follower = CompetitionTrackFollower(
             drive=self.drive,
             track=self.track,
-            speed_cm_s=TRACK_SPEED_CM_S,
+            speed_cm_s=TEST_SPEED_CM_S,
             controller=controller,
         )
         follower.start_mission()
         state = follower.update_from_radar(radar_update(self.track, 10))
         self.assertEqual(
             self.drive.commands[-1][0],
-            TRACK_SPEED_CM_S * 10.0,
+            TEST_SPEED_CM_S * 10.0,
         )
         self.assertNotEqual(self.drive.commands[-1][0], 9999.0)
         self.assertEqual(self.drive.commands[-1][1], -0.123)
         self.assertEqual(state.steering_angle_rad, -0.123)
-        self.assertEqual(state.commanded_speed_cm_s, TRACK_SPEED_CM_S)
+        self.assertEqual(state.commanded_speed_cm_s, TEST_SPEED_CM_S)
 
     def test_start_does_not_misclassify_completion(self):
         self.assertTrue(self.follower.state.running)
