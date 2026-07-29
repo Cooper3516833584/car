@@ -8,9 +8,33 @@
 - `components/steering_servo.py`：ROCK 5A Pin 23 前轮转向舵机及厂家标定曲线。
 - `components/ackermann_drive.py`：统一设置车速、前轮偏航方向，并可联动后轮差速。
 - `components/sound_light_alarm.py`：ROCK 5A GPIO4_B3 低电平触发声光报警器。
+- `components/battery_voltage_monitor.py`：C10B 串口电池遥测与低压声光报警服务。
 - `components/trusted_navigation_map.py`：可信雷达位姿门限、车体自反射过滤和导航占据图。
 
 `main.py` 通过 `Navigation` 间接使用 `AckermannDrive`；只有维护、标定或特殊控制时才直接访问前后独立组件。
+
+## C10B 电池低压报警
+
+`components/battery_voltage_monitor.py` 以只读方式监听 C10B 的 `/dev/ttyACM0`
+遥测帧，不写入串口、也不清空接收缓冲，因此可与后轮驱动的命令写入并行运行。它按
+厂商 L150 固件的 24 字节 `7B ... BCC 7D` 帧校验数据，并从第 20--21 字节复原电池
+电压。服务每 `2 s` 读取一次（`0.5 Hz`）；连续 5 次严格低于 `11.00 V` 时，GPIO4_B3
+的低电平声光报警器持续开启。任意一次有效读数达到 `11.00 V` 或更高会复位计数并关闭
+报警。
+
+开机服务单元在 `code/test/battery-voltage-monitor.service`。板端安装时先确保
+`sound-light-alarm.service` 已安装，再执行：
+
+```bash
+sudo cp /home/radxa/car/code/test/battery-voltage-monitor.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now battery-voltage-monitor.service
+```
+
+可用 `sudo systemctl status battery-voltage-monitor.service` 与
+`journalctl -u battery-voltage-monitor.service -f` 查看读取结果。厂商源码将“百分伏值
+乘 1000”写入 16 位字段；组件会按该溢出编码反推 `6--18 V` 内唯一值，现场首次启用时
+仍应使用万用表核对一次读数。
 
 ## 后驱电机组件
 

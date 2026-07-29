@@ -40,6 +40,15 @@ from .sound_light_alarm import (
     alarm_on,
     resolve_gpio_number,
 )
+from .battery_voltage_monitor import (
+    BatteryVoltageSample,
+    C10BBatteryVoltageReader,
+    C10BTelemetryError,
+    C10BTelemetryFrame,
+    C10BTelemetryParser,
+    LowBatteryMonitor,
+    decode_stock_c10b_voltage_v,
+)
 from .radar_driver import (
     DEFAULT_D500_PORT,
     D500PacketParser,
@@ -161,6 +170,13 @@ __all__ = [
     "alarm_off",
     "alarm_on",
     "resolve_gpio_number",
+    "BatteryVoltageSample",
+    "C10BBatteryVoltageReader",
+    "C10BTelemetryError",
+    "C10BTelemetryFrame",
+    "C10BTelemetryParser",
+    "LowBatteryMonitor",
+    "decode_stock_c10b_voltage_v",
     "DEFAULT_D500_PORT",
     "D500PacketParser",
     "D500RadarComponent",

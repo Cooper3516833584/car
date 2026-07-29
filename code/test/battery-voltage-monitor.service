@@ -1,0 +1,17 @@
+[Unit]
+Description=C10B battery-voltage low alarm monitor
+Requires=sound-light-alarm.service
+After=sound-light-alarm.service dev-ttyACM0.device
+Wants=dev-ttyACM0.device
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/radxa/car/code
+ExecStart=/usr/bin/python3 -c "from components.battery_voltage_monitor import main; raise SystemExit(main())" --device /dev/ttyACM0 --threshold-v 11.0 --period-s 2.0
+ExecStop=/usr/bin/python3 /home/radxa/car/code/components/sound_light_alarm.py --off
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
