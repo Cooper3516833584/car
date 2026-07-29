@@ -297,3 +297,25 @@ __all__ += [
     "TrackSegment",
     "build_competition_track",
 ]
+
+from .camera_line_follower import (
+    BlackLineDetector,
+    CameraLineFollower,
+    LineControlConfig,
+    LineFollowerState,
+    LineFollowerStatus,
+    LineObservation,
+    LineVisionConfig,
+    PerspectiveConfig,
+)
+
+__all__ += [
+    "BlackLineDetector",
+    "CameraLineFollower",
+    "LineControlConfig",
+    "LineFollowerState",
+    "LineFollowerStatus",
+    "LineObservation",
+    "LineVisionConfig",
+    "PerspectiveConfig",
+]
