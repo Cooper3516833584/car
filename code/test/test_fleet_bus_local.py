@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from components.navigation import NavigationPose, NavigationState
-from main import CompetitionCarApplication
+from main_fixed_track_test import CompetitionCarApplication
 from fleet_bus.command_queue import CarCommandQueue
 from fleet_bus.models import (
     AckStatus,

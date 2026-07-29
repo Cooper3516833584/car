@@ -12,7 +12,7 @@ class ImportSafetyTests(unittest.TestCase):
             "import threading;"
             "before=tuple(t.name for t in threading.enumerate());"
             "import components.competition_track;"
-            "import main;"
+            "import main_fixed_track_test;"
             "after=tuple(t.name for t in threading.enumerate());"
             "assert before == after == ('MainThread',), (before, after)"
         )

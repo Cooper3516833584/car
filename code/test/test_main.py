@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 import unittest
 
-from main import (
+from main_fixed_track_test import (
     CompetitionCarApplication,
     MainConfig,
     RADAR_CENTER_BEHIND_A_ALONG_AB_CM,

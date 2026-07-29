@@ -50,6 +50,42 @@ class TrackSegment(IntEnum):
     DA = 3
 
 
+@dataclass(frozen=True, slots=True)
+class CompetitionTrackSpeedProfile:
+    """Forward speed for each labelled portion of the D-task black loop."""
+
+    ab_cm_s: float
+    bc_cm_s: float
+    cd_cm_s: float
+    da_cm_s: float
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("ab_cm_s", self.ab_cm_s),
+            ("bc_cm_s", self.bc_cm_s),
+            ("cd_cm_s", self.cd_cm_s),
+            ("da_cm_s", self.da_cm_s),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be positive and finite")
+
+    @classmethod
+    def uniform(cls, speed_cm_s: float) -> "CompetitionTrackSpeedProfile":
+        return cls(speed_cm_s, speed_cm_s, speed_cm_s, speed_cm_s)
+
+    @property
+    def max_speed_cm_s(self) -> float:
+        return max(self.ab_cm_s, self.bc_cm_s, self.cd_cm_s, self.da_cm_s)
+
+    def for_segment(self, segment: TrackSegment) -> float:
+        return (
+            self.ab_cm_s,
+            self.bc_cm_s,
+            self.cd_cm_s,
+            self.da_cm_s,
+        )[int(segment)]
+
+
 TRACK_PURSUIT_CONFIG: Final[PurePursuitConfig] = PurePursuitConfig(
     cruise_speed_mm_s=500.0,
     max_speed_mm_s=600.0,
@@ -371,14 +407,19 @@ class CompetitionTrackFollower:
         *,
         drive: AckermannDrive,
         track: CompetitionTrack,
-        speed_cm_s: float,
+        speed_cm_s: float | None = None,
+        speed_profile: CompetitionTrackSpeedProfile | None = None,
         controller: PurePursuitController | None = None,
         on_state_changed: Callable[[TrackFollowerState], None] | None = None,
     ) -> None:
-        if not math.isfinite(speed_cm_s) or speed_cm_s <= 0.0:
-            raise ValueError("speed_cm_s must be positive and finite")
+        if (speed_cm_s is None) == (speed_profile is None):
+            raise ValueError("provide exactly one of speed_cm_s or speed_profile")
         self.drive = drive
-        self.speed_cm_s = float(speed_cm_s)
+        self.speed_profile = (
+            CompetitionTrackSpeedProfile.uniform(float(speed_cm_s))
+            if speed_profile is None
+            else speed_profile
+        )
         self._track = track
         self._controller = controller or PurePursuitController(
             config=TRACK_PURSUIT_CONFIG
@@ -430,7 +471,7 @@ class CompetitionTrackFollower:
                 running=True,
                 segment=TrackSegment.AB,
                 progress_cm=0.0,
-                target_speed_cm_s=self.speed_cm_s,
+                target_speed_cm_s=self.speed_profile.ab_cm_s,
             )
             state = self._state
         self._notify(state)
@@ -493,7 +534,9 @@ class CompetitionTrackFollower:
                         self._progress_index,
                     )
                 else:
-                    target_speed_cm_s = self.speed_cm_s
+                    target_speed_cm_s = self.speed_profile.for_segment(
+                        point.segment
+                    )
                     plan = self.drive.set_motion(
                         target_speed_cm_s * 10.0,
                         command.steering_angle_rad,

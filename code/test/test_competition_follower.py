@@ -4,6 +4,7 @@ import unittest
 from components.competition_track import (
     CompetitionTrack,
     CompetitionTrackFollower,
+    CompetitionTrackSpeedProfile,
     S_FINISH_CM,
     TrackSegment,
 )
@@ -164,6 +165,24 @@ class CompetitionTrackFollowerTests(unittest.TestCase):
         self.assertEqual(self.drive.commands[-1][1], -0.123)
         self.assertEqual(state.steering_angle_rad, -0.123)
         self.assertEqual(state.commanded_speed_cm_s, TEST_SPEED_CM_S)
+
+    def test_segment_profile_changes_speed_without_stopping_at_corners(self):
+        profile = CompetitionTrackSpeedProfile(6.0, 7.0, 8.0, 9.0)
+        follower = CompetitionTrackFollower(
+            drive=self.drive,
+            track=self.track,
+            speed_profile=profile,
+        )
+        follower.start_mission()
+        for index, expected_speed in zip(
+            self.track.segment_start_indices,
+            (6.0, 7.0, 8.0, 9.0),
+        ):
+            follower._progress_index = max(0, index - 1)
+            state = follower.update_from_radar(radar_update(self.track, index))
+            self.assertEqual(state.target_speed_cm_s, expected_speed)
+            self.assertEqual(self.drive.commands[-1][0], expected_speed * 10.0)
+        self.assertEqual(self.drive.stops, 0)
 
     def test_start_does_not_misclassify_completion(self):
         self.assertTrue(self.follower.state.running)

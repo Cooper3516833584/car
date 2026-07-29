@@ -281,6 +281,7 @@ __all__ += [
 from .competition_track import (
     CompetitionTrack,
     CompetitionTrackFollower,
+    CompetitionTrackSpeedProfile,
     FieldTransform,
     TrackFollowerState,
     TrackSegment,
@@ -290,6 +291,7 @@ from .competition_track import (
 __all__ += [
     "CompetitionTrack",
     "CompetitionTrackFollower",
+    "CompetitionTrackSpeedProfile",
     "FieldTransform",
     "TrackFollowerState",
     "TrackSegment",
