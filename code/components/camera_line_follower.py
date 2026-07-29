@@ -142,6 +142,7 @@ class LineVisionConfig:
     clahe_tile_grid: tuple[int, int] = (8, 8)
     adaptive_block_size: int = 31
     adaptive_c: float = 7.0
+    require_adaptive_confirmation: bool = True
     dark_percentile: float = 34.0
     dark_percentile_margin: float = 10.0
     maximum_dark_threshold: int = 175
@@ -153,14 +154,17 @@ class LineVisionConfig:
     scan_far_cm: float = 78.0
     scan_band_height_px: int = 7
     minimum_band_fill_ratio: float = 0.30
+    use_expected_width_window: bool = False
     expected_line_width_cm: float = 5.0
     minimum_line_width_cm: float = 1.5
     maximum_line_width_cm: float = 16.0
+    maximum_line_internal_gap_cm: float = 0.0
     maximum_center_jump_cm: float = 17.0
     minimum_fit_points: int = 5
     fit_outlier_floor_cm: float = 1.5
     fit_outlier_sigma: float = 2.8
     maximum_fit_rmse_cm: float = 5.0
+    polynomial_smoothing_alpha: float = 0.35
 
     # A finish marker is a black line running across the track, perpendicular
     # to the longitudinal guide line.  In the bird's-eye image it therefore
@@ -169,6 +173,8 @@ class LineVisionConfig:
     transverse_stop_max_forward_cm: float = 78.0
     transverse_stop_min_width_cm: float = 45.0
     transverse_stop_min_height_cm: float = 1.2
+    transverse_stop_max_height_cm: float = 10.0
+    round_marker_min_height_cm: float = 12.0
 
     # Candidate association weights. Larger continuity weight makes temporal
     # tracking stronger and rejects unrelated dark objects/shadows.
@@ -199,8 +205,12 @@ class LineVisionConfig:
             <= self.maximum_line_width_cm
         ):
             raise ValueError("line width limits are invalid")
+        if self.maximum_line_internal_gap_cm < 0.0:
+            raise ValueError("maximum_line_internal_gap_cm cannot be negative")
         if self.minimum_fit_points > self.scan_count:
             raise ValueError("minimum_fit_points exceeds scan_count")
+        if not 0.0 < self.polynomial_smoothing_alpha <= 1.0:
+            raise ValueError("polynomial_smoothing_alpha must be in (0, 1]")
         if not (
             0.0 <= self.transverse_stop_min_forward_cm
             < self.transverse_stop_max_forward_cm
@@ -211,6 +221,10 @@ class LineVisionConfig:
             self.transverse_stop_min_width_cm <= 0.0
             or self.transverse_stop_min_width_cm > self.perspective.ground_width_cm
             or self.transverse_stop_min_height_cm <= 0.0
+            or self.transverse_stop_max_height_cm
+            <= self.transverse_stop_min_height_cm
+            or self.round_marker_min_height_cm
+            <= self.transverse_stop_max_height_cm
         ):
             raise ValueError("transverse stop dimensions are invalid")
 
@@ -226,7 +240,9 @@ class LineControlConfig:
     minimum_lookahead_cm: float = 25.0
     maximum_lookahead_cm: float = 48.0
     lookahead_speed_gain_s: float = 0.09
+    lateral_gain: float = 0.35
     heading_gain: float = 0.30
+    curvature_feedforward_gain: float = 1.0
     maximum_abs_steering_rad: float = 0.28
     maximum_steering_rate_rad_s: float = 1.05
     steering_low_pass_time_constant_s: float = 0.10
@@ -245,6 +261,9 @@ class LineControlConfig:
     finish_line_startup_grace_s: float = 1.0
     finish_line_clear_frames_to_arm: int = 3
     finish_line_confirm_frames: int = 2
+    minimum_markers_before_finish: int = 3
+    round_marker_clear_frames_to_arm: int = 3
+    round_marker_confirm_frames: int = 2
 
     def __post_init__(self) -> None:
         if self.wheelbase_cm <= 0.0:
@@ -267,8 +286,12 @@ class LineControlConfig:
         if (
             self.finish_line_clear_frames_to_arm <= 0
             or self.finish_line_confirm_frames <= 0
+            or self.round_marker_clear_frames_to_arm <= 0
+            or self.round_marker_confirm_frames <= 0
         ):
-            raise ValueError("finish-line frame counters must be positive")
+            raise ValueError("track-marker frame counters must be positive")
+        if self.minimum_markers_before_finish < 0:
+            raise ValueError("minimum_markers_before_finish cannot be negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,6 +311,7 @@ class LineObservation:
     polynomial_y_left_by_x: tuple[float, float, float] | None
     dark_threshold: float
     transverse_line_detected: bool = False
+    round_marker_detected: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,6 +329,7 @@ class LineFollowerState:
     observation: LineObservation | None = None
     error: str | None = None
     finish_line_armed: bool = False
+    marker_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,9 +400,11 @@ class BlackLineDetector:
             timestamp_s=timestamp,
             dark_threshold=dark_threshold,
         )
+        transverse, round_marker = self._classify_track_markers(mask)
         observation = replace(
             observation,
-            transverse_line_detected=self._detect_transverse_stop_line(mask),
+            transverse_line_detected=transverse,
+            round_marker_detected=round_marker,
         )
 
         if observation.detected and observation.polynomial_y_left_by_x is not None:
@@ -464,7 +491,11 @@ class BlackLineDetector:
             max(18.0, min(float(otsu_threshold) + 10.0, percentile + self.config.dark_percentile_margin)),
         )
         global_dark = np.where(blurred <= dark_threshold, 255, 0).astype(np.uint8)
-        mask = cv2.bitwise_and(local, global_dark)
+        mask = (
+            cv2.bitwise_and(local, global_dark)
+            if self.config.require_adaptive_confirmation
+            else global_dark
+        )
 
         if self.config.morphology_open_size > 1:
             k = self.config.morphology_open_size
@@ -488,6 +519,9 @@ class BlackLineDetector:
         min_width_px = max(2, round(self.config.minimum_line_width_cm / cm_per_px_x))
         max_width_px = max(min_width_px + 1, round(self.config.maximum_line_width_cm / cm_per_px_x))
         expected_width_px = self.config.expected_line_width_cm / cm_per_px_x
+        max_internal_gap_px = round(
+            self.config.maximum_line_internal_gap_cm / cm_per_px_x
+        )
         max_jump_px = self.config.maximum_center_jump_cm / cm_per_px_x
 
         forward_positions = np.linspace(
@@ -507,13 +541,37 @@ class BlackLineDetector:
             if y0 >= y1:
                 continue
             fill = np.mean(mask[y0:y1] > 0, axis=0)
-            occupied = fill >= self.config.minimum_band_fill_ratio
-            runs = self._true_runs(occupied)
-            candidates: list[tuple[float, int, int, float]] = []
             expected_u = self._expected_u(forward_cm, w)
             if expected_u is None:
-                expected_u = last_selected_u if last_selected_u is not None else (w - 1) / 2.0
+                expected_u = (
+                    last_selected_u
+                    if last_selected_u is not None
+                    else (w - 1) / 2.0
+                )
+            if self.config.use_expected_width_window:
+                centre = self._expected_width_window_center(
+                    fill,
+                    expected_u=expected_u,
+                    expected_width_px=max(3, round(expected_width_px)),
+                    maximum_jump_px=max_jump_px,
+                )
+                if centre is None:
+                    continue
+                last_selected_u = centre
+                y_left_cm = ((w - 1) / 2.0 - centre) * cm_per_px_x
+                points.append((float(forward_cm), float(y_left_cm)))
+                widths_cm.append(self.config.expected_line_width_cm)
+                continue
 
+            occupied = fill >= self.config.minimum_band_fill_ratio
+            runs = self._true_runs(occupied)
+            if max_internal_gap_px > 0:
+                runs = self._merge_nearby_runs(
+                    runs,
+                    maximum_gap_px=max_internal_gap_px,
+                    maximum_width_px=max_width_px,
+                )
+            candidates: list[tuple[float, int, int, float]] = []
             for start, end in runs:
                 width = end - start
                 if width < min_width_px or width > max_width_px:
@@ -542,8 +600,40 @@ class BlackLineDetector:
 
         return points, widths_cm
 
-    def _detect_transverse_stop_line(self, mask: np.ndarray) -> bool:
-        """Return whether a broad black finish line crosses the track view."""
+    def _expected_width_window_center(
+        self,
+        fill: np.ndarray,
+        *,
+        expected_u: float,
+        expected_width_px: int,
+        maximum_jump_px: float,
+    ) -> float | None:
+        """Find the darkest full-width lane window, not one textured edge."""
+
+        width = len(fill)
+        window = min(width - 2, max(3, expected_width_px))
+        density = np.convolve(
+            fill,
+            np.ones(window, dtype=np.float64) / window,
+            mode="same",
+        )
+        centres = np.arange(width, dtype=np.float64)
+        half = window / 2.0
+        valid = (
+            (centres >= half)
+            & (centres < width - half)
+            & (np.abs(centres - expected_u) <= 1.6 * maximum_jump_px)
+            & (density >= self.config.minimum_band_fill_ratio)
+        )
+        if not np.any(valid):
+            return None
+        continuity = np.abs(centres - expected_u) / max(1.0, maximum_jump_px)
+        score = (1.0 - density) + self.config.continuity_weight * continuity
+        score[~valid] = math.inf
+        return float(np.argmin(score))
+
+    def _classify_track_markers(self, mask: np.ndarray) -> tuple[bool, bool]:
+        """Distinguish a thin finish stripe from the large round segment dots."""
 
         perspective = self.config.perspective
         height_px, width_px = mask.shape
@@ -556,35 +646,66 @@ class BlackLineDetector:
             1,
             math.ceil(self.config.transverse_stop_min_height_cm / cm_per_px_y),
         )
-        row_start = max(
+        max_height_px = max(
+            min_height_px,
+            math.floor(self.config.transverse_stop_max_height_cm / cm_per_px_y),
+        )
+        round_height_px = max(
+            max_height_px + 1,
+            math.ceil(self.config.round_marker_min_height_cm / cm_per_px_y),
+        )
+        transverse_row_start = max(
             0,
             math.floor(
                 height_px
                 - self.config.transverse_stop_max_forward_cm / cm_per_px_y
             ),
         )
-        row_end = min(
+        transverse_row_end = min(
             height_px,
             math.ceil(
                 height_px
                 - self.config.transverse_stop_min_forward_cm / cm_per_px_y
             ),
         )
-        if row_end <= row_start:
-            return False
+        if transverse_row_end <= transverse_row_start:
+            return False, False
 
-        # A pixel row can contain a path line or noise too.  Mark it only when
-        # its longest connected dark run is wide enough to span the track.
-        wide_rows = np.zeros(row_end - row_start, dtype=bool)
-        for index, row in enumerate(mask[row_start:row_end]):
+        # A round point can extend into the near 0..10 cm region.  Classify it
+        # over the complete bird view; only the finish stripe uses the narrower
+        # forward range that excludes the vehicle nose.
+        wide_rows = np.zeros(height_px, dtype=bool)
+        for index, row in enumerate(mask):
             for start, end in self._true_runs(row > 0):
                 if end - start >= min_width_px:
                     wide_rows[index] = True
                     break
-        return any(
-            end - start >= min_height_px
-            for start, end in self._true_runs(wide_rows)
+        full_spans = tuple(self._true_runs(wide_rows))
+        round_spans = tuple(
+            (start, end)
+            for start, end in full_spans
+            if end - start >= round_height_px
         )
+        transverse_spans = self._true_runs(
+            wide_rows[transverse_row_start:transverse_row_end]
+        )
+        transverse = False
+        for local_start, local_end in transverse_spans:
+            start = local_start + transverse_row_start
+            end = local_end + transverse_row_start
+            height = end - start
+            overlaps_round = any(
+                start < round_end and end > round_start
+                for round_start, round_end in round_spans
+            )
+            if (
+                min_height_px <= height <= max_height_px
+                and not overlaps_round
+            ):
+                transverse = True
+                break
+        round_marker = bool(round_spans)
+        return transverse, round_marker
 
     @staticmethod
     def _true_runs(values: np.ndarray) -> list[tuple[int, int]]:
@@ -593,6 +714,29 @@ class BlackLineDetector:
         starts = np.flatnonzero(transitions == 1)
         ends = np.flatnonzero(transitions == -1)
         return [(int(a), int(b)) for a, b in zip(starts, ends)]
+
+    @staticmethod
+    def _merge_nearby_runs(
+        runs: Sequence[tuple[int, int]],
+        *,
+        maximum_gap_px: int,
+        maximum_width_px: int,
+    ) -> list[tuple[int, int]]:
+        if not runs:
+            return []
+        merged: list[tuple[int, int]] = []
+        start, end = runs[0]
+        for next_start, next_end in runs[1:]:
+            if (
+                next_start - end <= maximum_gap_px
+                and next_end - start <= maximum_width_px
+            ):
+                end = next_end
+            else:
+                merged.append((start, end))
+                start, end = next_start, next_end
+        merged.append((start, end))
+        return merged
 
     def _expected_u(self, forward_cm: float, width_px: int) -> float | None:
         if self._previous_polynomial is None:
@@ -655,6 +799,12 @@ class BlackLineDetector:
                 dark_threshold=dark_threshold,
             )
 
+        if self._previous_polynomial is not None:
+            alpha = self.config.polynomial_smoothing_alpha
+            polynomial = (
+                alpha * polynomial
+                + (1.0 - alpha) * self._previous_polynomial
+            )
         x_kept = x[keep]
         y_kept = y[keep]
         residual = y_kept - np.polyval(polynomial, x_kept)
@@ -821,6 +971,7 @@ class CameraLineFollower:
         control_config: LineControlConfig = LineControlConfig(),
         detector: BlackLineDetector | None = None,
         on_state_changed: Callable[[LineFollowerState], None] | None = None,
+        on_marker_passed: Callable[[int], None] | None = None,
         on_debug_frame: Callable[[np.ndarray, LineObservation], None] | None = None,
         debug_frame_interval: int = 3,
     ) -> None:
@@ -832,6 +983,7 @@ class CameraLineFollower:
         self.control_config = control_config
         self.detector = detector or BlackLineDetector(vision_config)
         self._on_state_changed = on_state_changed
+        self._on_marker_passed = on_marker_passed
         self._on_debug_frame = on_debug_frame
         self._debug_frame_interval = debug_frame_interval
 
@@ -849,6 +1001,11 @@ class CameraLineFollower:
         self._finish_line_armed = False
         self._finish_line_clear_frames = 0
         self._finish_line_confirm_frames = 0
+        self._round_marker_armed = False
+        self._round_marker_clear_frames = 0
+        self._round_marker_confirm_frames = 0
+        self._marker_count = 0
+        self._active_cruise_speed_mm_s = control_config.cruise_speed_mm_s
 
     @property
     def state(self) -> LineFollowerState:
@@ -859,6 +1016,12 @@ class CameraLineFollower:
     def is_running(self) -> bool:
         thread = self._thread
         return thread is not None and thread.is_alive()
+
+    def set_cruise_speed_mm_s(self, speed_mm_s: float) -> None:
+        speed = float(speed_mm_s)
+        if not math.isfinite(speed) or speed <= 0.0:
+            raise ValueError("speed_mm_s must be positive and finite")
+        self._active_cruise_speed_mm_s = speed
 
     def start(self) -> "CameraLineFollower":
         self.detector._require_opencv()
@@ -874,6 +1037,13 @@ class CameraLineFollower:
             self._finish_line_armed = False
             self._finish_line_clear_frames = 0
             self._finish_line_confirm_frames = 0
+            self._round_marker_armed = False
+            self._round_marker_clear_frames = 0
+            self._round_marker_confirm_frames = 0
+            self._marker_count = 0
+            self._active_cruise_speed_mm_s = (
+                self.control_config.cruise_speed_mm_s
+            )
             self._state = replace(
                 self._state,
                 status=LineFollowerStatus.STARTING,
@@ -975,7 +1145,9 @@ class CameraLineFollower:
             if degraded or self._good_frames < self.control_config.recovery_good_frames:
                 return _ControlCommand(
                     True,
-                    self.control_config.degraded_speed_mm_s,
+                    self._scaled_speed(
+                        self.control_config.degraded_speed_mm_s
+                    ),
                     steering,
                     LineFollowerStatus.DEGRADED,
                 )
@@ -984,7 +1156,9 @@ class CameraLineFollower:
             steering = self._filter_steering(self._last_steering * 0.82, dt)
             return _ControlCommand(
                 True,
-                self.control_config.short_loss_speed_mm_s,
+                self._scaled_speed(
+                    self.control_config.short_loss_speed_mm_s
+                ),
                 steering,
                 LineFollowerStatus.DEGRADED,
             )
@@ -992,7 +1166,12 @@ class CameraLineFollower:
         return _ControlCommand(False, 0.0, 0.0, LineFollowerStatus.LOST)
 
     def _steering_from_observation(self, observation: LineObservation) -> float:
-        speed = max(self.control_config.minimum_tracking_speed_mm_s, self.control_config.cruise_speed_mm_s)
+        speed = max(
+            self._scaled_speed(
+                self.control_config.minimum_tracking_speed_mm_s
+            ),
+            self._active_cruise_speed_mm_s,
+        )
         lookahead = float(
             np.clip(
                 self.control_config.minimum_lookahead_cm
@@ -1001,23 +1180,22 @@ class CameraLineFollower:
                 self.control_config.maximum_lookahead_cm,
             )
         )
-        if observation.polynomial_y_left_by_x is not None:
-            polynomial = np.asarray(observation.polynomial_y_left_by_x)
-            target_x = min(
-                self.vision_config.scan_far_cm,
-                max(self.vision_config.scan_near_cm, lookahead),
+        curvature_feedforward = (
+            self.control_config.curvature_feedforward_gain
+            * math.atan(
+                self.control_config.wheelbase_cm
+                * observation.curvature_per_cm
             )
-            target_y = float(np.polyval(polynomial, target_x))
-            derivative = float(2.0 * polynomial[0] * target_x + polynomial[1])
-            heading = math.atan(derivative)
-        else:
-            target_x = max(1.0, observation.lookahead_x_cm)
-            target_y = observation.lookahead_y_left_cm
-            heading = observation.heading_error_rad
-        distance_sq = max(1.0, target_x * target_x + target_y * target_y)
-        curvature = 2.0 * target_y / distance_sq
-        pure_pursuit = math.atan(self.control_config.wheelbase_cm * curvature)
-        raw = pure_pursuit + self.control_config.heading_gain * heading
+        )
+        lateral_feedback = self.control_config.lateral_gain * math.atan2(
+            observation.near_lateral_error_cm,
+            max(1.0, lookahead),
+        )
+        heading_feedback = (
+            self.control_config.heading_gain
+            * observation.heading_error_rad
+        )
+        raw = curvature_feedforward + lateral_feedback + heading_feedback
         raw = float(
             np.clip(
                 raw,
@@ -1041,14 +1219,25 @@ class CameraLineFollower:
             / max(1e-6, self.control_config.maximum_abs_steering_rad)
         )
         confidence_scale = 0.70 + 0.30 * observation.confidence
+        minimum_speed = self._scaled_speed(
+            self.control_config.minimum_tracking_speed_mm_s
+        )
         return float(
             np.clip(
-                self.control_config.cruise_speed_mm_s
+                self._active_cruise_speed_mm_s
                 * steering_scale
                 * confidence_scale,
-                self.control_config.minimum_tracking_speed_mm_s,
-                self.control_config.cruise_speed_mm_s,
+                minimum_speed,
+                self._active_cruise_speed_mm_s,
             )
+        )
+
+    def _scaled_speed(self, configured_speed_mm_s: float) -> float:
+        base = max(1e-6, self.control_config.cruise_speed_mm_s)
+        return (
+            float(configured_speed_mm_s)
+            * self._active_cruise_speed_mm_s
+            / base
         )
 
     def _filter_steering(self, requested: float, dt: float) -> float:
@@ -1122,6 +1311,7 @@ class CameraLineFollower:
                 else:
                     observation = result  # type: ignore[assignment]
 
+                self._update_round_marker(observation, now)
                 if self._finish_line_reached(observation, now):
                     self._safe_stop_drive()
                     self._publish_state(
@@ -1137,6 +1327,7 @@ class CameraLineFollower:
                         capture_failures=0,
                         observation=observation,
                         finish_line_armed=True,
+                        marker_count=self._marker_count,
                         error=None,
                     )
                     LOG.info("transverse finish line confirmed; vehicle stopped")
@@ -1166,6 +1357,7 @@ class CameraLineFollower:
                     capture_failures=0,
                     observation=observation,
                     finish_line_armed=self._finish_line_armed,
+                    marker_count=self._marker_count,
                     error=None,
                 )
         except BaseException as exc:
@@ -1232,7 +1424,6 @@ class CameraLineFollower:
             or now_s - started_at < config.finish_line_startup_grace_s
         ):
             return False
-
         visible = observation.transverse_line_detected
         if not self._finish_line_armed:
             if visible:
@@ -1249,6 +1440,14 @@ class CameraLineFollower:
                     )
             return False
 
+        # After B, C, and D have been counted, the next debounced round marker
+        # is necessarily A on this one-lap closed track.  This is a fallback
+        # when the extra A transverse stripe is partly hidden by the low camera.
+        if self._marker_count >= 4:
+            return True
+        if self._marker_count < config.minimum_markers_before_finish:
+            self._finish_line_confirm_frames = 0
+            return False
         if visible:
             self._finish_line_confirm_frames += 1
         else:
@@ -1257,6 +1456,57 @@ class CameraLineFollower:
             self._finish_line_confirm_frames
             >= config.finish_line_confirm_frames
         )
+
+    def _update_round_marker(
+        self,
+        observation: LineObservation,
+        now_s: float,
+    ) -> None:
+        """Count each large endpoint dot once, ignoring the startup A dot."""
+
+        config = self.control_config
+        started_at = self._run_started_at_s
+        if (
+            started_at is None
+            or now_s - started_at < config.finish_line_startup_grace_s
+        ):
+            return
+
+        visible = observation.round_marker_detected
+        if not self._round_marker_armed:
+            if visible:
+                self._round_marker_clear_frames = 0
+            else:
+                self._round_marker_clear_frames += 1
+                if (
+                    self._round_marker_clear_frames
+                    >= config.round_marker_clear_frames_to_arm
+                ):
+                    self._round_marker_armed = True
+                    LOG.info("round track-marker detector armed")
+            return
+
+        if not visible:
+            self._round_marker_confirm_frames = 0
+            return
+        self._round_marker_confirm_frames += 1
+        if (
+            self._round_marker_confirm_frames
+            < config.round_marker_confirm_frames
+        ):
+            return
+
+        self._marker_count += 1
+        marker_count = self._marker_count
+        self._round_marker_armed = False
+        self._round_marker_clear_frames = 0
+        self._round_marker_confirm_frames = 0
+        LOG.info("round track marker passed count=%d", marker_count)
+        if self._on_marker_passed is not None:
+            try:
+                self._on_marker_passed(marker_count)
+            except Exception:
+                LOG.exception("track-marker callback failed")
 
     def _safe_stop_drive(self) -> None:
         if self._drive_stopped:

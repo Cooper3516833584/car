@@ -110,6 +110,20 @@ class DetectorTests(unittest.TestCase):
         cv2.rectangle(image, (20, 190), (300, 210), (20, 20, 20), -1)
         result = self.detector.process(image, timestamp_s=1.0)
         self.assertTrue(result.transverse_line_detected)
+        self.assertFalse(result.round_marker_detected)
+
+    def test_large_round_track_dot_is_not_a_finish_line(self):
+        rows, columns = np.ogrid[:400, :320]
+        mask = np.zeros((400, 320), dtype=np.uint8)
+        ellipse = (
+            ((columns - 160.0) / 125.0) ** 2
+            + ((rows - 330.0) / 75.0) ** 2
+            <= 1.0
+        )
+        mask[ellipse] = 255
+        transverse, round_marker = self.detector._classify_track_markers(mask)
+        self.assertFalse(transverse)
+        self.assertTrue(round_marker)
 
     def test_curve_polynomial_has_expected_sign(self):
         result = self.detector.process(self.synthetic_frame(curve=0.002), timestamp_s=1.0)
@@ -156,6 +170,7 @@ class ControllerTests(unittest.TestCase):
                 finish_line_startup_grace_s=0.0,
                 finish_line_clear_frames_to_arm=2,
                 finish_line_confirm_frames=2,
+                minimum_markers_before_finish=0,
             ),
         )
         follower._run_started_at_s = 0.0
@@ -168,6 +183,38 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(follower._finish_line_armed)
         self.assertFalse(follower._finish_line_reached(marker, 1.3))
         self.assertTrue(follower._finish_line_reached(marker, 1.4))
+
+    def test_round_marker_counts_once_after_startup_dot_clears(self):
+        counts = []
+        follower = CameraLineFollower(
+            drive=self.drive,
+            control_config=LineControlConfig(
+                finish_line_startup_grace_s=0.0,
+                round_marker_clear_frames_to_arm=2,
+                round_marker_confirm_frames=2,
+            ),
+            on_marker_passed=counts.append,
+        )
+        follower._run_started_at_s = 0.0
+        dot = replace(observation(), round_marker_detected=True)
+        clear = observation()
+
+        follower._update_round_marker(dot, 1.0)
+        follower._update_round_marker(clear, 1.1)
+        follower._update_round_marker(clear, 1.2)
+        follower._update_round_marker(dot, 1.3)
+        follower._update_round_marker(dot, 1.4)
+        follower._update_round_marker(dot, 1.5)
+        self.assertEqual(counts, [1])
+        self.assertEqual(follower._marker_count, 1)
+
+    def test_fourth_round_marker_is_a_finish_fallback_at_a(self):
+        self.follower._run_started_at_s = 0.0
+        self.follower._finish_line_armed = True
+        self.follower._marker_count = 4
+        self.assertTrue(
+            self.follower._finish_line_reached(observation(), 2.0)
+        )
 
     def test_steering_rate_is_limited(self):
         first = self.follower.compute_command(observation(y_left=20.0), now_s=10.0)

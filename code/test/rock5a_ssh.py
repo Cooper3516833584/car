@@ -27,6 +27,12 @@ def main() -> int:
         metavar=("LOCAL_FILE", "REMOTE_FILE"),
         help="copy one local file to the ROCK 5A before running the command",
     )
+    parser.add_argument(
+        "--download",
+        nargs=2,
+        metavar=("REMOTE_FILE", "LOCAL_FILE"),
+        help="copy one file from the ROCK 5A before running the command",
+    )
     args = parser.parse_args()
 
     password = os.environ.get("ROCK5A_PASSWORD")
@@ -49,6 +55,13 @@ def main() -> int:
             sftp = client.open_sftp()
             try:
                 sftp.put(local_file, remote_file)
+            finally:
+                sftp.close()
+        if args.download:
+            remote_file, local_file = args.download
+            sftp = client.open_sftp()
+            try:
+                sftp.get(remote_file, local_file)
             finally:
                 sftp.close()
 
