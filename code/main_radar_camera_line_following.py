@@ -26,7 +26,9 @@ from components import (
     AckermannDrive,
     CompetitionTrack,
     CompetitionTrackFollower,
+    CompetitionTrackSpeedProfile,
     DEFAULT_D500_PORT,
+    DEFAULT_HC14_PORT,
     D500RadarComponent,
     LineVisionConfig,
     PerspectiveConfig,
@@ -35,6 +37,7 @@ from components import (
     RadarMount,
     RadarScan,
     RectangleFieldCalibrator,
+    SerialCommunicationDriver,
     TrackFollowerState,
     TrackSegment,
     WallFusionConfig,
@@ -46,6 +49,14 @@ from components.camera_line_correction import (
     CameraLineCorrectionState,
     CameraLineSteeringCorrector,
 )
+from components.fleet_car_node import FleetCarNode
+from components.fleet_models import (
+    AckReason as FleetAckReason,
+    AckStatus as FleetAckStatus,
+    CarFleetState,
+    CommandResult as FleetCommandResult,
+    NodeFlags as FleetNodeFlags,
+)
 from components.navigation import (
     NavigationPose,
     NavigationState,
@@ -53,8 +64,17 @@ from components.navigation import (
 )
 
 
-# Radar fixed-track speed. Change this one value for the next real-car run.
-TRACK_SPEED_CM_S = 30.0
+# Fixed-track segment speeds. Change these four values for the next real-car
+# run; the stable steering/camera parameters below are not changed.
+AB_TRACK_SPEED_CM_S = 30.0
+BC_TRACK_SPEED_CM_S = 30.0
+CD_TRACK_SPEED_CM_S = 30.0
+DA_TRACK_SPEED_CM_S = 30.0
+
+# FleetBus position reports are replies to the read-only ground-station POLL.
+# Coordinates are centimetres relative to this run's radar-rebased start pose.
+FLEET_POSITION_REPORTING_ENABLED = True
+FLEET_POSITION_STALE_TIMEOUT_S = 0.5
 
 # At startup the car faces AB with its front reference at A. The radar centre
 # is this far behind A; after driving forward this distance, it passes A.
@@ -197,7 +217,10 @@ class MainConfig:
     radar_center_behind_a_cm: float = (
         RADAR_CENTER_BEHIND_A_ALONG_AB_CM
     )
-    speed_cm_s: float = TRACK_SPEED_CM_S
+    ab_speed_cm_s: float = AB_TRACK_SPEED_CM_S
+    bc_speed_cm_s: float = BC_TRACK_SPEED_CM_S
+    cd_speed_cm_s: float = CD_TRACK_SPEED_CM_S
+    da_speed_cm_s: float = DA_TRACK_SPEED_CM_S
     camera_source: int | str = 0
     camera_correction_enabled: bool = CAMERA_CORRECTION_ENABLED
     camera_correction: CameraLineCorrectionConfig = (
@@ -209,6 +232,11 @@ class MainConfig:
             ),
         )
     )
+    fleet_position_reporting_enabled: bool = (
+        FLEET_POSITION_REPORTING_ENABLED
+    )
+    fleet_link_port: str = DEFAULT_HC14_PORT
+    fleet_position_only: bool = False
 
     def __post_init__(self) -> None:
         if self.startup_scan_count <= 0:
@@ -217,12 +245,36 @@ class MainConfig:
             raise ValueError("calibration_timeout_s must be positive")
         if self.radar_center_behind_a_cm < 0.0:
             raise ValueError("radar_center_behind_a_cm cannot be negative")
-        if self.speed_cm_s <= 0.0:
-            raise ValueError("speed_cm_s must be positive")
+        for name, value in (
+            ("ab_speed_cm_s", self.ab_speed_cm_s),
+            ("bc_speed_cm_s", self.bc_speed_cm_s),
+            ("cd_speed_cm_s", self.cd_speed_cm_s),
+            ("da_speed_cm_s", self.da_speed_cm_s),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be positive and finite")
         if isinstance(self.camera_source, int) and self.camera_source < 0:
             raise ValueError("camera_source cannot be negative")
         if isinstance(self.camera_source, str) and not self.camera_source:
             raise ValueError("camera_source cannot be empty")
+        if not self.fleet_link_port:
+            raise ValueError("fleet_link_port cannot be empty")
+        if (
+            self.fleet_position_only
+            and not self.fleet_position_reporting_enabled
+        ):
+            raise ValueError(
+                "fleet_position_only requires FleetBus position reporting"
+            )
+
+    @property
+    def speed_profile(self) -> CompetitionTrackSpeedProfile:
+        return CompetitionTrackSpeedProfile(
+            self.ab_speed_cm_s,
+            self.bc_speed_cm_s,
+            self.cd_speed_cm_s,
+            self.da_speed_cm_s,
+        )
 
 @dataclass(frozen=True, slots=True)
 class CarRuntimeSnapshot:
@@ -234,7 +286,7 @@ class CarRuntimeSnapshot:
     navigation_state: NavigationState
     localization_degraded: bool
     error_code: int
-    localization_timeout_s: float = 0.5
+    localization_timeout_s: float = FLEET_POSITION_STALE_TIMEOUT_S
 
 
 class _CameraCorrectedDrive:
@@ -283,8 +335,13 @@ class RadarCameraLineApplication:
         self._fleet_error_code = 0
         self._closed = False
         self._last_camera_error: str | None = None
+        self._started_at = time.monotonic()
+        self._calibrating = False
 
-        max_wheel_speed_mm_s = max(300.0, config.speed_cm_s * 12.0)
+        max_wheel_speed_mm_s = max(
+            300.0,
+            config.speed_profile.max_speed_cm_s * 12.0,
+        )
         self.drive = AckermannDrive(
             max_wheel_speed_mm_s=max_wheel_speed_mm_s,
         )
@@ -307,7 +364,7 @@ class RadarCameraLineApplication:
         self.follower = CompetitionTrackFollower(
             drive=self._corrected_drive,
             track=self.track,
-            speed_cm_s=config.speed_cm_s,
+            speed_profile=config.speed_profile,
             on_state_changed=self._on_follower_state,
         )
         self._follower_state = self.follower.state
@@ -327,6 +384,32 @@ class RadarCameraLineApplication:
                 error,
             ),
         )
+        self.fleet_link = None
+        self.fleet_node = None
+        if config.fleet_position_reporting_enabled:
+            self.fleet_link = SerialCommunicationDriver(
+                port=config.fleet_link_port,
+                on_bytes=self._on_fleet_frame,
+                on_connected=lambda: LOG.info(
+                    "FleetBus HC-14 connected on %s",
+                    config.fleet_link_port,
+                ),
+                on_disconnected=lambda error: LOG.warning(
+                    "FleetBus HC-14 disconnected: %s",
+                    error,
+                ),
+                on_callback_error=lambda error: LOG.error(
+                    "FleetBus HC-14 callback failed: %s",
+                    error,
+                ),
+            )
+            self.fleet_node = FleetCarNode(
+                writer=self._send_fleet_frame,
+                state_provider=self._fleet_state,
+                on_set_coordinate_frame=self._fleet_unsupported,
+                on_navigate=self._fleet_unsupported,
+                on_stop=self._fleet_stop,
+            )
 
     @property
     def ready(self) -> bool:
@@ -391,7 +474,29 @@ class RadarCameraLineApplication:
             "vehicle must remain stationary at A during D500 calibration"
         )
         try:
+            if self.fleet_node is not None and self.fleet_link is not None:
+                self.fleet_node.start()
+                self.fleet_link.start()
+                LOG.info(
+                    "FleetBus relative-position reporting enabled; "
+                    "commands other than targeted stop are rejected"
+                )
+            with self._lock:
+                self._calibrating = True
             self._calibrate_radar()
+            with self._lock:
+                self._calibrating = False
+                self._ready = True
+            if self.config.fleet_position_only:
+                self.radar.set_motion_hint(False)
+                self.radar.start()
+                LOG.info(
+                    "FleetBus position-only mode active; drive and camera "
+                    "remain closed and the vehicle must stay stationary"
+                )
+                while not self._stop_event.wait(0.5):
+                    pass
+                return
             if self.config.camera_correction_enabled:
                 try:
                     self.camera_corrector.start()
@@ -415,13 +520,15 @@ class RadarCameraLineApplication:
             self.drive.start()
             self.follower.start_mission()
             self.radar.set_motion_hint(True)
-            with self._lock:
-                self._ready = True
             self.radar.start()
             LOG.info(
-                "one-lap radar+camera tracking started speed_cm_s=%.1f "
+                "one-lap radar+camera tracking started "
+                "speeds_cm_s=AB:%.1f,BC:%.1f,CD:%.1f,DA:%.1f "
                 "radar_center_behind_a_cm=%.1f",
-                self.config.speed_cm_s,
+                self.config.ab_speed_cm_s,
+                self.config.bc_speed_cm_s,
+                self.config.cd_speed_cm_s,
+                self.config.da_speed_cm_s,
                 self.config.radar_center_behind_a_cm,
             )
             while (
@@ -430,7 +537,92 @@ class RadarCameraLineApplication:
             ):
                 pass
         finally:
+            with self._lock:
+                self._calibrating = False
             self.close()
+
+    def _on_fleet_frame(self, frame: bytes) -> None:
+        if self.fleet_node is not None:
+            self.fleet_node.feed_frame(frame)
+
+    def _send_fleet_frame(self, frame: bytes) -> None:
+        link = self.fleet_link
+        if link is None:
+            return
+        try:
+            link.write(frame)
+        except Exception as exc:
+            LOG.warning("FleetBus position reply could not be sent: %s", exc)
+
+    def _fleet_state(self) -> CarFleetState:
+        now = time.monotonic()
+        with self._lock:
+            ready = self._ready
+            calibrating = self._calibrating
+            map_ready = self._map_ready
+            degraded = self._localization_degraded
+            pose = self._latest_navigation_pose
+            follower_state = self._follower_state
+            error_code = self._fleet_error_code
+        pose_fresh = (
+            pose is not None
+            and now - pose.timestamp_s
+            <= FLEET_POSITION_STALE_TIMEOUT_S
+        )
+        pose_valid = ready and pose_fresh
+        flags = 0
+        if pose_valid:
+            flags |= int(FleetNodeFlags.POSE_VALID)
+        if ready:
+            flags |= int(FleetNodeFlags.READY)
+        if map_ready:
+            flags |= int(FleetNodeFlags.MAP_READY)
+        if follower_state.running:
+            flags |= int(
+                FleetNodeFlags.BUSY
+                | FleetNodeFlags.ARMED_OR_MOTOR_ACTIVE
+            )
+        if ready and (degraded or not pose_valid):
+            flags |= int(FleetNodeFlags.LOCALIZATION_DEGRADED)
+
+        if pose is None:
+            x_cm = y_cm = heading_cdeg = 0
+        else:
+            x_cm = round(pose.x_cm)
+            y_cm = round(pose.y_cm)
+            heading_cdeg = round(pose.heading_deg * 100.0) % 36000
+        if follower_state.completed:
+            operation_state = 7
+        elif follower_state.running:
+            operation_state = 4
+        elif ready:
+            operation_state = 2
+        elif calibrating:
+            operation_state = 1
+        else:
+            operation_state = 0
+        return CarFleetState(
+            flags,
+            round((now - self._started_at) * 1000.0) & 0xFFFFFFFF,
+            x_cm,
+            y_cm,
+            heading_cdeg,
+            operation_state=operation_state,
+            pose_quality=4 if pose_valid else (2 if pose is not None else 0),
+            error_code=error_code,
+        )
+
+    @staticmethod
+    def _fleet_unsupported(*_args) -> FleetCommandResult:
+        return FleetCommandResult(
+            FleetAckStatus.REJECTED,
+            FleetAckReason.UNSUPPORTED,
+            "fixed-track position-reporting entry is read-only",
+        )
+
+    def _fleet_stop(self) -> FleetCommandResult:
+        self.request_stop()
+        return FleetCommandResult(FleetAckStatus.COMPLETED)
 
     def _calibrate_radar(self) -> None:
         with self._lock:
@@ -770,6 +962,11 @@ class RadarCameraLineApplication:
             self._closed = True
             self._ready = False
             self._map_ready = False
+            self._calibrating = False
+        if self.fleet_node is not None:
+            self.fleet_node.close()
+        if self.fleet_link is not None:
+            self.fleet_link.close()
         self.camera_corrector.close()
         self.follower.stop_mission()
         self.radar.set_motion_hint(False)
@@ -791,16 +988,26 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=float,
         default=RADAR_CENTER_BEHIND_A_ALONG_AB_CM,
     )
-    parser.add_argument(
-        "--speed-cm-s",
-        type=float,
-        default=TRACK_SPEED_CM_S,
-    )
+    parser.add_argument("--ab-speed-cm-s", type=float, default=AB_TRACK_SPEED_CM_S)
+    parser.add_argument("--bc-speed-cm-s", type=float, default=BC_TRACK_SPEED_CM_S)
+    parser.add_argument("--cd-speed-cm-s", type=float, default=CD_TRACK_SPEED_CM_S)
+    parser.add_argument("--da-speed-cm-s", type=float, default=DA_TRACK_SPEED_CM_S)
     parser.add_argument("--camera", type=_camera_source, default=0)
     parser.add_argument(
         "--no-camera-correction",
         action="store_true",
         help="run the copied fixed-track program in radar-only mode",
+    )
+    parser.add_argument("--fleet-link-port", default=DEFAULT_HC14_PORT)
+    parser.add_argument(
+        "--no-fleet-position",
+        action="store_true",
+        help="disable read-only FleetBus relative-position reports",
+    )
+    parser.add_argument(
+        "--fleet-position-only",
+        action="store_true",
+        help="calibrate and report pose without opening drive/camera outputs",
     )
     parser.add_argument(
         "--log-level",
@@ -838,12 +1045,20 @@ def main(argv: list[str] | None = None) -> int:
                 startup_scan_count=args.startup_scans,
                 calibration_timeout_s=args.calibration_timeout,
                 radar_center_behind_a_cm=args.radar_center_behind_a_cm,
-                speed_cm_s=args.speed_cm_s,
+                ab_speed_cm_s=args.ab_speed_cm_s,
+                bc_speed_cm_s=args.bc_speed_cm_s,
+                cd_speed_cm_s=args.cd_speed_cm_s,
+                da_speed_cm_s=args.da_speed_cm_s,
                 camera_source=args.camera,
                 camera_correction_enabled=(
                     not args.no_camera_correction
                 ),
                 camera_correction=_default_correction_config(),
+                fleet_position_reporting_enabled=(
+                    not args.no_fleet_position
+                ),
+                fleet_link_port=args.fleet_link_port,
+                fleet_position_only=args.fleet_position_only,
             )
         )
 

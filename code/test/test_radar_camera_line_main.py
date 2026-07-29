@@ -6,7 +6,14 @@ import time
 from components.camera_line_correction import CameraLineCorrectionConfig
 from components.camera_line_follower import LineObservation
 from components.competition_track import TrackFollowerState, TrackSegment
+from components.fleet_models import (
+    AckReason,
+    AckStatus,
+    NodeFlags,
+)
+from components.navigation import NavigationPose
 from main_radar_camera_line_following import (
+    AB_TRACK_SPEED_CM_S,
     AB_START_ALIGNMENT_FADE_END_PROGRESS_CM,
     AB_START_ALIGNMENT_FULL_END_PROGRESS_CM,
     AB_START_HEADING_GAIN,
@@ -19,11 +26,14 @@ from main_radar_camera_line_following import (
     CAMERA_LATERAL_DEADBAND_CM,
     CAMERA_MAX_STEERING_CORRECTION_RAD,
     CAMERA_STEERING_GAIN_RAD_PER_CM,
+    BC_TRACK_SPEED_CM_S,
+    CD_TRACK_SPEED_CM_S,
+    DA_TRACK_SPEED_CM_S,
     FINAL_DA_MIN_LEFT_CORRECTION_RAD,
     FINAL_DA_TRIM_FULL_PROGRESS_CM,
     FINAL_DA_TRIM_START_PROGRESS_CM,
+    FLEET_POSITION_REPORTING_ENABLED,
     RADAR_CENTER_BEHIND_A_ALONG_AB_CM,
-    TRACK_SPEED_CM_S,
     MainConfig,
     RadarCameraLineApplication,
     _CameraCorrectedDrive,
@@ -62,7 +72,11 @@ class RadarCameraLineMainTests(unittest.TestCase):
     def test_editable_defaults_match_radar_fixed_track_entry(self):
         config = MainConfig()
 
-        self.assertEqual(TRACK_SPEED_CM_S, 30.0)
+        self.assertEqual(AB_TRACK_SPEED_CM_S, 30.0)
+        self.assertEqual(BC_TRACK_SPEED_CM_S, 30.0)
+        self.assertEqual(CD_TRACK_SPEED_CM_S, 30.0)
+        self.assertEqual(DA_TRACK_SPEED_CM_S, 30.0)
+        self.assertTrue(FLEET_POSITION_REPORTING_ENABLED)
         self.assertEqual(RADAR_CENTER_BEHIND_A_ALONG_AB_CM, 20.0)
         self.assertTrue(CAMERA_CORRECTION_ENABLED)
         self.assertEqual(CAMERA_LATERAL_DEADBAND_CM, 10.0)
@@ -82,7 +96,15 @@ class RadarCameraLineMainTests(unittest.TestCase):
         self.assertEqual(FINAL_DA_TRIM_START_PROGRESS_CM, 725.0)
         self.assertEqual(FINAL_DA_TRIM_FULL_PROGRESS_CM, 740.0)
         self.assertEqual(FINAL_DA_MIN_LEFT_CORRECTION_RAD, 0.100)
-        self.assertEqual(config.speed_cm_s, 30.0)
+        self.assertEqual(
+            (
+                config.speed_profile.ab_cm_s,
+                config.speed_profile.bc_cm_s,
+                config.speed_profile.cd_cm_s,
+                config.speed_profile.da_cm_s,
+            ),
+            (30.0, 30.0, 30.0, 30.0),
+        )
         self.assertEqual(config.radar_center_behind_a_cm, 20.0)
 
     def test_final_da_trim_is_smooth_and_limited_to_lap_end(self):
@@ -346,14 +368,25 @@ class RadarCameraLineMainTests(unittest.TestCase):
             startup_scan_count=5,
             calibration_timeout_s=12.0,
             radar_center_behind_a_cm=7.0,
-            speed_cm_s=18.0,
+            ab_speed_cm_s=18.0,
+            bc_speed_cm_s=19.0,
+            cd_speed_cm_s=20.0,
+            da_speed_cm_s=21.0,
         )
 
         self.assertEqual(config.radar_port, "/dev/test-radar")
         self.assertEqual(config.startup_scan_count, 5)
         self.assertEqual(config.calibration_timeout_s, 12.0)
         self.assertEqual(config.radar_center_behind_a_cm, 7.0)
-        self.assertEqual(config.speed_cm_s, 18.0)
+        self.assertEqual(
+            (
+                config.speed_profile.ab_cm_s,
+                config.speed_profile.bc_cm_s,
+                config.speed_profile.cd_cm_s,
+                config.speed_profile.da_cm_s,
+            ),
+            (18.0, 19.0, 20.0, 21.0),
+        )
         self.assertEqual(RadarCameraLineApplication.__bases__, (object,))
 
     def test_camera_and_radar_arguments_are_parsed(self):
@@ -361,18 +394,34 @@ class RadarCameraLineMainTests(unittest.TestCase):
             [
                 "--camera",
                 "/dev/video2",
-                "--speed-cm-s",
-                "35",
+                "--ab-speed-cm-s",
+                "31",
+                "--bc-speed-cm-s",
+                "32",
+                "--cd-speed-cm-s",
+                "33",
+                "--da-speed-cm-s",
+                "34",
                 "--radar-center-behind-a-cm",
                 "4",
                 "--no-camera-correction",
+                "--fleet-position-only",
             ]
         )
 
         self.assertEqual(args.camera, "/dev/video2")
-        self.assertEqual(args.speed_cm_s, 35.0)
+        self.assertEqual(
+            (
+                args.ab_speed_cm_s,
+                args.bc_speed_cm_s,
+                args.cd_speed_cm_s,
+                args.da_speed_cm_s,
+            ),
+            (31.0, 32.0, 33.0, 34.0),
+        )
         self.assertEqual(args.radar_center_behind_a_cm, 4.0)
         self.assertTrue(args.no_camera_correction)
+        self.assertTrue(args.fleet_position_only)
 
     def test_current_front_camera_profile_is_retained(self):
         profile = RadarCameraLineApplication._front_camera_vision_config()
@@ -508,13 +557,92 @@ class RadarCameraLineMainTests(unittest.TestCase):
         )
         self.assertFalse(app.camera_corrector.state.curve_mode)
 
+    def test_fleet_state_reports_fresh_start_relative_pose(self):
+        app = RadarCameraLineApplication(MainConfig())
+        now = time.monotonic()
+        with app._lock:
+            app._ready = True
+            app._map_ready = True
+            app._latest_navigation_pose = NavigationPose(
+                12.4,
+                -8.6,
+                359.99,
+                now,
+            )
+            app._localization_degraded = False
+            app._follower_state = TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.AB,
+                progress_cm=50.0,
+                target_speed_cm_s=30.0,
+                commanded_speed_cm_s=30.0,
+                steering_angle_rad=0.0,
+                cross_track_error_cm=0.0,
+                heading_error_deg=0.0,
+            )
+
+        state = app._fleet_state()
+
+        self.assertEqual((state.x_cm, state.y_cm), (12, -9))
+        self.assertEqual(state.heading_cdeg, 35999)
+        self.assertTrue(state.node_flags & int(NodeFlags.POSE_VALID))
+        self.assertTrue(state.node_flags & int(NodeFlags.READY))
+        self.assertTrue(state.node_flags & int(NodeFlags.MAP_READY))
+        self.assertTrue(state.node_flags & int(NodeFlags.BUSY))
+        self.assertTrue(
+            state.node_flags & int(NodeFlags.ARMED_OR_MOTOR_ACTIVE)
+        )
+        self.assertEqual(state.operation_state, 4)
+        self.assertEqual(state.pose_quality, 4)
+
+    def test_fleet_state_marks_stale_pose_degraded_without_inventing_zero(self):
+        app = RadarCameraLineApplication(MainConfig())
+        with app._lock:
+            app._ready = True
+            app._map_ready = True
+            app._latest_navigation_pose = NavigationPose(
+                7.0,
+                8.0,
+                90.0,
+                time.monotonic() - 2.0,
+            )
+            app._localization_degraded = False
+
+        state = app._fleet_state()
+
+        self.assertEqual((state.x_cm, state.y_cm), (7, 8))
+        self.assertFalse(state.node_flags & int(NodeFlags.POSE_VALID))
+        self.assertTrue(
+            state.node_flags & int(NodeFlags.LOCALIZATION_DEGRADED)
+        )
+        self.assertEqual(state.pose_quality, 2)
+
+    def test_fixed_track_fleet_commands_are_read_only_except_stop(self):
+        app = RadarCameraLineApplication(MainConfig())
+
+        unsupported = app._fleet_unsupported(object())
+        stopped = app._fleet_stop()
+
+        self.assertEqual(unsupported.status, AckStatus.REJECTED)
+        self.assertEqual(unsupported.reason, AckReason.UNSUPPORTED)
+        self.assertEqual(stopped.status, AckStatus.COMPLETED)
+        self.assertTrue(app._stop_event.is_set())
+
     def test_invalid_values_are_rejected(self):
         with self.assertRaises(ValueError):
-            MainConfig(speed_cm_s=0.0)
+            MainConfig(ab_speed_cm_s=0.0)
+        with self.assertRaises(ValueError):
+            MainConfig(bc_speed_cm_s=float("nan"))
         with self.assertRaises(ValueError):
             MainConfig(radar_center_behind_a_cm=-0.1)
         with self.assertRaises(ValueError):
             MainConfig(camera_source=-1)
+        with self.assertRaises(ValueError):
+            MainConfig(
+                fleet_position_reporting_enabled=False,
+                fleet_position_only=True,
+            )
 
 
 if __name__ == "__main__":
