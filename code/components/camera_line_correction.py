@@ -131,8 +131,6 @@ class CameraLineSteeringCorrector:
             CameraLineCorrectionConfig()
         ),
         detector: BlackLineDetector | None = None,
-        supplemental_detector: BlackLineDetector | None = None,
-        supplemental_in_curve_mode: bool = True,
         on_state_changed: (
             Callable[[CameraLineCorrectionState], None] | None
         ) = None,
@@ -141,16 +139,10 @@ class CameraLineSteeringCorrector:
         self.vision_config = vision_config
         self.correction_config = correction_config
         self.detector = detector or BlackLineDetector(vision_config)
-        self.supplemental_detector = supplemental_detector
-        self.supplemental_in_curve_mode = bool(
-            supplemental_in_curve_mode
-        )
         self._on_state_changed = on_state_changed
 
         self._lock = threading.Lock()
         self._state = CameraLineCorrectionState()
-        self._supplemental_observation: LineObservation | None = None
-        self._supplemental_enabled = supplemental_detector is not None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._capture = None
@@ -173,17 +165,8 @@ class CameraLineSteeringCorrector:
         thread = self._thread
         return thread is not None and thread.is_alive()
 
-    @property
-    def supplemental_observation(self) -> LineObservation | None:
-        """Return the latest optional second-profile observation."""
-
-        with self._lock:
-            return self._supplemental_observation
-
     def start(self) -> "CameraLineSteeringCorrector":
         self.detector._require_opencv()
-        if self.supplemental_detector is not None:
-            self.supplemental_detector._require_opencv()
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 raise RuntimeError("camera line corrector is already running")
@@ -196,12 +179,6 @@ class CameraLineSteeringCorrector:
             self._last_update_s = None
             self._filtered_correction_rad = 0.0
             self.detector.reset()
-            if self.supplemental_detector is not None:
-                self.supplemental_detector.reset()
-            self._supplemental_enabled = (
-                self.supplemental_detector is not None
-            )
-            self._supplemental_observation = None
             self._state = CameraLineCorrectionState(
                 running=True,
                 curve_mode=self._curve_mode,
@@ -230,7 +207,6 @@ class CameraLineSteeringCorrector:
             self._invalid_grace_frames = 0
             self._last_update_s = None
             self._filtered_correction_rad = 0.0
-            self._supplemental_observation = None
             self._state = replace(
                 self._state,
                 running=False,
@@ -552,37 +528,6 @@ class CameraLineSteeringCorrector:
                     frame,
                     timestamp_s=now,
                 )
-                with self._lock:
-                    supplemental_allowed = (
-                        self.supplemental_in_curve_mode
-                        or not self._curve_mode
-                    )
-                if (
-                    self.supplemental_detector is not None
-                    and self._supplemental_enabled
-                    and supplemental_allowed
-                ):
-                    try:
-                        supplemental = self.supplemental_detector.process(
-                            frame,
-                            timestamp_s=now,
-                        )
-                    except Exception:
-                        # The second profile is optional and must never take
-                        # the proven primary/curve correction offline.
-                        self._supplemental_enabled = False
-                        with self._lock:
-                            self._supplemental_observation = None
-                        LOG.exception(
-                            "supplemental camera profile disabled; "
-                            "primary correction remains available"
-                        )
-                    else:
-                        with self._lock:
-                            self._supplemental_observation = supplemental
-                elif not supplemental_allowed:
-                    with self._lock:
-                        self._supplemental_observation = None
                 self.update_from_observation(observation, now_s=now)
         except BaseException as exc:
             LOG.exception("camera line correction stopped")

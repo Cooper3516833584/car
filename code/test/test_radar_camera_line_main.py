@@ -1,6 +1,5 @@
 """Hardware-free tests for radar tracking with soft camera correction."""
 
-from dataclasses import replace
 import unittest
 import time
 
@@ -24,12 +23,6 @@ from main_radar_camera_line_following import (
     FINAL_DA_TRIM_FULL_PROGRESS_CM,
     FINAL_DA_TRIM_START_PROGRESS_CM,
     RADAR_CENTER_BEHIND_A_ALONG_AB_CM,
-    STRAIGHT_FAR_HEADING_DEADBAND_RAD,
-    STRAIGHT_FAR_MARGIN_CM,
-    STRAIGHT_FAR_MAX_CORRECTION_RAD,
-    STRAIGHT_FAR_REQUIRED_FRAMES,
-    TRACK_SEMICIRCLE_LENGTH_CM,
-    TRACK_STRAIGHT_LENGTH_CM,
     TRACK_SPEED_CM_S,
     MainConfig,
     RadarCameraLineApplication,
@@ -44,33 +37,22 @@ def observation(
     heading_error_rad=0.0,
     round_marker=False,
     transverse=False,
-    timestamp_s=1.0,
-    confidence=0.95,
-    fit_rmse_cm=0.5,
-    visible_band_count=12,
-    forward_heading_change_rad=0.0,
-    polynomial=None,
 ):
     return LineObservation(
-        timestamp_s=timestamp_s,
+        timestamp_s=1.0,
         detected=True,
-        confidence=confidence,
+        confidence=0.95,
         lookahead_x_cm=35.0,
         lookahead_y_left_cm=lateral_cm,
         near_lateral_error_cm=lateral_cm,
         heading_error_rad=heading_error_rad,
         curvature_per_cm=0.0,
-        fit_rmse_cm=fit_rmse_cm,
-        visible_band_count=visible_band_count,
+        fit_rmse_cm=0.5,
+        visible_band_count=12,
         total_band_count=13,
         median_line_width_cm=28.0,
-        polynomial_y_left_by_x=(
-            (0.0, 0.0, lateral_cm)
-            if polynomial is None
-            else polynomial
-        ),
+        polynomial_y_left_by_x=(0.0, 0.0, lateral_cm),
         dark_threshold=100.0,
-        forward_heading_change_rad=forward_heading_change_rad,
         round_marker_detected=round_marker,
         transverse_line_detected=transverse,
     )
@@ -100,10 +82,6 @@ class RadarCameraLineMainTests(unittest.TestCase):
         self.assertEqual(FINAL_DA_TRIM_START_PROGRESS_CM, 725.0)
         self.assertEqual(FINAL_DA_TRIM_FULL_PROGRESS_CM, 740.0)
         self.assertEqual(FINAL_DA_MIN_LEFT_CORRECTION_RAD, 0.100)
-        self.assertEqual(STRAIGHT_FAR_MARGIN_CM, 25.0)
-        self.assertEqual(STRAIGHT_FAR_REQUIRED_FRAMES, 5)
-        self.assertEqual(STRAIGHT_FAR_HEADING_DEADBAND_RAD, 0.018)
-        self.assertEqual(STRAIGHT_FAR_MAX_CORRECTION_RAD, 0.055)
         self.assertEqual(config.speed_cm_s, 30.0)
         self.assertEqual(config.radar_center_behind_a_cm, 20.0)
 
@@ -405,188 +383,6 @@ class RadarCameraLineMainTests(unittest.TestCase):
         self.assertEqual(profile.scan_far_cm, 72.0)
         self.assertEqual(profile.expected_line_width_cm, 28.0)
         self.assertEqual(profile.maximum_center_jump_cm, 18.0)
-
-    def test_30_degree_far_profile_is_separate_and_low_cost(self):
-        near_profile = RadarCameraLineApplication._front_camera_vision_config()
-        far_profile = (
-            RadarCameraLineApplication._straight_far_vision_config()
-        )
-
-        self.assertEqual(
-            far_profile.perspective.source_points_norm,
-            (
-                (0.100, 0.950),
-                (0.900, 0.950),
-                (0.556, 0.100),
-                (0.413, 0.100),
-            ),
-        )
-        self.assertEqual(far_profile.perspective.output_width_px, 200)
-        self.assertEqual(far_profile.perspective.output_height_px, 250)
-        self.assertEqual(far_profile.perspective.ground_depth_cm, 120.0)
-        self.assertEqual(far_profile.scan_far_cm, 105.0)
-        self.assertIsNot(near_profile, far_profile)
-        app = RadarCameraLineApplication(MainConfig())
-        self.assertIsNotNone(app.camera_corrector.supplemental_detector)
-        self.assertFalse(app.camera_corrector.supplemental_in_curve_mode)
-
-    def test_far_heading_waits_for_stable_straight_observations(self):
-        app = RadarCameraLineApplication(MainConfig())
-        app._on_follower_state(
-            TrackFollowerState(
-                running=True,
-                completed=False,
-                segment=TrackSegment.AB,
-                progress_cm=75.0,
-                target_speed_cm_s=30.0,
-                commanded_speed_cm_s=30.0,
-                steering_angle_rad=0.0,
-                cross_track_error_cm=0.0,
-                heading_error_deg=0.0,
-            )
-        )
-
-        corrections = []
-        for index in range(STRAIGHT_FAR_REQUIRED_FRAMES):
-            timestamp = 10.0 + 0.05 * index
-            corrections.append(
-                app._straight_far_heading_correction(
-                    now_s=timestamp,
-                    observation=observation(
-                        timestamp_s=timestamp,
-                        polynomial=(0.0, 0.08, 0.0),
-                    ),
-                )
-            )
-
-        self.assertEqual(corrections[:-1], [0.0] * 4)
-        self.assertGreater(corrections[-1], 0.0)
-        self.assertLessEqual(
-            corrections[-1],
-            STRAIGHT_FAR_MAX_CORRECTION_RAD,
-        )
-
-    def test_far_heading_is_hard_disabled_on_both_curves(self):
-        app = RadarCameraLineApplication(MainConfig())
-        for segment, progress in (
-            (TrackSegment.BC, TRACK_STRAIGHT_LENGTH_CM + 50.0),
-            (
-                TrackSegment.DA,
-                (
-                    2.0 * TRACK_STRAIGHT_LENGTH_CM
-                    + TRACK_SEMICIRCLE_LENGTH_CM
-                    + 50.0
-                ),
-            ),
-        ):
-            app._on_follower_state(
-                TrackFollowerState(
-                    running=True,
-                    completed=False,
-                    segment=segment,
-                    progress_cm=progress,
-                    target_speed_cm_s=30.0,
-                    commanded_speed_cm_s=30.0,
-                    steering_angle_rad=-0.1,
-                    cross_track_error_cm=2.0,
-                    heading_error_deg=-4.0,
-                )
-            )
-            for index in range(STRAIGHT_FAR_REQUIRED_FRAMES + 2):
-                timestamp = 20.0 + 0.05 * index
-                correction = app._straight_far_heading_correction(
-                    now_s=timestamp,
-                    observation=observation(
-                        timestamp_s=timestamp,
-                        polynomial=(0.0, 0.10, 0.0),
-                    ),
-                )
-                self.assertEqual(correction, 0.0)
-
-    def test_far_heading_works_on_cd_but_not_near_endpoint_markers(self):
-        app = RadarCameraLineApplication(MainConfig())
-        cd_start = (
-            TRACK_STRAIGHT_LENGTH_CM + TRACK_SEMICIRCLE_LENGTH_CM
-        )
-        for local_progress, expected_active in (
-            (STRAIGHT_FAR_MARGIN_CM - 1.0, False),
-            (75.0, True),
-            (
-                TRACK_STRAIGHT_LENGTH_CM
-                - STRAIGHT_FAR_MARGIN_CM
-                + 1.0,
-                False,
-            ),
-        ):
-            app._on_follower_state(
-                TrackFollowerState(
-                    running=True,
-                    completed=False,
-                    segment=TrackSegment.CD,
-                    progress_cm=cd_start + local_progress,
-                    target_speed_cm_s=30.0,
-                    commanded_speed_cm_s=30.0,
-                    steering_angle_rad=0.0,
-                    cross_track_error_cm=0.0,
-                    heading_error_deg=0.0,
-                )
-            )
-            correction = 0.0
-            for index in range(STRAIGHT_FAR_REQUIRED_FRAMES):
-                timestamp = 30.0 + local_progress + 0.05 * index
-                correction = app._straight_far_heading_correction(
-                    now_s=timestamp,
-                    observation=observation(
-                        timestamp_s=timestamp,
-                        polynomial=(0.0, -0.09, 0.0),
-                    ),
-                )
-            self.assertEqual(correction < 0.0, expected_active)
-
-    def test_far_heading_rejects_markers_and_bending_paths(self):
-        for candidate in (
-            observation(
-                timestamp_s=40.0,
-                polynomial=(0.0, 0.10, 0.0),
-                round_marker=True,
-            ),
-            observation(
-                timestamp_s=40.0,
-                polynomial=(0.0, 0.10, 0.0),
-                transverse=True,
-            ),
-            observation(
-                timestamp_s=40.0,
-                polynomial=(0.0, 0.10, 0.0),
-                forward_heading_change_rad=0.20,
-            ),
-        ):
-            app = RadarCameraLineApplication(MainConfig())
-            app._on_follower_state(
-                TrackFollowerState(
-                    running=True,
-                    completed=False,
-                    segment=TrackSegment.AB,
-                    progress_cm=75.0,
-                    target_speed_cm_s=30.0,
-                    commanded_speed_cm_s=30.0,
-                    steering_angle_rad=0.0,
-                    cross_track_error_cm=0.0,
-                    heading_error_deg=0.0,
-                )
-            )
-            for index in range(STRAIGHT_FAR_REQUIRED_FRAMES + 1):
-                candidate = replace(
-                    candidate,
-                    timestamp_s=40.0 + 0.05 * index,
-                )
-                self.assertEqual(
-                    app._straight_far_heading_correction(
-                        now_s=candidate.timestamp_s,
-                        observation=candidate,
-                    ),
-                    0.0,
-                )
 
     def test_large_visual_error_only_adds_small_correction(self):
         correction = CameraLineCorrectionConfig(
