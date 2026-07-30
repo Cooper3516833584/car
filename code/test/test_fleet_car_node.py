@@ -19,6 +19,7 @@ class Harness:
         self.rescue_calls = []
         self.mapping_calls = []
         self.alarm_calls = []
+        self.start_calls = 0
         self.callback_threads = []
         self.event = threading.Event()
         self.state = CarFleetState(
@@ -37,6 +38,7 @@ class Harness:
             on_stop=self.stop,
             on_start_mapping=self.start_mapping,
             on_set_alarm=self.set_alarm,
+            on_start_mission=self.start_mission,
             timing=NodeTiming(0, 16),
             wait=lambda _: False,
         )
@@ -70,6 +72,10 @@ class Harness:
 
     def set_alarm(self, active):
         self.alarm_calls.append(active)
+        return CommandResult(AckStatus.COMPLETED)
+
+    def start_mission(self):
+        self.start_calls += 1
         return CommandResult(AckStatus.COMPLETED)
 
     def send(self, frame):
@@ -178,6 +184,18 @@ class FleetCarNodeTests(unittest.TestCase):
                 decode_ack(unpack_frame(raw).payload).status,
             )
             self.assertEqual(expected, self.h.alarm_calls[-1])
+
+    def test_start_mission_calls_task_handler(self):
+        raw = self.h.send(self.request(
+            MessageKind.COMMAND,
+            encode_command(CommandPayload(CommandId.CAR_START_MISSION)),
+            seq=12,
+        ))
+        self.assertEqual(
+            AckStatus.COMPLETED,
+            decode_ack(unpack_frame(raw).payload).status,
+        )
+        self.assertEqual(1, self.h.start_calls)
 
     def test_disaster_rescue_is_decoded_by_optional_task_handler(self):
         self.h.node.close()

@@ -38,6 +38,8 @@ from components import (
     RadarScan,
     RectangleFieldCalibrator,
     SerialCommunicationDriver,
+    SoundLightAlarm,
+    AlarmGPIOError,
     TrackFollowerState,
     TrackSegment,
     WallFusionConfig,
@@ -254,6 +256,8 @@ class MainConfig:
     )
     fleet_link_port: str = DEFAULT_HC14_PORT
     fleet_position_only: bool = False
+    fleet_wait_for_start: bool = False
+    fleet_mission_request_state: int | None = None
 
     def __post_init__(self) -> None:
         if self.startup_scan_count <= 0:
@@ -283,6 +287,13 @@ class MainConfig:
             raise ValueError(
                 "fleet_position_only requires FleetBus position reporting"
             )
+        if self.fleet_wait_for_start and not self.fleet_position_reporting_enabled:
+            raise ValueError("fleet_wait_for_start requires FleetBus")
+        if (
+            self.fleet_mission_request_state is not None
+            and not 0 <= self.fleet_mission_request_state <= 255
+        ):
+            raise ValueError("fleet_mission_request_state must fit u8")
 
     @property
     def speed_profile(self) -> CompetitionTrackSpeedProfile:
@@ -343,6 +354,7 @@ class RadarCameraLineApplication:
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._completed_event = threading.Event()
+        self._mission_start_event = threading.Event()
         self._scan_event = threading.Event()
         self._startup_scans: list[RadarScan] = []
         self._ready = False
@@ -354,6 +366,7 @@ class RadarCameraLineApplication:
         self._last_camera_error: str | None = None
         self._started_at = time.monotonic()
         self._calibrating = False
+        self._alarm = None
 
         max_wheel_speed_mm_s = max(
             300.0,
@@ -426,6 +439,8 @@ class RadarCameraLineApplication:
                 on_set_coordinate_frame=self._fleet_unsupported,
                 on_navigate=self._fleet_unsupported,
                 on_stop=self._fleet_stop,
+                on_set_alarm=self._fleet_set_alarm,
+                on_start_mission=self._fleet_start_mission,
             )
 
     @property
@@ -514,6 +529,18 @@ class RadarCameraLineApplication:
                 while not self._stop_event.wait(0.5):
                     pass
                 return
+            if self.config.fleet_wait_for_start:
+                self.radar.set_motion_hint(False)
+                self.radar.start()
+                LOG.info("ready; waiting for FleetBus CAR_START_MISSION")
+                while (
+                    not self._stop_event.is_set()
+                    and not self._mission_start_event.wait(0.2)
+                ):
+                    pass
+                if self._stop_event.is_set():
+                    return
+                LOG.info("FleetBus start command accepted; beginning task 1")
             if self.config.camera_correction_enabled:
                 try:
                     self.camera_corrector.start()
@@ -608,7 +635,13 @@ class RadarCameraLineApplication:
             x_cm = round(pose.x_cm)
             y_cm = round(pose.y_cm)
             heading_cdeg = round(pose.heading_deg * 100.0) % 36000
-        if follower_state.completed:
+        if (
+            self.config.fleet_wait_for_start
+            and not self._mission_start_event.is_set()
+            and self.config.fleet_mission_request_state is not None
+        ):
+            operation_state = self.config.fleet_mission_request_state
+        elif follower_state.completed:
             operation_state = 7
         elif follower_state.running:
             operation_state = 4
@@ -639,6 +672,35 @@ class RadarCameraLineApplication:
 
     def _fleet_stop(self) -> FleetCommandResult:
         self.request_stop()
+        return FleetCommandResult(FleetAckStatus.COMPLETED)
+
+    def _fleet_start_mission(self) -> FleetCommandResult:
+        if not self.config.fleet_wait_for_start:
+            return self._fleet_unsupported()
+        if not self.ready:
+            return FleetCommandResult(
+                FleetAckStatus.REJECTED,
+                FleetAckReason.NOT_READY,
+                "car calibration is not complete",
+            )
+        self._mission_start_event.set()
+        return FleetCommandResult(FleetAckStatus.COMPLETED)
+
+    def _fleet_set_alarm(self, active: bool) -> FleetCommandResult:
+        try:
+            if self._alarm is None:
+                self._alarm = SoundLightAlarm()
+                if not self._alarm.is_initialized:
+                    self._alarm.initialize()
+            self._alarm.set_active(active)
+        except AlarmGPIOError as exc:
+            LOG.error("could not set car alarm active=%s: %s", active, exc)
+            return FleetCommandResult(
+                FleetAckStatus.FAILED,
+                FleetAckReason.INTERNAL_ERROR,
+                str(exc),
+            )
+        LOG.info("car alarm active=%s by FleetBus", active)
         return FleetCommandResult(FleetAckStatus.COMPLETED)
 
     def _calibrate_radar(self) -> None:
@@ -1074,6 +1136,11 @@ class RadarCameraLineApplication:
             self.fleet_node.close()
         if self.fleet_link is not None:
             self.fleet_link.close()
+        if self._alarm is not None:
+            try:
+                self._alarm.off()
+            except AlarmGPIOError as exc:
+                LOG.warning("could not silence car alarm during shutdown: %s", exc)
         self.camera_corrector.close()
         self.follower.stop_mission()
         self.radar.set_motion_hint(False)
@@ -1115,6 +1182,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--fleet-position-only",
         action="store_true",
         help="calibrate and report pose without opening drive/camera outputs",
+    )
+    parser.add_argument(
+        "--wait-for-fleet-start",
+        action="store_true",
+        help="remain stationary after calibration until CAR_START_MISSION",
+    )
+    parser.add_argument(
+        "--fleet-mission-request-state",
+        type=int,
+        default=None,
+        help="operation-state value reported while waiting for mission start",
     )
     parser.add_argument(
         "--log-level",
@@ -1166,6 +1244,8 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 fleet_link_port=args.fleet_link_port,
                 fleet_position_only=args.fleet_position_only,
+                fleet_wait_for_start=args.wait_for_fleet_start,
+                fleet_mission_request_state=args.fleet_mission_request_state,
             )
         )
 

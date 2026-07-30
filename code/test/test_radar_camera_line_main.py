@@ -776,6 +776,25 @@ class RadarCameraLineMainTests(unittest.TestCase):
         self.assertEqual(stopped.status, AckStatus.COMPLETED)
         self.assertTrue(app._stop_event.is_set())
 
+    def test_task1_waits_for_ready_start_command_and_reports_request(self):
+        app = RadarCameraLineApplication(
+            MainConfig(
+                fleet_wait_for_start=True,
+                fleet_mission_request_state=13,
+            )
+        )
+        self.assertEqual(13, app._fleet_state().operation_state)
+        rejected = app._fleet_start_mission()
+        self.assertEqual(AckStatus.REJECTED, rejected.status)
+        self.assertEqual(AckReason.NOT_READY, rejected.reason)
+
+        with app._lock:
+            app._ready = True
+        completed = app._fleet_start_mission()
+        self.assertEqual(AckStatus.COMPLETED, completed.status)
+        self.assertTrue(app._mission_start_event.is_set())
+        self.assertEqual(2, app._fleet_state().operation_state)
+
     def test_invalid_values_are_rejected(self):
         with self.assertRaises(ValueError):
             MainConfig(ab_speed_cm_s=0.0)
@@ -789,6 +808,11 @@ class RadarCameraLineMainTests(unittest.TestCase):
             MainConfig(
                 fleet_position_reporting_enabled=False,
                 fleet_position_only=True,
+            )
+        with self.assertRaises(ValueError):
+            MainConfig(
+                fleet_position_reporting_enabled=False,
+                fleet_wait_for_start=True,
             )
 
 

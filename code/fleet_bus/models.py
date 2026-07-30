@@ -24,6 +24,7 @@ class CarOperationState(IntEnum):
     LOCALIZATION_LOST = 10
     FAILED = 11
     CLOSED = 12
+    MISSION1_REQUESTED = 13
 
 
 @dataclass(frozen=True)

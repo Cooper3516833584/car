@@ -43,6 +43,15 @@ class TaskEntryTests(unittest.TestCase):
                     profile.da_cm_s,
                 ),
             )
+        task1_args = build_argument_parser().parse_args(
+            main_task1.build_core_argv([])
+        )
+        task2_args = build_argument_parser().parse_args(
+            main_task2.build_core_argv([])
+        )
+        self.assertTrue(task1_args.wait_for_fleet_start)
+        self.assertEqual(13, task1_args.fleet_mission_request_state)
+        self.assertFalse(task2_args.wait_for_fleet_start)
 
     def test_explicit_cli_speed_overrides_task_default(self):
         args = build_argument_parser().parse_args(

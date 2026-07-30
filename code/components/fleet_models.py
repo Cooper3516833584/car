@@ -34,6 +34,7 @@ class CommandId(IntEnum):
     CAR_START_MAPPING = 0x13
     CAR_ALARM_ON = 0x14
     CAR_ALARM_OFF = 0x15
+    CAR_START_MISSION = 0x16
     DRONE_GOTO = 0x20
     DRONE_HOLD = 0x21
     CANCEL_TASK = 0x22
