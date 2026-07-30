@@ -106,11 +106,11 @@ class RadarCameraLineMainTests(unittest.TestCase):
         self.assertEqual(C_VISIBLE_TRIM_FULL_PROGRESS_CM, 330.0)
         self.assertEqual(C_VISIBLE_TRIM_FADE_START_PROGRESS_CM, 390.0)
         self.assertEqual(C_VISIBLE_TRIM_END_PROGRESS_CM, 430.0)
-        self.assertEqual(C_VISIBLE_MIN_LEFT_CORRECTION_RAD, 0.025)
+        self.assertEqual(C_VISIBLE_MIN_LEFT_CORRECTION_RAD, 0.035)
         self.assertEqual(DA_VISIBLE_TRIM_START_PROGRESS_CM, 560.0)
         self.assertEqual(DA_VISIBLE_TRIM_FULL_PROGRESS_CM, 590.0)
         self.assertEqual(DA_VISIBLE_MIN_LEFT_CORRECTION_RAD, 0.045)
-        self.assertEqual(DA_VISIBLE_EXTRA_LEFT_CORRECTION_RAD, 0.018)
+        self.assertEqual(DA_VISIBLE_EXTRA_LEFT_CORRECTION_RAD, 0.030)
         self.assertEqual(FINAL_DA_TRIM_START_PROGRESS_CM, 725.0)
         self.assertEqual(FINAL_DA_TRIM_FULL_PROGRESS_CM, 740.0)
         self.assertEqual(FINAL_DA_MIN_LEFT_CORRECTION_RAD, 0.100)
@@ -223,10 +223,10 @@ class RadarCameraLineMainTests(unittest.TestCase):
 
         cases = (
             (TrackSegment.BC, 299.0, None),
-            (TrackSegment.BC, 315.0, 0.0125),
-            (TrackSegment.BC, 350.0, 0.025),
-            (TrackSegment.CD, 390.0, 0.025),
-            (TrackSegment.CD, 410.0, 0.0125),
+            (TrackSegment.BC, 315.0, 0.0175),
+            (TrackSegment.BC, 350.0, 0.035),
+            (TrackSegment.CD, 390.0, 0.035),
+            (TrackSegment.CD, 410.0, 0.0175),
             (TrackSegment.CD, 430.0, None),
         )
         for segment, progress_cm, expected in cases:
@@ -254,9 +254,9 @@ class RadarCameraLineMainTests(unittest.TestCase):
 
         cases = (
             (559.0, None),
-            (575.0, 0.009),
-            (650.0, 0.018),
-            (732.5, 0.009),
+            (575.0, 0.015),
+            (650.0, 0.030),
+            (732.5, 0.015),
             (740.0, None),
         )
         for progress_cm, expected in cases:
@@ -296,7 +296,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
         )
         self.assertAlmostEqual(
             application._adjust_radar_steering(-0.18, 15.0),
-            -0.155,
+            -0.145,
         )
 
         application._on_follower_state(
@@ -314,7 +314,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
         )
         self.assertAlmostEqual(
             application._adjust_radar_steering(-0.20, 15.0),
-            -0.137,
+            -0.125,
         )
 
     def test_inactive_final_trim_does_not_clamp_negative_camera_correction(self):

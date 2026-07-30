@@ -110,7 +110,7 @@ C_VISIBLE_TRIM_START_PROGRESS_CM = 300.0
 C_VISIBLE_TRIM_FULL_PROGRESS_CM = 330.0
 C_VISIBLE_TRIM_FADE_START_PROGRESS_CM = 390.0
 C_VISIBLE_TRIM_END_PROGRESS_CM = 430.0
-C_VISIBLE_MIN_LEFT_CORRECTION_RAD = 0.025
+C_VISIBLE_MIN_LEFT_CORRECTION_RAD = 0.035
 
 # Fixed-course trim only where the ground-station trajectory shows the DA
 # semicircle cutting inside the painted line.  Introduce a small outward trim
@@ -122,7 +122,7 @@ DA_VISIBLE_MIN_LEFT_CORRECTION_RAD = 0.045
 # The camera already exceeds the floor over much of DA, so a floor alone cannot
 # move the path farther outward.  Add this small course-specific amount on top,
 # fading it out as the stronger final-A floor takes over.
-DA_VISIBLE_EXTRA_LEFT_CORRECTION_RAD = 0.018
+DA_VISIBLE_EXTRA_LEFT_CORRECTION_RAD = 0.030
 FINAL_DA_TRIM_START_PROGRESS_CM = 725.0
 FINAL_DA_TRIM_FULL_PROGRESS_CM = 740.0
 FINAL_DA_MIN_LEFT_CORRECTION_RAD = 0.100
