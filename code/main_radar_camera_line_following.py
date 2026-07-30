@@ -103,6 +103,15 @@ AB_START_MIN_VALID_FRAMES = 2
 BC_ENTRY_LIMIT_END_PROGRESS_CM = 210.0
 BC_ENTRY_MIN_RIGHT_CORRECTION_RAD = -0.012
 
+# Ground-station trajectories show a repeatable inside cut while approaching C
+# and a short left-side offset after entering CD.  Apply only a small, smooth
+# positive correction floor around that fixed part of the course.
+C_VISIBLE_TRIM_START_PROGRESS_CM = 300.0
+C_VISIBLE_TRIM_FULL_PROGRESS_CM = 330.0
+C_VISIBLE_TRIM_FADE_START_PROGRESS_CM = 390.0
+C_VISIBLE_TRIM_END_PROGRESS_CM = 430.0
+C_VISIBLE_MIN_LEFT_CORRECTION_RAD = 0.025
+
 # Fixed-course trim only where the ground-station trajectory shows the DA
 # semicircle cutting inside the painted line.  Introduce a small outward trim
 # after leaving D, hold it through the visibly displaced middle of the arc,
@@ -110,6 +119,10 @@ BC_ENTRY_MIN_RIGHT_CORRECTION_RAD = -0.012
 DA_VISIBLE_TRIM_START_PROGRESS_CM = 560.0
 DA_VISIBLE_TRIM_FULL_PROGRESS_CM = 590.0
 DA_VISIBLE_MIN_LEFT_CORRECTION_RAD = 0.045
+# The camera already exceeds the floor over much of DA, so a floor alone cannot
+# move the path farther outward.  Add this small course-specific amount on top,
+# fading it out as the stronger final-A floor takes over.
+DA_VISIBLE_EXTRA_LEFT_CORRECTION_RAD = 0.018
 FINAL_DA_TRIM_START_PROGRESS_CM = 725.0
 FINAL_DA_TRIM_FULL_PROGRESS_CM = 740.0
 FINAL_DA_MIN_LEFT_CORRECTION_RAD = 0.100
@@ -762,12 +775,21 @@ class RadarCameraLineApplication:
             course_limited_correction = self._apply_course_camera_limit(
                 camera_correction
             )
+            c_point_trim = self._c_point_trim()
+            position_limited_correction = (
+                course_limited_correction
+                if c_point_trim is None
+                else max(course_limited_correction, c_point_trim)
+            )
             final_da_trim = self._final_da_trim()
             correction = (
-                course_limited_correction
+                position_limited_correction
                 if final_da_trim is None
-                else max(course_limited_correction, final_da_trim)
+                else max(position_limited_correction, final_da_trim)
             )
+            da_visible_extra = self._da_visible_extra_trim()
+            if da_visible_extra is not None:
+                correction += da_visible_extra
             combined = float(radar_steering_rad) + correction
             adjusted = max(
                 MIN_VEHICLE_STEERING_RAD,
@@ -778,7 +800,8 @@ class RadarCameraLineApplication:
                 "steering fusion radar_rad=%.4f camera_rad=%.4f "
                 "final_rad=%.4f observed_camera_rad=%.4f "
                 "ab_start_alignment_rad=%.4f "
-                "course_limited_camera_rad=%.4f final_da_trim_rad=%.4f "
+                "course_limited_camera_rad=%.4f c_point_trim_rad=%.4f "
+                "final_da_trim_rad=%.4f da_visible_extra_rad=%.4f "
                 "camera_active=%s "
                 "camera_error_cm=%.2f camera_confidence=%.2f",
                 radar_steering_rad,
@@ -787,7 +810,13 @@ class RadarCameraLineApplication:
                 observed_correction,
                 ab_start_alignment,
                 course_limited_correction,
+                0.0 if c_point_trim is None else c_point_trim,
                 0.0 if final_da_trim is None else final_da_trim,
+                (
+                    0.0
+                    if da_visible_extra is None
+                    else da_visible_extra
+                ),
                 state.active,
                 state.lateral_error_cm,
                 state.confidence,
@@ -874,6 +903,37 @@ class RadarCameraLineApplication:
             )
         return float(correction_rad)
 
+    def _c_point_trim(self) -> float | None:
+        with self._lock:
+            state = self._follower_state
+        if not state.running or state.completed:
+            return None
+        if state.segment is TrackSegment.BC:
+            if state.progress_cm < C_VISIBLE_TRIM_START_PROGRESS_CM:
+                return None
+            if state.progress_cm >= C_VISIBLE_TRIM_FULL_PROGRESS_CM:
+                return C_VISIBLE_MIN_LEFT_CORRECTION_RAD
+            blend = (
+                state.progress_cm - C_VISIBLE_TRIM_START_PROGRESS_CM
+            ) / (
+                C_VISIBLE_TRIM_FULL_PROGRESS_CM
+                - C_VISIBLE_TRIM_START_PROGRESS_CM
+            )
+            return C_VISIBLE_MIN_LEFT_CORRECTION_RAD * blend
+        if state.segment is not TrackSegment.CD:
+            return None
+        if state.progress_cm >= C_VISIBLE_TRIM_END_PROGRESS_CM:
+            return None
+        if state.progress_cm <= C_VISIBLE_TRIM_FADE_START_PROGRESS_CM:
+            return C_VISIBLE_MIN_LEFT_CORRECTION_RAD
+        blend = (
+            C_VISIBLE_TRIM_END_PROGRESS_CM - state.progress_cm
+        ) / (
+            C_VISIBLE_TRIM_END_PROGRESS_CM
+            - C_VISIBLE_TRIM_FADE_START_PROGRESS_CM
+        )
+        return C_VISIBLE_MIN_LEFT_CORRECTION_RAD * blend
+
     def _final_da_trim(self) -> float | None:
         with self._lock:
             state = self._follower_state
@@ -914,6 +974,35 @@ class RadarCameraLineApplication:
             FINAL_DA_MIN_LEFT_CORRECTION_RAD
             - DA_VISIBLE_MIN_LEFT_CORRECTION_RAD
         ) * final_blend
+
+    def _da_visible_extra_trim(self) -> float | None:
+        with self._lock:
+            state = self._follower_state
+        if (
+            not state.running
+            or state.completed
+            or state.segment is not TrackSegment.DA
+            or state.progress_cm < DA_VISIBLE_TRIM_START_PROGRESS_CM
+            or state.progress_cm >= FINAL_DA_TRIM_FULL_PROGRESS_CM
+        ):
+            return None
+        if state.progress_cm < DA_VISIBLE_TRIM_FULL_PROGRESS_CM:
+            blend = (
+                state.progress_cm - DA_VISIBLE_TRIM_START_PROGRESS_CM
+            ) / (
+                DA_VISIBLE_TRIM_FULL_PROGRESS_CM
+                - DA_VISIBLE_TRIM_START_PROGRESS_CM
+            )
+            return DA_VISIBLE_EXTRA_LEFT_CORRECTION_RAD * blend
+        if state.progress_cm <= FINAL_DA_TRIM_START_PROGRESS_CM:
+            return DA_VISIBLE_EXTRA_LEFT_CORRECTION_RAD
+        fade = (
+            FINAL_DA_TRIM_FULL_PROGRESS_CM - state.progress_cm
+        ) / (
+            FINAL_DA_TRIM_FULL_PROGRESS_CM
+            - FINAL_DA_TRIM_START_PROGRESS_CM
+        )
+        return DA_VISIBLE_EXTRA_LEFT_CORRECTION_RAD * fade
 
     def _on_camera_state(
         self,
