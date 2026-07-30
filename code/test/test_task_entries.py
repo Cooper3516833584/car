@@ -1,41 +1,34 @@
 import unittest
-from pathlib import Path
+from unittest.mock import patch
 
 import main_task1
 import main_task2
-from competition_task_runtime import build_argument_parser
 from components.competition_track import CompetitionTrackSpeedProfile
+from main_radar_camera_line_following import build_argument_parser
 
 
 class TaskEntryTests(unittest.TestCase):
-    def test_each_task_has_a_separate_ten_cm_s_profile(self):
+    def test_each_task_has_an_independent_segment_profile(self):
         self.assertEqual(
             main_task1.TASK1_SPEED_PROFILE,
-            CompetitionTrackSpeedProfile.uniform(10.0),
+            CompetitionTrackSpeedProfile(12.0, 15.0, 30.0, 15.0),
         )
         self.assertEqual(
             main_task2.TASK2_SPEED_PROFILE,
-            CompetitionTrackSpeedProfile.uniform(10.0),
+            CompetitionTrackSpeedProfile(15.0, 15.0, 30.0, 15.0),
         )
         self.assertIsNot(
             main_task1.TASK1_SPEED_PROFILE,
             main_task2.TASK2_SPEED_PROFILE,
         )
 
-    def test_task_two_has_no_embedded_arrival_timing_requirement(self):
-        source = Path(main_task2.__file__).read_text(encoding="utf-8")
-        self.assertNotIn("15.0", source)
-        self.assertNotIn("90.0", source)
-
-    def test_each_entry_exposes_independent_segment_speed_arguments(self):
-        for name, profile in (
-            ("task 1", main_task1.TASK1_SPEED_PROFILE),
-            ("task 2", main_task2.TASK2_SPEED_PROFILE),
+    def test_each_entry_passes_its_profile_to_the_shared_core(self):
+        for module, profile in (
+            (main_task1, main_task1.TASK1_SPEED_PROFILE),
+            (main_task2, main_task2.TASK2_SPEED_PROFILE),
         ):
-            args = build_argument_parser(
-                task_name=name,
-                default_speed_profile=profile,
-            ).parse_args([])
+            core_argv = module.build_core_argv([])
+            args = build_argument_parser().parse_args(core_argv)
             self.assertEqual(
                 (
                     args.ab_speed_cm_s,
@@ -43,8 +36,30 @@ class TaskEntryTests(unittest.TestCase):
                     args.cd_speed_cm_s,
                     args.da_speed_cm_s,
                 ),
-                (10.0, 10.0, 10.0, 10.0),
+                (
+                    profile.ab_cm_s,
+                    profile.bc_cm_s,
+                    profile.cd_cm_s,
+                    profile.da_cm_s,
+                ),
             )
+
+    def test_explicit_cli_speed_overrides_task_default(self):
+        args = build_argument_parser().parse_args(
+            main_task2.build_core_argv(
+                ["--ab-speed-cm-s", "18", "--log-level", "DEBUG"]
+            )
+        )
+        self.assertEqual(args.ab_speed_cm_s, 18.0)
+        self.assertEqual(args.log_level, "DEBUG")
+
+    def test_entry_calls_shared_core_without_running_hardware_on_import(self):
+        with patch.object(main_task1, "_run_core", return_value=7) as run_core:
+            result = main_task1.main(["--no-fleet-position"])
+        self.assertEqual(result, 7)
+        run_core.assert_called_once_with(
+            main_task1.build_core_argv(["--no-fleet-position"])
+        )
 
 
 if __name__ == "__main__":
