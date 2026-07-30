@@ -103,9 +103,13 @@ AB_START_MIN_VALID_FRAMES = 2
 BC_ENTRY_LIMIT_END_PROGRESS_CM = 210.0
 BC_ENTRY_MIN_RIGHT_CORRECTION_RAD = -0.012
 
-# Fixed-course trim for the final DA approach.  The end marker progressively
-# hides the longitudinal line while radar tends to command full right lock, so
-# preserve a known-good left correction over only the last part of the lap.
+# Fixed-course trim only where the ground-station trajectory shows the DA
+# semicircle cutting inside the painted line.  Introduce a small outward trim
+# after leaving D, hold it through the visibly displaced middle of the arc,
+# then blend into the known-good stronger correction near A.
+DA_VISIBLE_TRIM_START_PROGRESS_CM = 560.0
+DA_VISIBLE_TRIM_FULL_PROGRESS_CM = 600.0
+DA_VISIBLE_MIN_LEFT_CORRECTION_RAD = 0.025
 FINAL_DA_TRIM_START_PROGRESS_CM = 725.0
 FINAL_DA_TRIM_FULL_PROGRESS_CM = 740.0
 FINAL_DA_MIN_LEFT_CORRECTION_RAD = 0.100
@@ -877,14 +881,25 @@ class RadarCameraLineApplication:
             not state.running
             or state.completed
             or state.segment is not TrackSegment.DA
-            or state.progress_cm < FINAL_DA_TRIM_START_PROGRESS_CM
+            or state.progress_cm < DA_VISIBLE_TRIM_START_PROGRESS_CM
         ):
             return None
-        span_cm = (
+        if state.progress_cm < DA_VISIBLE_TRIM_FULL_PROGRESS_CM:
+            visible_span_cm = (
+                DA_VISIBLE_TRIM_FULL_PROGRESS_CM
+                - DA_VISIBLE_TRIM_START_PROGRESS_CM
+            )
+            visible_blend = (
+                state.progress_cm - DA_VISIBLE_TRIM_START_PROGRESS_CM
+            ) / visible_span_cm
+            return DA_VISIBLE_MIN_LEFT_CORRECTION_RAD * visible_blend
+        if state.progress_cm < FINAL_DA_TRIM_START_PROGRESS_CM:
+            return DA_VISIBLE_MIN_LEFT_CORRECTION_RAD
+        final_span_cm = (
             FINAL_DA_TRIM_FULL_PROGRESS_CM
             - FINAL_DA_TRIM_START_PROGRESS_CM
         )
-        blend = min(
+        final_blend = min(
             1.0,
             max(
                 0.0,
@@ -892,10 +907,13 @@ class RadarCameraLineApplication:
                     state.progress_cm
                     - FINAL_DA_TRIM_START_PROGRESS_CM
                 )
-                / span_cm,
+                / final_span_cm,
             ),
         )
-        return FINAL_DA_MIN_LEFT_CORRECTION_RAD * blend
+        return DA_VISIBLE_MIN_LEFT_CORRECTION_RAD + (
+            FINAL_DA_MIN_LEFT_CORRECTION_RAD
+            - DA_VISIBLE_MIN_LEFT_CORRECTION_RAD
+        ) * final_blend
 
     def _on_camera_state(
         self,
