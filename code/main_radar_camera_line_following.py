@@ -66,10 +66,10 @@ from components.navigation import (
 
 # Fixed-track segment speeds. Change these four values for the next real-car
 # run; the stable steering/camera parameters below are not changed.
-AB_TRACK_SPEED_CM_S = 30.0
-BC_TRACK_SPEED_CM_S = 30.0
+AB_TRACK_SPEED_CM_S = 12.0
+BC_TRACK_SPEED_CM_S = 15.0
 CD_TRACK_SPEED_CM_S = 30.0
-DA_TRACK_SPEED_CM_S = 30.0
+DA_TRACK_SPEED_CM_S = 15.0
 
 # FleetBus position reports are replies to the read-only ground-station POLL.
 # Coordinates are centimetres relative to this run's radar-rebased start pose.
@@ -78,7 +78,7 @@ FLEET_POSITION_STALE_TIMEOUT_S = 0.5
 
 # At startup the car faces AB with its front reference at A. The radar centre
 # is this far behind A; after driving forward this distance, it passes A.
-RADAR_CENTER_BEHIND_A_ALONG_AB_CM = 20.0
+RADAR_CENTER_BEHIND_A_ALONG_AB_CM = 24.0
 
 # Camera correction stays filtered and gated, but must be strong enough to
 # overcome the repeatable radar bias once the line error is already large.

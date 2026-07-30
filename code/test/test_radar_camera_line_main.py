@@ -75,12 +75,12 @@ class RadarCameraLineMainTests(unittest.TestCase):
     def test_editable_defaults_match_radar_fixed_track_entry(self):
         config = MainConfig()
 
-        self.assertEqual(AB_TRACK_SPEED_CM_S, 30.0)
-        self.assertEqual(BC_TRACK_SPEED_CM_S, 30.0)
+        self.assertEqual(AB_TRACK_SPEED_CM_S, 12.0)
+        self.assertEqual(BC_TRACK_SPEED_CM_S, 15.0)
         self.assertEqual(CD_TRACK_SPEED_CM_S, 30.0)
-        self.assertEqual(DA_TRACK_SPEED_CM_S, 30.0)
+        self.assertEqual(DA_TRACK_SPEED_CM_S, 15.0)
         self.assertTrue(FLEET_POSITION_REPORTING_ENABLED)
-        self.assertEqual(RADAR_CENTER_BEHIND_A_ALONG_AB_CM, 20.0)
+        self.assertEqual(RADAR_CENTER_BEHIND_A_ALONG_AB_CM, 24.0)
         self.assertTrue(CAMERA_CORRECTION_ENABLED)
         self.assertEqual(CAMERA_LATERAL_DEADBAND_CM, 10.0)
         self.assertEqual(CAMERA_STEERING_GAIN_RAD_PER_CM, 0.010)
@@ -109,9 +109,9 @@ class RadarCameraLineMainTests(unittest.TestCase):
                 config.speed_profile.cd_cm_s,
                 config.speed_profile.da_cm_s,
             ),
-            (30.0, 30.0, 30.0, 30.0),
+            (12.0, 15.0, 30.0, 15.0),
         )
-        self.assertEqual(config.radar_center_behind_a_cm, 20.0)
+        self.assertEqual(config.radar_center_behind_a_cm, 24.0)
 
     def test_final_da_trim_is_smooth_and_limited_to_lap_end(self):
         application = RadarCameraLineApplication(MainConfig())
