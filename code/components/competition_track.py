@@ -198,12 +198,14 @@ class CompetitionTrack:
         field_points_cm: tuple[tuple[float, float], ...],
         segment_start_indices: tuple[int, int, int, int],
         wrap_start_index: int,
+        finish_progress_cm: float,
     ) -> None:
         self._points = points
         self._path = path
         self.field_points_cm = field_points_cm
         self.segment_start_indices = segment_start_indices
         self.wrap_start_index = wrap_start_index
+        self._finish_progress_cm = finish_progress_cm
 
     @classmethod
     def build(
@@ -212,9 +214,17 @@ class CompetitionTrack:
         reference_offset_cm: float,
         sample_spacing_cm: float = TRACK_SAMPLE_SPACING_CM,
         wrap_extension_cm: float = WRAP_EXTENSION_CM,
+        finish_extension_cm: float = 0.0,
     ) -> "CompetitionTrack":
         if sample_spacing_cm <= 0.0 or wrap_extension_cm <= 0.0:
             raise ValueError("sample spacing and wrap extension must be positive")
+        if (
+            not math.isfinite(finish_extension_cm)
+            or not 0.0 <= finish_extension_cm <= wrap_extension_cm
+        ):
+            raise ValueError(
+                "finish extension must be finite and within the wrap extension"
+            )
         transform = FieldTransform.from_a_reference(
             offset_cm=reference_offset_cm
         )
@@ -315,8 +325,15 @@ class CompetitionTrack:
             segment=TrackSegment.AB,
         )
         wrap_samples = max(1, math.ceil(wrap_extension_cm / sample_spacing_cm))
-        for index in range(1, wrap_samples + 1):
-            distance = wrap_extension_cm * index / wrap_samples
+        wrap_distances = {
+            wrap_extension_cm * index / wrap_samples
+            for index in range(1, wrap_samples + 1)
+        }
+        if finish_extension_cm > 0.0:
+            # Preserve the exact requested stop point even when it is not an
+            # integer multiple of the regular path-sampling interval.
+            wrap_distances.add(finish_extension_cm)
+        for distance in sorted(wrap_distances):
             append(
                 A_FIELD_CM[0],
                 A_FIELD_CM[1] + distance,
@@ -345,6 +362,7 @@ class CompetitionTrack:
             tuple(field_points),
             tuple(starts),
             wrap_start_index,
+            S_FINISH_CM + finish_extension_cm,
         )
 
     @property
@@ -357,7 +375,7 @@ class CompetitionTrack:
 
     @property
     def finish_progress_cm(self) -> float:
-        return S_FINISH_CM
+        return self._finish_progress_cm
 
     def point_at_index(self, index: int) -> CompetitionTrackPoint:
         return self._points[index]
@@ -382,6 +400,7 @@ def build_competition_track(
     sample_spacing_cm: float = TRACK_SAMPLE_SPACING_CM,
     wrap_extension_cm: float = WRAP_EXTENSION_CM,
     reference_offset_cm: float = 0.0,
+    finish_extension_cm: float = 0.0,
     transform: FieldTransform | None = None,
 ) -> CompetitionTrack:
     if transform is not None:
@@ -396,6 +415,7 @@ def build_competition_track(
         reference_offset_cm=reference_offset_cm,
         sample_spacing_cm=sample_spacing_cm,
         wrap_extension_cm=wrap_extension_cm,
+        finish_extension_cm=finish_extension_cm,
     )
 
 

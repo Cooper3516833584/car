@@ -222,6 +222,47 @@ class CompetitionTrackFollowerTests(unittest.TestCase):
         self.follower.update_from_radar(radar_update(self.track, wrap + 1))
         self.assertEqual(self.drive.stops, 1)
 
+    def test_finish_extension_keeps_following_until_rear_axle_reaches_a(self):
+        extension_cm = 24.0
+        track = CompetitionTrack.build(
+            reference_offset_cm=extension_cm,
+            finish_extension_cm=extension_cm,
+        )
+        controller = FakeController(
+            index=track.wrap_start_index,
+            steering_angle_rad=0.0,
+        )
+        follower = CompetitionTrackFollower(
+            drive=self.drive,
+            track=track,
+            speed_cm_s=TEST_SPEED_CM_S,
+            controller=controller,
+        )
+        follower.start_mission()
+
+        at_front_reference_a = follower.update_from_radar(
+            radar_update(track, track.wrap_start_index)
+        )
+
+        self.assertTrue(at_front_reference_a.running)
+        self.assertFalse(at_front_reference_a.completed)
+        self.assertEqual(at_front_reference_a.segment, TrackSegment.AB)
+        self.assertEqual(self.drive.stops, 0)
+
+        finish_index = next(
+            index
+            for index, point in enumerate(track.points)
+            if point.progress_cm >= track.finish_progress_cm
+        )
+        controller.index = finish_index
+        at_rear_axle_a = follower.update_from_radar(
+            radar_update(track, finish_index)
+        )
+
+        self.assertFalse(at_rear_axle_a.running)
+        self.assertTrue(at_rear_axle_a.completed)
+        self.assertEqual(self.drive.stops, 1)
+
     def test_failure_stops_car(self):
         self.drive.set_motion = lambda *_args, **_kwargs: (_ for _ in ()).throw(
             RuntimeError("write failed")

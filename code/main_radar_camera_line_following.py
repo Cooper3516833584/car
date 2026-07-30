@@ -78,9 +78,11 @@ DA_TRACK_SPEED_CM_S = 15.0
 FLEET_POSITION_REPORTING_ENABLED = True
 FLEET_POSITION_STALE_TIMEOUT_S = 0.5
 
-# At startup the car faces AB with its front reference at A. The radar centre
-# is this far behind A; after driving forward this distance, it passes A.
-RADAR_CENTER_BEHIND_A_ALONG_AB_CM = 24.0
+# At startup the car faces AB with its front reference at A. The radar/rear
+# axle centre is this far behind A. After one geometric lap, continue by this
+# distance along AB so the rear axle, rather than the front reference, stops
+# at A.
+RADAR_CENTER_BEHIND_A_ALONG_AB_CM = 20.0
 
 # Camera correction stays filtered and gated, but must be strong enough to
 # overcome the repeatable radar bias once the line error is already large.
@@ -128,6 +130,19 @@ DA_VISIBLE_EXTRA_LEFT_CORRECTION_RAD = 0.030
 FINAL_DA_TRIM_START_PROGRESS_CM = 725.0
 FINAL_DA_TRIM_FULL_PROGRESS_CM = 740.0
 FINAL_DA_MIN_LEFT_CORRECTION_RAD = 0.100
+# Near A the fixed trim is feed-forward, not a replacement for visual
+# feedback.  Add a separately bounded residual from the last trustworthy
+# longitudinal-line observation and hold it briefly while the A marker hides
+# the line.  This distinguishes the accurate ~2 cm case from the observed
+# 10-15 cm radar/camera disagreement without weakening the marker rejection.
+FINAL_DA_VISUAL_DEADBAND_CM = 3.0
+FINAL_DA_VISUAL_GAIN_RAD_PER_CM = 0.005
+FINAL_DA_VISUAL_MAX_RESIDUAL_RAD = 0.040
+FINAL_DA_VISUAL_HOLD_S = 0.65
+FINAL_DA_MAX_TOTAL_LEFT_CORRECTION_RAD = 0.170
+FINAL_A_MAX_CAMERA_ERROR_CM = 6.0
+CAR_OPERATION_LOCALIZATION_LOST = 10
+FLEET_TERMINAL_REPORT_GRACE_S = 0.5
 
 
 LOG = logging.getLogger("radar-camera-line-main")
@@ -364,6 +379,10 @@ class RadarCameraLineApplication:
         self._fleet_error_code = 0
         self._closed = False
         self._last_camera_error: str | None = None
+        self._final_da_visual_error_cm: float | None = None
+        self._final_da_visual_residual_rad = 0.0
+        self._final_da_visual_timestamp_s: float | None = None
+        self._terminal_camera_disagreement = False
         self._started_at = time.monotonic()
         self._calibrating = False
         self._alarm = None
@@ -377,7 +396,11 @@ class RadarCameraLineApplication:
         )
         self.track = CompetitionTrack.build(
             reference_offset_cm=config.radar_center_behind_a_cm,
+            finish_extension_cm=config.radar_center_behind_a_cm,
         )
+        self._one_lap_progress_cm = self.track.point_at_index(
+            self.track.wrap_start_index
+        ).progress_cm
         self.camera_corrector = CameraLineSteeringCorrector(
             camera_index=config.camera_source,
             vision_config=self._front_camera_vision_config(),
@@ -463,7 +486,10 @@ class RadarCameraLineApplication:
                 map_ready=self._map_ready,
                 pose=self._latest_navigation_pose,
                 navigation_state=navigation_state,
-                localization_degraded=self._localization_degraded,
+                localization_degraded=(
+                    self._localization_degraded
+                    or self._terminal_camera_disagreement
+                ),
                 error_code=self._fleet_error_code,
             )
 
@@ -568,11 +594,13 @@ class RadarCameraLineApplication:
             LOG.info(
                 "one-lap radar+camera tracking started "
                 "speeds_cm_s=AB:%.1f,BC:%.1f,CD:%.1f,DA:%.1f "
-                "radar_center_behind_a_cm=%.1f",
+                "radar_center_behind_a_cm=%.1f "
+                "post_lap_extension_cm=%.1f",
                 self.config.ab_speed_cm_s,
                 self.config.bc_speed_cm_s,
                 self.config.cd_speed_cm_s,
                 self.config.da_speed_cm_s,
+                self.config.radar_center_behind_a_cm,
                 self.config.radar_center_behind_a_cm,
             )
             while (
@@ -580,6 +608,17 @@ class RadarCameraLineApplication:
                 and not self._completed_event.wait(0.5)
             ):
                 pass
+            if (
+                self._terminal_camera_disagreement
+                and self.fleet_link is not None
+                and not self._stop_event.is_set()
+            ):
+                LOG.warning(
+                    "holding stopped state for %.1fs so FleetBus can report "
+                    "the terminal localization disagreement",
+                    FLEET_TERMINAL_REPORT_GRACE_S,
+                )
+                self._stop_event.wait(FLEET_TERMINAL_REPORT_GRACE_S)
         finally:
             with self._lock:
                 self._calibrating = False
@@ -604,7 +643,10 @@ class RadarCameraLineApplication:
             ready = self._ready
             calibrating = self._calibrating
             map_ready = self._map_ready
-            degraded = self._localization_degraded
+            degraded = (
+                self._localization_degraded
+                or self._terminal_camera_disagreement
+            )
             pose = self._latest_navigation_pose
             follower_state = self._follower_state
             error_code = self._fleet_error_code
@@ -613,7 +655,11 @@ class RadarCameraLineApplication:
             and now - pose.timestamp_s
             <= FLEET_POSITION_STALE_TIMEOUT_S
         )
-        pose_valid = ready and pose_fresh
+        pose_valid = (
+            ready
+            and pose_fresh
+            and not self._terminal_camera_disagreement
+        )
         flags = 0
         if pose_valid:
             flags |= int(FleetNodeFlags.POSE_VALID)
@@ -641,6 +687,8 @@ class RadarCameraLineApplication:
             and self.config.fleet_mission_request_state is not None
         ):
             operation_state = self.config.fleet_mission_request_state
+        elif self._terminal_camera_disagreement:
+            operation_state = CAR_OPERATION_LOCALIZATION_LOST
         elif follower_state.completed:
             operation_state = 7
         elif follower_state.running:
@@ -658,7 +706,11 @@ class RadarCameraLineApplication:
             y_cm,
             heading_cdeg,
             operation_state=operation_state,
-            pose_quality=4 if pose_valid else (2 if pose is not None else 0),
+            pose_quality=(
+                2
+                if pose_valid and degraded
+                else (4 if pose_valid else (2 if pose is not None else 0))
+            ),
             error_code=error_code,
         )
 
@@ -734,8 +786,10 @@ class RadarCameraLineApplication:
         with self._lock:
             self._map_ready = True
         LOG.info(
-            "calibration complete; rear axle rebased to A=(0,0,0deg) "
+            "calibration complete; startup rear axle rebased to "
+            "(0,0,0deg), A is %.1f cm ahead along AB "
             "bounds=x[%.1f,%.1f] y[%.1f,%.1f] fitted_lines=%d",
+            self.config.radar_center_behind_a_cm,
             calibration.min_x_cm,
             calibration.max_x_cm,
             calibration.min_y_cm,
@@ -802,9 +856,32 @@ class RadarCameraLineApplication:
         with self._lock:
             self._follower_state = state
         if state.completed:
+            now_s = time.monotonic()
+            with self._lock:
+                visual_error_cm = self._final_da_visual_error_cm
+                visual_timestamp_s = self._final_da_visual_timestamp_s
+                disagreement = (
+                    visual_error_cm is not None
+                    and visual_timestamp_s is not None
+                    and now_s - visual_timestamp_s
+                    <= FINAL_DA_VISUAL_HOLD_S
+                    and abs(visual_error_cm)
+                    > FINAL_A_MAX_CAMERA_ERROR_CM
+                )
+                self._terminal_camera_disagreement = disagreement
             self.radar.set_motion_hint(False)
             self._completed_event.set()
-            LOG.info("one lap complete; vehicle stopped at A")
+            if disagreement:
+                LOG.warning(
+                    "one lap ended with radar/camera disagreement at A; "
+                    "last_visual_error_cm=%.2f pose quality is degraded",
+                    visual_error_cm,
+                )
+            else:
+                LOG.info(
+                    "one lap plus %.1f cm complete; rear axle stopped at A",
+                    self.config.radar_center_behind_a_cm,
+                )
 
     def request_stop(self) -> None:
         self._stop_event.set()
@@ -844,14 +921,42 @@ class RadarCameraLineApplication:
                 else max(course_limited_correction, c_point_trim)
             )
             final_da_trim = self._final_da_trim()
-            correction = (
-                position_limited_correction
-                if final_da_trim is None
-                else max(position_limited_correction, final_da_trim)
-            )
             da_visible_extra = self._da_visible_extra_trim()
-            if da_visible_extra is not None:
-                correction += da_visible_extra
+            final_da_visual_residual = (
+                self._final_da_visual_residual(now_s=now_s)
+            )
+            with self._lock:
+                follower_state = self._follower_state
+            terminal_da_active = (
+                final_da_trim is not None
+                and follower_state.running
+                and not follower_state.completed
+                and follower_state.segment is TrackSegment.DA
+                and follower_state.progress_cm
+                >= FINAL_DA_TRIM_START_PROGRESS_CM
+            )
+            if terminal_da_active:
+                correction = max(
+                    position_limited_correction,
+                    final_da_trim + final_da_visual_residual,
+                )
+                if da_visible_extra is not None:
+                    correction += da_visible_extra
+                correction = max(
+                    -FINAL_DA_MAX_TOTAL_LEFT_CORRECTION_RAD,
+                    min(
+                        FINAL_DA_MAX_TOTAL_LEFT_CORRECTION_RAD,
+                        correction,
+                    ),
+                )
+            else:
+                correction = (
+                    position_limited_correction
+                    if final_da_trim is None
+                    else max(position_limited_correction, final_da_trim)
+                )
+                if da_visible_extra is not None:
+                    correction += da_visible_extra
             combined = float(radar_steering_rad) + correction
             adjusted = max(
                 MIN_VEHICLE_STEERING_RAD,
@@ -864,6 +969,7 @@ class RadarCameraLineApplication:
                 "ab_start_alignment_rad=%.4f "
                 "course_limited_camera_rad=%.4f c_point_trim_rad=%.4f "
                 "final_da_trim_rad=%.4f da_visible_extra_rad=%.4f "
+                "final_da_visual_residual_rad=%.4f "
                 "camera_active=%s "
                 "camera_error_cm=%.2f camera_confidence=%.2f",
                 radar_steering_rad,
@@ -879,6 +985,7 @@ class RadarCameraLineApplication:
                     if da_visible_extra is None
                     else da_visible_extra
                 ),
+                final_da_visual_residual,
                 state.active,
                 state.lateral_error_cm,
                 state.confidence,
@@ -1066,10 +1173,80 @@ class RadarCameraLineApplication:
         )
         return DA_VISIBLE_EXTRA_LEFT_CORRECTION_RAD * fade
 
+    def _final_da_visual_residual(
+        self,
+        *,
+        now_s: float | None = None,
+    ) -> float:
+        now = time.monotonic() if now_s is None else float(now_s)
+        with self._lock:
+            follower_state = self._follower_state
+            timestamp_s = self._final_da_visual_timestamp_s
+            residual_rad = self._final_da_visual_residual_rad
+        if (
+            not follower_state.running
+            or follower_state.completed
+            or follower_state.segment is not TrackSegment.DA
+            or follower_state.progress_cm
+            < FINAL_DA_TRIM_START_PROGRESS_CM
+            or timestamp_s is None
+            or now - timestamp_s > FINAL_DA_VISUAL_HOLD_S
+        ):
+            return 0.0
+        return residual_rad
+
+    def _update_final_da_visual_feedback(
+        self,
+        state: CameraLineCorrectionState,
+    ) -> None:
+        observation = state.observation
+        with self._lock:
+            follower_state = self._follower_state
+        on_post_lap_extension = (
+            follower_state.segment is TrackSegment.AB
+            and follower_state.progress_cm >= self._one_lap_progress_cm
+        )
+        if (
+            not follower_state.running
+            or follower_state.completed
+            or not (
+                (
+                    follower_state.segment is TrackSegment.DA
+                    and follower_state.progress_cm
+                    >= FINAL_DA_TRIM_START_PROGRESS_CM
+                )
+                or on_post_lap_extension
+            )
+            or not state.active
+            or state.valid_frames < 2
+            or observation is None
+            or not observation.detected
+            or observation.round_marker_detected
+            or observation.transverse_line_detected
+            or not math.isfinite(state.lateral_error_cm)
+        ):
+            return
+        magnitude = max(
+            0.0,
+            abs(state.lateral_error_cm) - FINAL_DA_VISUAL_DEADBAND_CM,
+        )
+        residual_rad = math.copysign(
+            min(
+                FINAL_DA_VISUAL_MAX_RESIDUAL_RAD,
+                FINAL_DA_VISUAL_GAIN_RAD_PER_CM * magnitude,
+            ),
+            state.lateral_error_cm,
+        )
+        with self._lock:
+            self._final_da_visual_error_cm = state.lateral_error_cm
+            self._final_da_visual_residual_rad = residual_rad
+            self._final_da_visual_timestamp_s = state.timestamp_s
+
     def _on_camera_state(
         self,
         state: CameraLineCorrectionState,
     ) -> None:
+        self._update_final_da_visual_feedback(state)
         if state.error and state.error != self._last_camera_error:
             LOG.warning(
                 "camera correction degraded; radar remains authoritative: %s",

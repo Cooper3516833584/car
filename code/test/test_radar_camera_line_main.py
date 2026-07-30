@@ -1,9 +1,13 @@
 """Hardware-free tests for radar tracking with soft camera correction."""
 
+import math
 import unittest
 import time
 
-from components.camera_line_correction import CameraLineCorrectionConfig
+from components.camera_line_correction import (
+    CameraLineCorrectionConfig,
+    CameraLineCorrectionState,
+)
 from components.camera_line_follower import LineObservation
 from components.competition_track import TrackFollowerState, TrackSegment
 from components.fleet_models import (
@@ -31,6 +35,7 @@ from main_radar_camera_line_following import (
     CAMERA_LATERAL_DEADBAND_CM,
     CAMERA_MAX_STEERING_CORRECTION_RAD,
     CAMERA_STEERING_GAIN_RAD_PER_CM,
+    CAR_OPERATION_LOCALIZATION_LOST,
     BC_TRACK_SPEED_CM_S,
     CD_TRACK_SPEED_CM_S,
     DA_TRACK_SPEED_CM_S,
@@ -39,8 +44,15 @@ from main_radar_camera_line_following import (
     DA_VISIBLE_TRIM_FULL_PROGRESS_CM,
     DA_VISIBLE_TRIM_START_PROGRESS_CM,
     FINAL_DA_MIN_LEFT_CORRECTION_RAD,
+    FINAL_DA_MAX_TOTAL_LEFT_CORRECTION_RAD,
     FINAL_DA_TRIM_FULL_PROGRESS_CM,
     FINAL_DA_TRIM_START_PROGRESS_CM,
+    FINAL_DA_VISUAL_DEADBAND_CM,
+    FINAL_DA_VISUAL_GAIN_RAD_PER_CM,
+    FINAL_DA_VISUAL_HOLD_S,
+    FINAL_DA_VISUAL_MAX_RESIDUAL_RAD,
+    FINAL_A_MAX_CAMERA_ERROR_CM,
+    FLEET_TERMINAL_REPORT_GRACE_S,
     FLEET_POSITION_REPORTING_ENABLED,
     RADAR_CENTER_BEHIND_A_ALONG_AB_CM,
     MainConfig,
@@ -86,7 +98,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
         self.assertEqual(CD_TRACK_SPEED_CM_S, 30.0)
         self.assertEqual(DA_TRACK_SPEED_CM_S, 15.0)
         self.assertTrue(FLEET_POSITION_REPORTING_ENABLED)
-        self.assertEqual(RADAR_CENTER_BEHIND_A_ALONG_AB_CM, 24.0)
+        self.assertEqual(RADAR_CENTER_BEHIND_A_ALONG_AB_CM, 20.0)
         self.assertTrue(CAMERA_CORRECTION_ENABLED)
         self.assertEqual(CAMERA_LATERAL_DEADBAND_CM, 10.0)
         self.assertEqual(CAMERA_STEERING_GAIN_RAD_PER_CM, 0.010)
@@ -114,6 +126,14 @@ class RadarCameraLineMainTests(unittest.TestCase):
         self.assertEqual(FINAL_DA_TRIM_START_PROGRESS_CM, 725.0)
         self.assertEqual(FINAL_DA_TRIM_FULL_PROGRESS_CM, 740.0)
         self.assertEqual(FINAL_DA_MIN_LEFT_CORRECTION_RAD, 0.100)
+        self.assertEqual(FINAL_DA_VISUAL_DEADBAND_CM, 3.0)
+        self.assertEqual(FINAL_DA_VISUAL_GAIN_RAD_PER_CM, 0.005)
+        self.assertEqual(FINAL_DA_VISUAL_MAX_RESIDUAL_RAD, 0.040)
+        self.assertEqual(FINAL_DA_VISUAL_HOLD_S, 0.65)
+        self.assertEqual(FINAL_DA_MAX_TOTAL_LEFT_CORRECTION_RAD, 0.170)
+        self.assertEqual(FINAL_A_MAX_CAMERA_ERROR_CM, 6.0)
+        self.assertEqual(CAR_OPERATION_LOCALIZATION_LOST, 10)
+        self.assertEqual(FLEET_TERMINAL_REPORT_GRACE_S, 0.5)
         self.assertEqual(
             (
                 config.speed_profile.ab_cm_s,
@@ -123,7 +143,40 @@ class RadarCameraLineMainTests(unittest.TestCase):
             ),
             (12.0, 15.0, 30.0, 15.0),
         )
-        self.assertEqual(config.radar_center_behind_a_cm, 24.0)
+        self.assertEqual(config.radar_center_behind_a_cm, 20.0)
+
+    def test_track_extends_one_lap_until_rear_axle_reaches_a(self):
+        config = MainConfig()
+        application = RadarCameraLineApplication(config)
+        one_lap_progress_cm = application.track.point_at_index(
+            application.track.wrap_start_index
+        ).progress_cm
+
+        self.assertAlmostEqual(
+            application.track.finish_progress_cm - one_lap_progress_cm,
+            config.radar_center_behind_a_cm,
+        )
+        finish_point = next(
+            point
+            for point in application.track.points
+            if math.isclose(
+                point.progress_cm,
+                application.track.finish_progress_cm,
+                abs_tol=1e-9,
+            )
+        )
+        self.assertAlmostEqual(finish_point.x_cm, config.radar_center_behind_a_cm)
+        self.assertAlmostEqual(finish_point.y_cm, 0.0)
+        self.assertGreater(
+            application.track.points[-1].progress_cm,
+            application.track.finish_progress_cm,
+        )
+        self.assertEqual(
+            application.track.segment_at_progress(
+                application.track.finish_progress_cm
+            ),
+            TrackSegment.AB,
+        )
 
     def test_final_da_trim_is_smooth_and_limited_to_lap_end(self):
         application = RadarCameraLineApplication(MainConfig())
@@ -278,6 +331,244 @@ class RadarCameraLineMainTests(unittest.TestCase):
                 self.assertIsNone(actual)
             else:
                 self.assertAlmostEqual(actual, expected)
+
+    def test_final_da_adds_visual_residual_to_fixed_feed_forward(self):
+        application = RadarCameraLineApplication(MainConfig())
+        now = time.monotonic()
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.DA,
+                progress_cm=750.0,
+                target_speed_cm_s=15.0,
+                commanded_speed_cm_s=15.0,
+                steering_angle_rad=-0.32,
+                cross_track_error_cm=4.0,
+                heading_error_deg=-18.0,
+            )
+        )
+        application._on_camera_state(
+            CameraLineCorrectionState(
+                running=True,
+                active=True,
+                timestamp_s=now,
+                confidence=0.82,
+                lateral_error_cm=15.0,
+                valid_frames=4,
+                curve_mode=True,
+                observation=observation(lateral_cm=15.0),
+            )
+        )
+
+        self.assertAlmostEqual(
+            application._final_da_visual_residual(now_s=now),
+            0.040,
+        )
+        self.assertAlmostEqual(
+            application._adjust_radar_steering(-0.32, 15.0),
+            -0.18,
+        )
+
+    def test_final_da_precise_visual_error_preserves_known_good_trim(self):
+        application = RadarCameraLineApplication(MainConfig())
+        now = time.monotonic()
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.DA,
+                progress_cm=750.0,
+                target_speed_cm_s=15.0,
+                commanded_speed_cm_s=15.0,
+                steering_angle_rad=-0.32,
+                cross_track_error_cm=5.0,
+                heading_error_deg=-18.0,
+            )
+        )
+        application._on_camera_state(
+            CameraLineCorrectionState(
+                running=True,
+                active=True,
+                timestamp_s=now,
+                confidence=0.82,
+                lateral_error_cm=2.0,
+                valid_frames=4,
+                curve_mode=True,
+                observation=observation(lateral_cm=2.0),
+            )
+        )
+
+        self.assertEqual(
+            application._final_da_visual_residual(now_s=now),
+            0.0,
+        )
+        self.assertAlmostEqual(
+            application._adjust_radar_steering(-0.32, 15.0),
+            -0.22,
+        )
+
+    def test_final_da_holds_last_trusted_feedback_through_marker(self):
+        application = RadarCameraLineApplication(MainConfig())
+        now = time.monotonic()
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.DA,
+                progress_cm=750.0,
+                target_speed_cm_s=15.0,
+                commanded_speed_cm_s=15.0,
+                steering_angle_rad=-0.32,
+                cross_track_error_cm=5.0,
+                heading_error_deg=-18.0,
+            )
+        )
+        application._on_camera_state(
+            CameraLineCorrectionState(
+                running=True,
+                active=True,
+                timestamp_s=now,
+                confidence=0.82,
+                lateral_error_cm=12.0,
+                valid_frames=4,
+                curve_mode=True,
+                observation=observation(lateral_cm=12.0),
+            )
+        )
+        application._on_camera_state(
+            CameraLineCorrectionState(
+                running=True,
+                active=False,
+                timestamp_s=now + 0.1,
+                confidence=0.30,
+                curve_mode=True,
+                observation=observation(
+                    lateral_cm=14.0,
+                    transverse=True,
+                ),
+            )
+        )
+
+        self.assertAlmostEqual(
+            application._final_da_visual_residual(now_s=now + 0.5),
+            0.040,
+        )
+        self.assertEqual(
+            application._final_da_visual_residual(now_s=now + 0.7),
+            0.0,
+        )
+
+    def test_post_lap_extension_refreshes_terminal_visual_feedback(self):
+        application = RadarCameraLineApplication(MainConfig())
+        now = time.monotonic()
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.AB,
+                progress_cm=application.track.finish_progress_cm - 2.0,
+                target_speed_cm_s=12.0,
+                commanded_speed_cm_s=12.0,
+                steering_angle_rad=0.0,
+                cross_track_error_cm=2.0,
+                heading_error_deg=1.0,
+            )
+        )
+        application._on_camera_state(
+            CameraLineCorrectionState(
+                running=True,
+                active=True,
+                timestamp_s=now,
+                confidence=0.82,
+                lateral_error_cm=8.0,
+                valid_frames=4,
+                curve_mode=False,
+                observation=observation(lateral_cm=8.0),
+            )
+        )
+
+        self.assertEqual(application._final_da_visual_error_cm, 8.0)
+        self.assertEqual(application._final_da_visual_timestamp_s, now)
+        self.assertEqual(
+            application._final_da_visual_residual(now_s=now),
+            0.0,
+        )
+
+    def test_terminal_camera_disagreement_degrades_reported_pose_quality(self):
+        application = RadarCameraLineApplication(MainConfig())
+        now = time.monotonic()
+        with application._lock:
+            application._ready = True
+            application._latest_navigation_pose = NavigationPose(
+                0.0,
+                0.0,
+                0.0,
+                now,
+            )
+            application._final_da_visual_error_cm = 12.0
+            application._final_da_visual_timestamp_s = now
+
+        application._on_follower_state(
+            TrackFollowerState(
+                running=False,
+                completed=True,
+                segment=TrackSegment.AB,
+                progress_cm=772.0,
+                target_speed_cm_s=0.0,
+                commanded_speed_cm_s=0.0,
+                steering_angle_rad=0.0,
+                cross_track_error_cm=4.0,
+                heading_error_deg=-18.0,
+            )
+        )
+
+        state = application._fleet_state()
+        self.assertTrue(
+            state.node_flags & int(NodeFlags.LOCALIZATION_DEGRADED)
+        )
+        self.assertFalse(state.node_flags & int(NodeFlags.POSE_VALID))
+        self.assertEqual(state.pose_quality, 2)
+        self.assertEqual(
+            state.operation_state,
+            CAR_OPERATION_LOCALIZATION_LOST,
+        )
+
+    def test_accurate_terminal_camera_error_still_reports_arrived(self):
+        application = RadarCameraLineApplication(MainConfig())
+        now = time.monotonic()
+        with application._lock:
+            application._ready = True
+            application._latest_navigation_pose = NavigationPose(
+                0.0,
+                0.0,
+                0.0,
+                now,
+            )
+            application._final_da_visual_error_cm = 2.0
+            application._final_da_visual_timestamp_s = now
+
+        application._on_follower_state(
+            TrackFollowerState(
+                running=False,
+                completed=True,
+                segment=TrackSegment.AB,
+                progress_cm=772.0,
+                target_speed_cm_s=0.0,
+                commanded_speed_cm_s=0.0,
+                steering_angle_rad=0.0,
+                cross_track_error_cm=5.0,
+                heading_error_deg=-18.0,
+            )
+        )
+
+        state = application._fleet_state()
+        self.assertTrue(state.node_flags & int(NodeFlags.POSE_VALID))
+        self.assertFalse(
+            state.node_flags & int(NodeFlags.LOCALIZATION_DEGRADED)
+        )
+        self.assertEqual(state.pose_quality, 4)
+        self.assertEqual(state.operation_state, 7)
 
     def test_course_trims_are_applied_by_steering_fusion(self):
         application = RadarCameraLineApplication(MainConfig())
