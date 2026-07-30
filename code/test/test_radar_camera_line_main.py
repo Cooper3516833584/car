@@ -97,8 +97,8 @@ class RadarCameraLineMainTests(unittest.TestCase):
         self.assertEqual(BC_ENTRY_LIMIT_END_PROGRESS_CM, 210.0)
         self.assertEqual(BC_ENTRY_MIN_RIGHT_CORRECTION_RAD, -0.012)
         self.assertEqual(DA_VISIBLE_TRIM_START_PROGRESS_CM, 560.0)
-        self.assertEqual(DA_VISIBLE_TRIM_FULL_PROGRESS_CM, 600.0)
-        self.assertEqual(DA_VISIBLE_MIN_LEFT_CORRECTION_RAD, 0.025)
+        self.assertEqual(DA_VISIBLE_TRIM_FULL_PROGRESS_CM, 590.0)
+        self.assertEqual(DA_VISIBLE_MIN_LEFT_CORRECTION_RAD, 0.045)
         self.assertEqual(FINAL_DA_TRIM_START_PROGRESS_CM, 725.0)
         self.assertEqual(FINAL_DA_TRIM_FULL_PROGRESS_CM, 740.0)
         self.assertEqual(FINAL_DA_MIN_LEFT_CORRECTION_RAD, 0.100)
@@ -136,7 +136,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
                 running=True,
                 completed=False,
                 segment=TrackSegment.DA,
-                progress_cm=580.0,
+                progress_cm=575.0,
                 target_speed_cm_s=30.0,
                 commanded_speed_cm_s=30.0,
                 steering_angle_rad=-0.2,
@@ -144,7 +144,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
                 heading_error_deg=0.0,
             )
         )
-        self.assertAlmostEqual(application._final_da_trim(), 0.0125)
+        self.assertAlmostEqual(application._final_da_trim(), 0.0225)
 
         application._on_follower_state(
             TrackFollowerState(
@@ -159,7 +159,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
                 heading_error_deg=0.0,
             )
         )
-        self.assertAlmostEqual(application._final_da_trim(), 0.025)
+        self.assertAlmostEqual(application._final_da_trim(), 0.045)
 
         application._on_follower_state(
             TrackFollowerState(
@@ -174,7 +174,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
                 heading_error_deg=0.0,
             )
         )
-        self.assertAlmostEqual(application._final_da_trim(), 0.0625)
+        self.assertAlmostEqual(application._final_da_trim(), 0.0725)
 
         application._on_follower_state(
             TrackFollowerState(
