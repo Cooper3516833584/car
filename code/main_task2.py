@@ -19,7 +19,7 @@ from main_radar_camera_line_following import main as _run_core
 # remain independently adjustable for field timing.
 TASK2_AB_SPEED_CM_S = 15.0
 TASK2_BC_SPEED_CM_S = 15.0
-TASK2_CD_SPEED_CM_S = 30.0
+TASK2_CD_SPEED_CM_S = 6.0
 TASK2_DA_SPEED_CM_S = 15.0
 
 TASK2_SPEED_PROFILE = CompetitionTrackSpeedProfile(
