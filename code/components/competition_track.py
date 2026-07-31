@@ -44,9 +44,17 @@ WRAP_EXTENSION_CM: Final[float] = 100.0
 FINISH_APPROACH_DISTANCE_CM: Final[float] = 40.0
 FINISH_APPROACH_SPEED_CM_S: Final[float] = 8.0
 FINISH_POSITION_TOLERANCE_CM: Final[float] = 4.0
-FINISH_CROSS_TRACK_TOLERANCE_CM: Final[float] = 3.0
+# The Euclidean position gate already bounds lateral error.  Keep the explicit
+# cross-track gate equal to it so a centimetre-scale rounding difference cannot
+# reject an otherwise valid finish sample and send the forward-only car past A.
+FINISH_CROSS_TRACK_TOLERANCE_CM: Final[float] = (
+    FINISH_POSITION_TOLERANCE_CM
+)
 FINISH_HEADING_TOLERANCE_DEG: Final[float] = 6.0
-FINISH_MAX_OVERSHOOT_CM: Final[float] = 15.0
+# Once a forward-only car has passed the finish, driving another 15 cm cannot
+# improve its distance to the goal.  Allow one path sample for a final capture,
+# then stop safely instead of reproducing that deterministic overshoot.
+FINISH_MAX_OVERSHOOT_CM: Final[float] = TRACK_SAMPLE_SPACING_CM
 
 
 class TrackSegment(IntEnum):
@@ -563,12 +571,14 @@ class CompetitionTrackFollower:
                     pose.x_cm - finish_goal.x_cm,
                     pose.y_cm - finish_goal.y_cm,
                 )
-                finish_index_reached = (
-                    progress_cm >= self._track.finish_progress_cm
+                finish_capture_reached = (
+                    progress_cm
+                    >= self._track.finish_progress_cm
+                    - FINISH_POSITION_TOLERANCE_CM
                     and self._progress_index >= self._track.wrap_start_index
                 )
                 terminal_tolerance_met = (
-                    finish_index_reached
+                    finish_capture_reached
                     and finish_distance_cm
                     <= FINISH_POSITION_TOLERANCE_CM
                     and abs(command.cross_track_error_cm)
