@@ -91,7 +91,7 @@ class Harness:
 
 class FleetCarNodeTests(unittest.TestCase):
     def test_default_turnaround_supports_dense_pose_polling(self):
-        self.assertEqual(0.05, NodeTiming().turnaround_s)
+        self.assertAlmostEqual(0.10, NodeTiming().turnaround_s)
 
     def test_active_command_sequence_is_exposed_for_async_result_matching(self):
         request = self.request(

@@ -1,0 +1,19 @@
+[Unit]
+Description=Serial-screen competition mission launcher
+Requires=sound-light-alarm.service
+After=sound-light-alarm.service dev-serial-by\x2did-usb\x2djixin.pro_CMSIS\x2dDAP_LU_LU_2022_8888\x2dif00.device
+Wants=dev-serial-by\x2did-usb\x2djixin.pro_CMSIS\x2dDAP_LU_LU_2022_8888\x2dif00.device
+
+[Service]
+Type=simple
+User=radxa
+Group=radxa
+SupplementaryGroups=dialout gpio pwm
+WorkingDirectory=/home/radxa/car/code
+ExecStart=/usr/bin/python3 /home/radxa/car/code/mission_screen_launcher.py --port /dev/serial/by-id/usb-jixin.pro_CMSIS-DAP_LU_LU_2022_8888-if00 --baudrate 9600 --delay-s 10
+Restart=always
+RestartSec=2
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

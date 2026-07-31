@@ -235,7 +235,7 @@ class SurveyReportPayload:
 
 @dataclass(frozen=True)
 class NodeTiming:
-    turnaround_s: float = 0.05
+    turnaround_s: float = 0.10
     queue_size: int = 16
 
 
