@@ -11,7 +11,7 @@ class TaskEntryTests(unittest.TestCase):
     def test_each_task_has_an_independent_segment_profile(self):
         self.assertEqual(
             main_task1.TASK1_SPEED_PROFILE,
-            CompetitionTrackSpeedProfile(4.0, 15.0, 15.0, 15.0),
+            CompetitionTrackSpeedProfile(8.0, 15.0, 20.0, 15.0),
         )
         self.assertEqual(
             main_task2.TASK2_SPEED_PROFILE,

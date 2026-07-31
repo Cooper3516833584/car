@@ -99,10 +99,10 @@ class RadarCameraLineMainTests(unittest.TestCase):
     def test_editable_defaults_match_radar_fixed_track_entry(self):
         config = MainConfig()
 
-        self.assertEqual(AB_TRACK_SPEED_CM_S, 4.0)
+        self.assertEqual(AB_TRACK_SPEED_CM_S, 8.0)
         self.assertEqual(BC_TRACK_SPEED_CM_S, 15.0)
-        self.assertEqual(CD_TRACK_SPEED_CM_S, 30.0)
-        self.assertEqual(DA_TRACK_SPEED_CM_S, 30.0)
+        self.assertEqual(CD_TRACK_SPEED_CM_S, 20.0)
+        self.assertEqual(DA_TRACK_SPEED_CM_S, 15.0)
         self.assertTrue(FLEET_POSITION_REPORTING_ENABLED)
         self.assertEqual(RADAR_CENTER_BEHIND_A_ALONG_AB_CM, 18.625)
         self.assertTrue(CAMERA_CORRECTION_ENABLED)
@@ -165,7 +165,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
                 config.speed_profile.cd_cm_s,
                 config.speed_profile.da_cm_s,
             ),
-            (4.0, 15.0, 30.0, 30.0),
+            (8.0, 15.0, 20.0, 15.0),
         )
         self.assertEqual(config.radar_center_behind_a_cm, 18.625)
 

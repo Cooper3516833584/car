@@ -16,9 +16,9 @@ from main_radar_camera_line_following import main as _run_core
 
 # Task 1 (payload drop) segment speeds.  These values are independent from
 # task 2 and can be changed directly before the competition.
-TASK1_AB_SPEED_CM_S = 4.0
+TASK1_AB_SPEED_CM_S = 8.0
 TASK1_BC_SPEED_CM_S = 15.0
-TASK1_CD_SPEED_CM_S = 15.0
+TASK1_CD_SPEED_CM_S = 20.0
 TASK1_DA_SPEED_CM_S = 15.0
 
 TASK1_SPEED_PROFILE = CompetitionTrackSpeedProfile(
