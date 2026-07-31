@@ -41,6 +41,12 @@ S_FINISH_CM: Final[float] = 300.0 + 2.0 * math.pi * TRACK_RADIUS_CM
 
 TRACK_SAMPLE_SPACING_CM: Final[float] = 2.5
 WRAP_EXTENSION_CM: Final[float] = 100.0
+FINISH_APPROACH_DISTANCE_CM: Final[float] = 40.0
+FINISH_APPROACH_SPEED_CM_S: Final[float] = 8.0
+FINISH_POSITION_TOLERANCE_CM: Final[float] = 4.0
+FINISH_CROSS_TRACK_TOLERANCE_CM: Final[float] = 3.0
+FINISH_HEADING_TOLERANCE_DEG: Final[float] = 6.0
+FINISH_MAX_OVERSHOOT_CM: Final[float] = 15.0
 
 
 class TrackSegment(IntEnum):
@@ -206,6 +212,11 @@ class CompetitionTrack:
         self.segment_start_indices = segment_start_indices
         self.wrap_start_index = wrap_start_index
         self._finish_progress_cm = finish_progress_cm
+        self._finish_index = next(
+            index
+            for index, point in enumerate(points)
+            if point.progress_cm >= finish_progress_cm
+        )
 
     @classmethod
     def build(
@@ -377,6 +388,10 @@ class CompetitionTrack:
     def finish_progress_cm(self) -> float:
         return self._finish_progress_cm
 
+    @property
+    def finish_point(self) -> CompetitionTrackPoint:
+        return self._points[self._finish_index]
+
     def point_at_index(self, index: int) -> CompetitionTrackPoint:
         return self._points[index]
 
@@ -447,6 +462,8 @@ class CompetitionTrackFollower:
         self._on_state_changed = on_state_changed
         self._running = False
         self._completed = False
+        self._terminal_tolerance_met = False
+        self._terminal_hard_stop_triggered = False
         self._progress_index = 0
         self._lock = threading.Lock()
         self._state = TrackFollowerState(
@@ -480,11 +497,23 @@ class CompetitionTrackFollower:
         with self._lock:
             return self._state.progress_cm
 
+    @property
+    def terminal_tolerance_met(self) -> bool:
+        with self._lock:
+            return self._terminal_tolerance_met
+
+    @property
+    def terminal_hard_stop_triggered(self) -> bool:
+        with self._lock:
+            return self._terminal_hard_stop_triggered
+
     def start_mission(self) -> None:
         with self._lock:
             if self._running or self._completed:
                 return
             self._running = True
+            self._terminal_tolerance_met = False
+            self._terminal_hard_stop_triggered = False
             self._progress_index = 0
             self._state = replace(
                 self._state,
@@ -529,13 +558,38 @@ class CompetitionTrackFollower:
                     self._state.progress_cm,
                     point.progress_cm,
                 )
-                if (
+                finish_goal = self._track.finish_point
+                finish_distance_cm = math.hypot(
+                    pose.x_cm - finish_goal.x_cm,
+                    pose.y_cm - finish_goal.y_cm,
+                )
+                finish_index_reached = (
                     progress_cm >= self._track.finish_progress_cm
                     and self._progress_index >= self._track.wrap_start_index
-                ):
+                )
+                terminal_tolerance_met = (
+                    finish_index_reached
+                    and finish_distance_cm
+                    <= FINISH_POSITION_TOLERANCE_CM
+                    and abs(command.cross_track_error_cm)
+                    <= FINISH_CROSS_TRACK_TOLERANCE_CM
+                    and abs(command.heading_error_deg)
+                    <= FINISH_HEADING_TOLERANCE_DEG
+                )
+                terminal_hard_stop = (
+                    progress_cm
+                    >= self._track.finish_progress_cm
+                    + FINISH_MAX_OVERSHOOT_CM
+                )
+                if terminal_tolerance_met or terminal_hard_stop:
                     self.drive.stop(center_steering=True)
                     self._running = False
                     self._completed = True
+                    self._terminal_tolerance_met = terminal_tolerance_met
+                    self._terminal_hard_stop_triggered = (
+                        terminal_hard_stop
+                        and not terminal_tolerance_met
+                    )
                     self._state = TrackFollowerState(
                         False,
                         True,
@@ -548,15 +602,50 @@ class CompetitionTrackFollower:
                         command.heading_error_deg,
                     )
                     state = self._state
-                    LOG.info(
-                        "competition track complete progress_cm=%.2f path_index=%d",
-                        progress_cm,
-                        self._progress_index,
-                    )
+                    if terminal_tolerance_met:
+                        LOG.info(
+                            "competition track complete progress_cm=%.2f "
+                            "path_index=%d finish_distance_cm=%.2f "
+                            "cross_track_cm=%.2f heading_error_deg=%.2f",
+                            progress_cm,
+                            self._progress_index,
+                            finish_distance_cm,
+                            command.cross_track_error_cm,
+                            command.heading_error_deg,
+                        )
+                    else:
+                        LOG.warning(
+                            "competition track terminal hard stop "
+                            "progress_cm=%.2f path_index=%d "
+                            "finish_distance_cm=%.2f cross_track_cm=%.2f "
+                            "heading_error_deg=%.2f",
+                            progress_cm,
+                            self._progress_index,
+                            finish_distance_cm,
+                            command.cross_track_error_cm,
+                            command.heading_error_deg,
+                        )
                 else:
-                    target_speed_cm_s = self.speed_profile.for_segment(
+                    cruise_speed_cm_s = self.speed_profile.for_segment(
                         point.segment
                     )
+                    remaining_cm = max(
+                        0.0,
+                        self._track.finish_progress_cm - progress_cm,
+                    )
+                    if remaining_cm >= FINISH_APPROACH_DISTANCE_CM:
+                        target_speed_cm_s = cruise_speed_cm_s
+                    else:
+                        approach_speed_cm_s = min(
+                            cruise_speed_cm_s,
+                            FINISH_APPROACH_SPEED_CM_S,
+                        )
+                        blend = (
+                            remaining_cm / FINISH_APPROACH_DISTANCE_CM
+                        )
+                        target_speed_cm_s = approach_speed_cm_s + (
+                            cruise_speed_cm_s - approach_speed_cm_s
+                        ) * blend
                     plan = self.drive.set_motion(
                         target_speed_cm_s * 10.0,
                         command.steering_angle_rad,

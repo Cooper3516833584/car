@@ -5,6 +5,9 @@ from components.competition_track import (
     CompetitionTrack,
     CompetitionTrackFollower,
     CompetitionTrackSpeedProfile,
+    FINISH_APPROACH_DISTANCE_CM,
+    FINISH_APPROACH_SPEED_CM_S,
+    FINISH_MAX_OVERSHOOT_CM,
     S_FINISH_CM,
     TrackSegment,
 )
@@ -43,9 +46,18 @@ class FakeDrive:
 
 
 class FakeController:
-    def __init__(self, *, index, steering_angle_rad):
+    def __init__(
+        self,
+        *,
+        index,
+        steering_angle_rad,
+        cross_track_error_cm=2.5,
+        heading_error_deg=4.0,
+    ):
         self.index = index
         self.steering_angle_rad = steering_angle_rad
+        self.cross_track_error_cm = cross_track_error_cm
+        self.heading_error_deg = heading_error_deg
         self.calls = []
 
     def compute(self, pose, path, *, min_path_index=0):
@@ -55,10 +67,10 @@ class FakeController:
             steering_angle_rad=self.steering_angle_rad,
             direction=MotorDirection.FORWARD,
             nearest_path_index=self.index,
-            cross_track_error_cm=2.5,
+            cross_track_error_cm=self.cross_track_error_cm,
             distance_to_goal_cm=500.0,
-            signed_cross_track_error_cm=-2.5,
-            heading_error_deg=4.0,
+            signed_cross_track_error_cm=-self.cross_track_error_cm,
+            heading_error_deg=self.heading_error_deg,
         )
 
 
@@ -183,6 +195,115 @@ class CompetitionTrackFollowerTests(unittest.TestCase):
             self.assertEqual(state.target_speed_cm_s, expected_speed)
             self.assertEqual(self.drive.commands[-1][0], expected_speed * 10.0)
         self.assertEqual(self.drive.stops, 0)
+
+    def test_terminal_approach_speed_ramps_to_eight_cm_s(self):
+        finish_index = next(
+            index
+            for index, point in enumerate(self.track.points)
+            if point.progress_cm >= self.track.finish_progress_cm
+        )
+        approach_index = next(
+            index
+            for index, point in enumerate(self.track.points)
+            if point.progress_cm
+            >= self.track.finish_progress_cm
+            - FINISH_APPROACH_DISTANCE_CM / 2.0
+        )
+        controller = FakeController(
+            index=approach_index,
+            steering_angle_rad=0.0,
+        )
+        follower = CompetitionTrackFollower(
+            drive=self.drive,
+            track=self.track,
+            speed_cm_s=30.0,
+            controller=controller,
+        )
+        follower.start_mission()
+
+        state = follower.update_from_radar(
+            radar_update(self.track, approach_index)
+        )
+        self.assertGreater(state.target_speed_cm_s, FINISH_APPROACH_SPEED_CM_S)
+        self.assertLess(state.target_speed_cm_s, 30.0)
+
+        controller.index = finish_index
+        controller.cross_track_error_cm = 4.0
+        state = follower.update_from_radar(
+            radar_update(self.track, finish_index)
+        )
+        self.assertTrue(state.running)
+        self.assertEqual(
+            state.target_speed_cm_s,
+            FINISH_APPROACH_SPEED_CM_S,
+        )
+
+    def test_completion_waits_for_terminal_position_heading_and_cross_track(self):
+        finish_index = next(
+            index
+            for index, point in enumerate(self.track.points)
+            if point.progress_cm >= self.track.finish_progress_cm
+        )
+        controller = FakeController(
+            index=finish_index,
+            steering_angle_rad=0.0,
+            cross_track_error_cm=4.0,
+            heading_error_deg=8.0,
+        )
+        follower = CompetitionTrackFollower(
+            drive=self.drive,
+            track=self.track,
+            speed_cm_s=30.0,
+            controller=controller,
+        )
+        follower.start_mission()
+
+        outside = follower.update_from_radar(
+            radar_update(self.track, finish_index)
+        )
+        self.assertTrue(outside.running)
+        self.assertFalse(outside.completed)
+        self.assertEqual(self.drive.stops, 0)
+
+        controller.cross_track_error_cm = 2.0
+        controller.heading_error_deg = 4.0
+        inside = follower.update_from_radar(
+            radar_update(self.track, finish_index)
+        )
+        self.assertFalse(inside.running)
+        self.assertTrue(inside.completed)
+        self.assertTrue(follower.terminal_tolerance_met)
+        self.assertEqual(self.drive.stops, 1)
+
+    def test_terminal_hard_stop_prevents_unbounded_overshoot(self):
+        hard_stop_index = next(
+            index
+            for index, point in enumerate(self.track.points)
+            if point.progress_cm
+            >= self.track.finish_progress_cm + FINISH_MAX_OVERSHOOT_CM
+        )
+        controller = FakeController(
+            index=hard_stop_index,
+            steering_angle_rad=0.0,
+            cross_track_error_cm=10.0,
+            heading_error_deg=20.0,
+        )
+        follower = CompetitionTrackFollower(
+            drive=self.drive,
+            track=self.track,
+            speed_cm_s=30.0,
+            controller=controller,
+        )
+        follower.start_mission()
+
+        state = follower.update_from_radar(
+            radar_update(self.track, hard_stop_index)
+        )
+        self.assertFalse(state.running)
+        self.assertTrue(state.completed)
+        self.assertFalse(follower.terminal_tolerance_met)
+        self.assertTrue(follower.terminal_hard_stop_triggered)
+        self.assertEqual(self.drive.stops, 1)
 
     def test_start_does_not_misclassify_completion(self):
         self.assertTrue(self.follower.state.running)
