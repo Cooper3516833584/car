@@ -21,6 +21,7 @@ from .fleet_models import (
 )
 from .fleet_protocol import (
     FrameParser,
+    ProtocolError,
     RecentResponseCache,
     SequenceCounter,
     VERSION,
@@ -28,12 +29,20 @@ from .fleet_protocol import (
     decode_command,
     decode_coordinate_frame,
     decode_disaster_rescue,
+    decode_trace_request,
     encode_ack,
     encode_map_report,
     encode_path_report,
     encode_report,
+    encode_trace_report,
     new_session,
     pack_frame,
+)
+from .fleet_trace import (
+    PoseTraceBuffer,
+    PoseTraceSampler,
+    TraceSamplingOptions,
+    car_state_to_trace_sample,
 )
 
 
@@ -51,6 +60,7 @@ class FleetCarNode:
         on_start_mission: Optional[Callable[[], CommandResult]] = None,
         timing: NodeTiming = NodeTiming(),
         wait: Optional[Callable[[float], bool]] = None,
+        trace_options: TraceSamplingOptions = TraceSamplingOptions(),
     ) -> None:
         self._writer = writer
         self._state_provider = state_provider
@@ -78,6 +88,17 @@ class FleetCarNode:
         self._active_command_seq = 0
         self._active_command_status = 0
         self._error_code = 0
+        self._trace_buffer = PoseTraceBuffer(trace_options)
+        self._trace_sampler = (
+            PoseTraceSampler(
+                state_provider=state_provider,
+                trace_buffer=self._trace_buffer,
+                options=trace_options,
+                state_adapter=car_state_to_trace_sample,
+            )
+            if trace_options.enabled
+            else None
+        )  # type: Optional[PoseTraceSampler]
 
     def set_disaster_handler(self, callback: Callable) -> None:
         """Install the task-layer rescue callback before accepting commands."""
@@ -89,6 +110,14 @@ class FleetCarNode:
     def active_command_seq(self) -> int:
         """Return the request sequence currently represented by status reports."""
         return self._active_command_seq
+
+    @property
+    def trace_buffer(self) -> PoseTraceBuffer:
+        return self._trace_buffer
+
+    @property
+    def trace_sampler(self) -> Optional[PoseTraceSampler]:
+        return self._trace_sampler
 
     def set_active_command_result(
         self, result: CommandResult, request_seq: Optional[int] = None
@@ -106,6 +135,8 @@ class FleetCarNode:
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
+        if self._trace_sampler is not None:
+            self._trace_sampler.start()
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run, name="fleetbus-car-node", daemon=True
@@ -133,6 +164,8 @@ class FleetCarNode:
                     self.dropped_requests += 1
 
     def close(self) -> None:
+        if self._trace_sampler is not None:
+            self._trace_sampler.close()
         self._stop_event.set()
         try:
             self._queue.put_nowait((-1, 0, None))
@@ -163,7 +196,10 @@ class FleetCarNode:
                     continue
             if request is None:
                 return
-            reply = self._handle(request)
+            try:
+                reply = self._handle(request)
+            except ProtocolError:
+                continue
             if reply is None:
                 continue
             if self._wait(self._timing.turnaround_s):
@@ -182,6 +218,13 @@ class FleetCarNode:
             return self._map_report(request)
         if request.kind == MessageKind.PATH_REQUEST:
             return self._path_report(request)
+        if request.kind == MessageKind.TRACE_REQUEST:
+            cached = self._cache.get(request.session, request.seq)
+            if cached is not None:
+                return cached
+            reply = self._trace_report(request)
+            self._cache.put(request.session, request.seq, reply)
+            return reply
         if request.kind != MessageKind.COMMAND:
             return None
         cached = self._cache.get(request.session, request.seq)
@@ -342,3 +385,15 @@ class FleetCarNode:
             points,
         )
         return self._frame(MessageKind.PATH_REPORT, encode_path_report(payload))
+
+    def _trace_report(self, request: Frame) -> bytes:
+        trace_request = decode_trace_request(request.payload)
+        report = self._trace_buffer.build_report(
+            request.session,
+            request.seq,
+            trace_request,
+        )
+        return self._frame(
+            MessageKind.TRACE_REPORT,
+            encode_trace_report(report),
+        )

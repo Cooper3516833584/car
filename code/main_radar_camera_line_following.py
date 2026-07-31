@@ -52,6 +52,7 @@ from components.camera_line_correction import (
     CameraLineSteeringCorrector,
 )
 from components.fleet_car_node import FleetCarNode
+from components.fleet_trace import TraceSamplingOptions
 from components.fleet_models import (
     AckReason as FleetAckReason,
     AckStatus as FleetAckStatus,
@@ -464,6 +465,13 @@ class RadarCameraLineApplication:
                 on_stop=self._fleet_stop,
                 on_set_alarm=self._fleet_set_alarm,
                 on_start_mission=self._fleet_start_mission,
+                trace_options=TraceSamplingOptions(
+                    enabled=True,
+                    sample_interval_s=0.10,
+                    buffer_capacity=600,
+                    min_distance_cm=1.0,
+                    stationary_keepalive_s=1.0,
+                ),
             )
 
     @property

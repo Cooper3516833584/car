@@ -235,6 +235,53 @@ class FleetCarNodeTests(unittest.TestCase):
         path_frame = unpack_frame(self.h.send(self.request(MessageKind.PATH_REQUEST, b"", seq=2)))
         self.assertEqual(len(decode_path_report(path_frame.payload).points), 3)
 
+    def test_trace_request_returns_legal_empty_report(self):
+        raw = self.h.send(self.request(
+            MessageKind.TRACE_REQUEST,
+            encode_trace_request(TraceRequestPayload(0, 0, 15, 0)),
+            seq=30,
+        ))
+        frame = unpack_frame(raw)
+        self.assertEqual(MessageKind.TRACE_REPORT, frame.kind)
+        report = decode_trace_report(frame.payload)
+        self.assertEqual((55, 30), (report.request_session, report.request_seq))
+        self.assertNotEqual(0, report.trace_session)
+        self.assertEqual((), report.samples)
+
+    def test_trace_request_is_read_only_batched_and_cached(self):
+        self.h.node.trace_buffer.record(
+            TraceSample(100, 1, 2, 0, 400, 4, int(TraceSampleFlags.POSE_VALID))
+        )
+        self.h.node.trace_buffer.record(
+            TraceSample(200, 3, 4, 0, 500, 3, int(TraceSampleFlags.POSE_VALID))
+        )
+        request = self.request(
+            MessageKind.TRACE_REQUEST,
+            encode_trace_request(TraceRequestPayload(0, 0, 15, 0)),
+            seq=31,
+        )
+        first = self.h.send(request)
+        report = decode_trace_report(unpack_frame(first).payload)
+        self.assertEqual(2, len(report.samples))
+        self.assertTrue(report.report_flags & int(TraceReportFlags.CURSOR_RESET))
+        self.assertEqual([], self.h.coordinate_calls)
+        self.assertEqual([], self.h.navigate_calls)
+        self.assertEqual(0, self.h.stop_calls)
+        self.assertEqual(first, self.h.send(request))
+
+    def test_invalid_trace_request_does_not_stop_reply_worker(self):
+        self.h.node.feed_frame(pack_frame(self.request(
+            MessageKind.TRACE_REQUEST,
+            b"",
+            seq=32,
+        )))
+        raw = self.h.send(self.request(
+            MessageKind.POLL,
+            encode_poll(PollPayload()),
+            seq=33,
+        ))
+        self.assertEqual(MessageKind.REPORT, unpack_frame(raw).kind)
+
     def test_stop_is_idempotent_for_duplicate_and_new_sequence(self):
         payload = encode_command(CommandPayload(CommandId.TARGETED_STOP))
         self.h.send(self.request(MessageKind.COMMAND, payload, seq=4))

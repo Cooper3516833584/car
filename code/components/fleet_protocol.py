@@ -9,7 +9,8 @@ from .fleet_models import (
     AckPayload, CarNavigateCommand, CommandPayload, CoordinateFrameCommand,
     DisasterRescueCommand, DroneGotoCommand, Frame, GoalFlags,
     MapReportPayload, ParserStats, PathReportPayload, PollPayload,
-    ReportPayload, SurveyReportPayload,
+    ReportPayload, SurveyReportPayload, TraceReportFlags,
+    TraceReportPayload, TraceRequestPayload, TraceSample,
 )
 
 MAGIC = b"\xD3\x91"
@@ -31,6 +32,16 @@ POINT = struct.Struct("<ii")
 SURVEY_REPORT_HEADER = struct.Struct("<IHHBHBBHBB")
 DISASTER_RESCUE_HEADER = struct.Struct("<HBB")
 SURVEY_CELL_COUNT = 15
+TRACE_REQUEST = struct.Struct("<IIBB")
+TRACE_REPORT_HEADER = struct.Struct("<IHIIIIBB")
+TRACE_SAMPLE_ABSOLUTE = struct.Struct("<IiiiHBB")
+TRACE_SAMPLE_DELTA = struct.Struct("<HhhhHBB")
+TRACE_MAX_SAMPLES = 15
+TRACE_REPORT_FLAG_MASK = int(
+    TraceReportFlags.MORE_PENDING
+    | TraceReportFlags.CURSOR_RESET
+    | TraceReportFlags.BUFFER_OVERRUN
+)
 FIXED_HEADER_LEN = HEADER.size
 FRAME_OVERHEAD = FIXED_HEADER_LEN + CRC.size + len(TAIL)
 
@@ -244,6 +255,218 @@ def decode_report(data: bytes) -> ReportPayload:
     _heading(value.heading_cdeg)
     _range("pose_quality", value.pose_quality, 0, 4)
     return value
+
+
+def encode_trace_request(value: TraceRequestPayload) -> bytes:
+    max_samples = _range("max_samples", value.max_samples, 1, TRACE_MAX_SAMPLES)
+    flags = _u8("flags", value.flags)
+    if flags:
+        raise ProtocolError("payload", "TRACE_REQUEST flags must be zero")
+    return TRACE_REQUEST.pack(
+        _u32("known_trace_session", value.known_trace_session),
+        _u32("after_sample_seq", value.after_sample_seq),
+        max_samples,
+        flags,
+    )
+
+
+def decode_trace_request(data: bytes) -> TraceRequestPayload:
+    if len(data) != TRACE_REQUEST.size:
+        raise ProtocolError(
+            "payload",
+            "TRACE_REQUEST payload must be {} bytes".format(TRACE_REQUEST.size),
+        )
+    value = TraceRequestPayload(*TRACE_REQUEST.unpack(data))
+    encode_trace_request(value)
+    return value
+
+
+def validate_trace_sample(sample: TraceSample) -> None:
+    if not isinstance(sample, TraceSample):
+        raise ProtocolError("payload", "sample must be a TraceSample")
+    _u32("uptime_ms", sample.uptime_ms)
+    _i32("x_cm", sample.x_cm)
+    _i32("y_cm", sample.y_cm)
+    _i32("z_cm", sample.z_cm)
+    _heading(sample.heading_cdeg)
+    _range("quality", sample.quality, 0, 4)
+    _u8("sample_flags", sample.flags)
+
+
+def _validate_trace_report_header(
+    value: TraceReportPayload, sample_count: int
+) -> None:
+    _u32("request_session", value.request_session)
+    _u16("request_seq", value.request_seq)
+    _u32("trace_session", value.trace_session)
+    _u32("oldest_available_seq", value.oldest_available_seq)
+    _u32("first_sample_seq", value.first_sample_seq)
+    _u32("latest_available_seq", value.latest_available_seq)
+    report_flags = _u8("report_flags", value.report_flags)
+    if report_flags & ~TRACE_REPORT_FLAG_MASK:
+        raise ProtocolError("payload", "TRACE_REPORT contains unknown flags")
+    if not 0 <= sample_count <= TRACE_MAX_SAMPLES:
+        raise ProtocolError(
+            "payload",
+            "TRACE_REPORT sample count must be between 0 and {}".format(
+                TRACE_MAX_SAMPLES
+            ),
+        )
+    if sample_count == 0:
+        if value.first_sample_seq != 0:
+            raise ProtocolError(
+                "payload", "empty TRACE_REPORT must have first_sample_seq zero"
+            )
+        return
+    if value.first_sample_seq == 0:
+        raise ProtocolError(
+            "payload", "non-empty TRACE_REPORT must have a nonzero first sample"
+        )
+    last_sample_seq = value.first_sample_seq + sample_count - 1
+    if last_sample_seq > 0xFFFFFFFF:
+        raise ProtocolError("range", "TRACE_REPORT sample sequence overflows uint32")
+    if value.latest_available_seq < last_sample_seq:
+        raise ProtocolError(
+            "payload", "TRACE_REPORT samples exceed latest_available_seq"
+        )
+
+
+def encode_trace_report(value: TraceReportPayload) -> bytes:
+    samples = tuple(value.samples)
+    sample_count = len(samples)
+    _validate_trace_report_header(value, sample_count)
+    encoded = bytearray(
+        TRACE_REPORT_HEADER.pack(
+            value.request_session,
+            value.request_seq,
+            value.trace_session,
+            value.oldest_available_seq,
+            value.first_sample_seq,
+            value.latest_available_seq,
+            sample_count,
+            value.report_flags,
+        )
+    )
+    if samples:
+        first = samples[0]
+        validate_trace_sample(first)
+        encoded.extend(
+            TRACE_SAMPLE_ABSOLUTE.pack(
+                first.uptime_ms,
+                first.x_cm,
+                first.y_cm,
+                first.z_cm,
+                first.heading_cdeg,
+                first.quality,
+                first.flags,
+            )
+        )
+        previous = first
+        for sample in samples[1:]:
+            validate_trace_sample(sample)
+            dt_ms = _range(
+                "dt_ms", sample.uptime_ms - previous.uptime_ms, 1, 0xFFFF
+            )
+            dx_cm = _i16("dx_cm", sample.x_cm - previous.x_cm)
+            dy_cm = _i16("dy_cm", sample.y_cm - previous.y_cm)
+            dz_cm = _i16("dz_cm", sample.z_cm - previous.z_cm)
+            encoded.extend(
+                TRACE_SAMPLE_DELTA.pack(
+                    dt_ms,
+                    dx_cm,
+                    dy_cm,
+                    dz_cm,
+                    sample.heading_cdeg,
+                    sample.quality,
+                    sample.flags,
+                )
+            )
+            previous = sample
+    if len(encoded) > MAX_PAYLOAD_LEN:
+        raise ProtocolError("oversize", "TRACE_REPORT exceeds FleetBus V1 limit")
+    return bytes(encoded)
+
+
+def decode_trace_report(data: bytes) -> TraceReportPayload:
+    payload_data = bytes(data)
+    if len(payload_data) > MAX_PAYLOAD_LEN:
+        raise ProtocolError("oversize", "TRACE_REPORT exceeds FleetBus V1 limit")
+    if len(payload_data) < TRACE_REPORT_HEADER.size:
+        raise ProtocolError("payload", "TRACE_REPORT payload is too short")
+    (
+        request_session,
+        request_seq,
+        trace_session,
+        oldest_available_seq,
+        first_sample_seq,
+        latest_available_seq,
+        sample_count,
+        report_flags,
+    ) = TRACE_REPORT_HEADER.unpack_from(payload_data)
+    expected_size = TRACE_REPORT_HEADER.size
+    if sample_count:
+        expected_size += TRACE_SAMPLE_ABSOLUTE.size
+        expected_size += (sample_count - 1) * TRACE_SAMPLE_DELTA.size
+    if len(payload_data) != expected_size:
+        raise ProtocolError(
+            "payload", "TRACE_REPORT sample count/length mismatch"
+        )
+    provisional = TraceReportPayload(
+        request_session,
+        request_seq,
+        trace_session,
+        oldest_available_seq,
+        first_sample_seq,
+        latest_available_seq,
+        report_flags,
+        (),
+    )
+    _validate_trace_report_header(provisional, sample_count)
+    if not sample_count:
+        return provisional
+
+    values = TRACE_SAMPLE_ABSOLUTE.unpack_from(
+        payload_data, TRACE_REPORT_HEADER.size
+    )
+    first = TraceSample(*values)
+    validate_trace_sample(first)
+    samples = [first]
+    previous = first
+    offset = TRACE_REPORT_HEADER.size + TRACE_SAMPLE_ABSOLUTE.size
+    for _ in range(1, sample_count):
+        (
+            dt_ms,
+            dx_cm,
+            dy_cm,
+            dz_cm,
+            heading_cdeg,
+            quality,
+            sample_flags,
+        ) = TRACE_SAMPLE_DELTA.unpack_from(payload_data, offset)
+        _range("dt_ms", dt_ms, 1, 0xFFFF)
+        sample = TraceSample(
+            _u32("uptime_ms", previous.uptime_ms + dt_ms),
+            _i32("x_cm", previous.x_cm + dx_cm),
+            _i32("y_cm", previous.y_cm + dy_cm),
+            _i32("z_cm", previous.z_cm + dz_cm),
+            heading_cdeg,
+            quality,
+            sample_flags,
+        )
+        validate_trace_sample(sample)
+        samples.append(sample)
+        previous = sample
+        offset += TRACE_SAMPLE_DELTA.size
+    return TraceReportPayload(
+        request_session,
+        request_seq,
+        trace_session,
+        oldest_available_seq,
+        first_sample_seq,
+        latest_available_seq,
+        report_flags,
+        tuple(samples),
+    )
 
 
 def encode_command(value: CommandPayload) -> bytes:

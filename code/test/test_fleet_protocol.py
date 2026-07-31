@@ -27,6 +27,25 @@ class FleetProtocolTests(unittest.TestCase):
             for col in range(5)
         )
         encoded = {
+            "trace_request": encode_trace_request(
+                TraceRequestPayload(0x12345678, 100, 15, 0)
+            ).hex(),
+            "trace_report": encode_trace_report(
+                TraceReportPayload(
+                    0x10203040,
+                    0x5060,
+                    0x708090A0,
+                    7,
+                    8,
+                    10,
+                    0,
+                    (
+                        TraceSample(1000, -100, 200, -300, 35999, 4, 1),
+                        TraceSample(1100, -90, 180, -270, 0, 3, 3),
+                        TraceSample(1200, 10, 80, -170, 1234, 2, 1),
+                    ),
+                )
+            ).hex(),
             "poll": encode_poll(PollPayload(7)).hex(),
             "report": encode_report(
                 ReportPayload(1, 2, 3, 4, -5, 6, 7, 800, 9, -10, 11, 1200, 4, 3, 12, 2, 0)
@@ -65,6 +84,14 @@ class FleetProtocolTests(unittest.TestCase):
                 DisasterRescueCommand(4, 2, 3, terrain)
             ).hex(),
         }
+        self.assertEqual(
+            "78563412640000000f00",
+            encoded.pop("trace_request"),
+        )
+        self.assertEqual(
+            "403020106050a090807007000000080000000a0000000300e80300009cffffffc8000000d4feffff9f8c040164000a00ecff1e0000000303640064009cff6400d2040201",
+            encoded.pop("trace_report"),
+        )
         self.assertEqual(set(encoded), set(DATA["payload_vectors"]))
         for name, expected in DATA["payload_vectors"].items():
             self.assertEqual(encoded[name], expected, name)

@@ -23,6 +23,8 @@ class MessageKind(IntEnum):
     PATH_REPORT = 0x08
     SURVEY_REQUEST = 0x09
     SURVEY_REPORT = 0x0A
+    TRACE_REQUEST = 0x0B
+    TRACE_REPORT = 0x0C
 
 
 class CommandId(IntEnum):
@@ -104,6 +106,19 @@ class TerrainCode(IntEnum):
 class SurveyFlags(IntFlag):
     COMPLETE = 0x01
     ABSOLUTE_POSITIONS = 0x02
+
+
+class TraceReportFlags(IntFlag):
+    NONE = 0x00
+    MORE_PENDING = 0x01
+    CURSOR_RESET = 0x02
+    BUFFER_OVERRUN = 0x04
+
+
+class TraceSampleFlags(IntFlag):
+    NONE = 0x00
+    POSE_VALID = 0x01
+    LOCALIZATION_DEGRADED = 0x02
 
 
 @dataclass(frozen=True)
@@ -231,6 +246,37 @@ class SurveyReportPayload:
     debris_col: int
     terrain_codes: Tuple[int, ...]
     cell_positions_cm: Tuple[Tuple[int, int], ...] = ()
+
+
+@dataclass(frozen=True)
+class TraceRequestPayload:
+    known_trace_session: int
+    after_sample_seq: int
+    max_samples: int = 15
+    flags: int = 0
+
+
+@dataclass(frozen=True)
+class TraceSample:
+    uptime_ms: int
+    x_cm: int
+    y_cm: int
+    z_cm: int
+    heading_cdeg: int
+    quality: int
+    flags: int
+
+
+@dataclass(frozen=True)
+class TraceReportPayload:
+    request_session: int
+    request_seq: int
+    trace_session: int
+    oldest_available_seq: int
+    first_sample_seq: int
+    latest_available_seq: int
+    report_flags: int
+    samples: Tuple[TraceSample, ...] = ()
 
 
 @dataclass(frozen=True)
