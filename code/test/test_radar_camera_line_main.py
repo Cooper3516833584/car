@@ -25,6 +25,7 @@ from main_radar_camera_line_following import (
     AB_LATERAL_ALIGNMENT_MIN_VALID_FRAMES,
     AB_LATERAL_ALIGNMENT_RAMP_START_PROGRESS_CM,
     AB_LATERAL_ALIGNMENT_REQUIRED_MEASUREMENTS,
+    AB_LATERAL_ALIGNMENT_TERMINAL_FADE_DISTANCE_CM,
     AB_LINE_ASSIST_FADE_END_PROGRESS_CM,
     AB_LINE_ASSIST_FULL_END_PROGRESS_CM,
     AB_LINE_ASSIST_GAIN_RAD_PER_CM,
@@ -141,6 +142,10 @@ class RadarCameraLineMainTests(unittest.TestCase):
             60.0,
         )
         self.assertEqual(AB_LATERAL_ALIGNMENT_FULL_PROGRESS_CM, 100.0)
+        self.assertEqual(
+            AB_LATERAL_ALIGNMENT_TERMINAL_FADE_DISTANCE_CM,
+            65.0,
+        )
         self.assertEqual(AB_LATERAL_ALIGNMENT_MIN_VALID_FRAMES, 4)
         self.assertEqual(AB_LATERAL_ALIGNMENT_REQUIRED_MEASUREMENTS, 5)
         self.assertEqual(AB_LATERAL_ALIGNMENT_MAX_ABS_OFFSET_CM, 12.0)
@@ -933,7 +938,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
             application._ab_line_assist_correction(now_s=1.12)
         )
 
-    def test_ab_visual_lateral_alignment_is_translation_only_and_persists(self):
+    def test_ab_visual_alignment_fades_before_terminal_a(self):
         correction = CameraLineCorrectionConfig(
             required_consecutive_frames=2,
             large_error_required_frames=2,
@@ -1003,6 +1008,67 @@ class RadarCameraLineMainTests(unittest.TestCase):
         self.assertAlmostEqual(later_aligned.x_cm, 120.0)
         self.assertAlmostEqual(later_aligned.y_cm, -5.0)
         self.assertAlmostEqual(later_aligned.heading_deg, 45.0)
+
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.DA,
+                progress_cm=(
+                    application.track.finish_progress_cm
+                    - AB_LATERAL_ALIGNMENT_TERMINAL_FADE_DISTANCE_CM / 2.0
+                ),
+                target_speed_cm_s=15.0,
+                commanded_speed_cm_s=15.0,
+                steering_angle_rad=-0.1,
+                cross_track_error_cm=0.0,
+                heading_error_deg=0.0,
+            )
+        )
+        terminal_raw = NavigationPose(780.0, -8.0, 0.0, 3.0)
+        terminal_aligned = application._ab_lateral_aligned_control_pose(
+            terminal_raw,
+            now_s=3.0,
+        )
+        self.assertAlmostEqual(terminal_aligned.y_cm, -12.0)
+
+        application._on_follower_state(
+            TrackFollowerState(
+                running=False,
+                completed=True,
+                segment=TrackSegment.DA,
+                progress_cm=application.track.finish_progress_cm,
+                target_speed_cm_s=0.0,
+                commanded_speed_cm_s=0.0,
+                steering_angle_rad=0.0,
+                cross_track_error_cm=0.0,
+                heading_error_deg=0.0,
+            )
+        )
+        completed_pose = application._ab_lateral_aligned_control_pose(
+            terminal_raw,
+            now_s=3.1,
+        )
+        self.assertEqual(completed_pose, terminal_raw)
+
+        application._on_follower_state(
+            TrackFollowerState(
+                running=True,
+                completed=False,
+                segment=TrackSegment.AB,
+                progress_cm=application.track.finish_progress_cm + 2.0,
+                target_speed_cm_s=8.0,
+                commanded_speed_cm_s=8.0,
+                steering_angle_rad=0.0,
+                cross_track_error_cm=8.0,
+                heading_error_deg=0.0,
+            )
+        )
+        post_a_pose = application._ab_lateral_aligned_control_pose(
+            terminal_raw,
+            now_s=3.2,
+        )
+        self.assertEqual(post_a_pose, terminal_raw)
 
     def test_ab_visual_lateral_alignment_rejects_curved_fit(self):
         correction = CameraLineCorrectionConfig(

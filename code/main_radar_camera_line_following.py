@@ -111,7 +111,9 @@ AB_START_MAX_FORWARD_HEADING_CHANGE_RAD = 0.080
 # bounded lateral assist while a robust mission-frame lateral alignment is
 # learned.  The alignment is translation-only: radar still supplies every
 # motion update and heading, while vision contributes one fixed bounded Y
-# offset shared by Pure Pursuit and FleetBus for the remainder of the lap.
+# offset shared by Pure Pursuit and FleetBus through most of the lap. It fades
+# back to raw radar near the final A so a startup-only bias cannot move the
+# physical stopping line.
 AB_LINE_ASSIST_FULL_END_PROGRESS_CM = 100.0
 AB_LINE_ASSIST_FADE_END_PROGRESS_CM = 135.0
 AB_LINE_ASSIST_LATERAL_DEADBAND_CM = 2.0
@@ -125,6 +127,7 @@ AB_LATERAL_ALIGNMENT_LEARNING_START_PROGRESS_CM = 50.0
 AB_LATERAL_ALIGNMENT_LEARNING_END_PROGRESS_CM = 90.0
 AB_LATERAL_ALIGNMENT_RAMP_START_PROGRESS_CM = 60.0
 AB_LATERAL_ALIGNMENT_FULL_PROGRESS_CM = 100.0
+AB_LATERAL_ALIGNMENT_TERMINAL_FADE_DISTANCE_CM = 65.0
 AB_LATERAL_ALIGNMENT_MIN_VALID_FRAMES = 4
 AB_LATERAL_ALIGNMENT_REQUIRED_MEASUREMENTS = 5
 AB_LATERAL_ALIGNMENT_MAX_ABS_OFFSET_CM = 12.0
@@ -1025,15 +1028,24 @@ class RadarCameraLineApplication:
         )
         return aligned_pose
 
-    @staticmethod
     def _ab_lateral_alignment_scale(
+        self,
         follower_state: TrackFollowerState,
         *,
         locked: bool,
     ) -> float:
         if not locked:
             return 0.0
+        if follower_state.completed:
+            return 0.0
         progress_cm = follower_state.progress_cm
+        remaining_cm = self.track.finish_progress_cm - progress_cm
+        if remaining_cm < AB_LATERAL_ALIGNMENT_TERMINAL_FADE_DISTANCE_CM:
+            return max(
+                0.0,
+                remaining_cm
+                / AB_LATERAL_ALIGNMENT_TERMINAL_FADE_DISTANCE_CM,
+            )
         if progress_cm <= AB_LATERAL_ALIGNMENT_RAMP_START_PROGRESS_CM:
             return 0.0
         if progress_cm >= AB_LATERAL_ALIGNMENT_FULL_PROGRESS_CM:
