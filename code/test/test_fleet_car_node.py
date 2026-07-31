@@ -272,6 +272,73 @@ class FleetCarNodeTests(unittest.TestCase):
         self.assertEqual(0, self.h.stop_calls)
         self.assertEqual(first, self.h.send(request))
 
+    def test_terminal_trace_drain_waits_for_matching_cursor(self):
+        self.h.node.trace_buffer.record(
+            TraceSample(100, 1, 2, 0, 400, 4, int(TraceSampleFlags.POSE_VALID))
+        )
+        trace_session = self.h.node.trace_buffer.trace_session
+        result = []
+        waiter = threading.Thread(
+            target=lambda: result.append(self.h.node.wait_for_trace_drain(0.5))
+        )
+        waiter.start()
+
+        self.h.send(self.request(
+            MessageKind.TRACE_REQUEST,
+            encode_trace_request(TraceRequestPayload(trace_session ^ 1, 1, 4, 0)),
+            seq=34,
+        ))
+        time.sleep(0.02)
+        self.assertTrue(waiter.is_alive())
+        self.h.send(self.request(
+            MessageKind.TRACE_REQUEST,
+            encode_trace_request(TraceRequestPayload(trace_session, 0, 4, 0)),
+            seq=35,
+        ))
+        time.sleep(0.02)
+        self.assertTrue(waiter.is_alive())
+        self.h.send(self.request(
+            MessageKind.TRACE_REQUEST,
+            encode_trace_request(TraceRequestPayload(trace_session, 1, 4, 0)),
+            seq=36,
+        ))
+
+        waiter.join(0.5)
+        self.assertEqual([True], result)
+
+    def test_terminal_trace_drain_times_out_without_confirmation(self):
+        self.h.node.trace_buffer.record(
+            TraceSample(100, 1, 2, 0, 400, 4, int(TraceSampleFlags.POSE_VALID))
+        )
+
+        self.assertFalse(self.h.node.wait_for_trace_drain(0.02))
+
+    def test_terminal_trace_drain_is_cancelled(self):
+        self.h.node.trace_buffer.record(
+            TraceSample(100, 1, 2, 0, 400, 4, int(TraceSampleFlags.POSE_VALID))
+        )
+        cancel_event = threading.Event()
+        cancel_event.set()
+
+        self.assertFalse(
+            self.h.node.wait_for_trace_drain(0.5, cancel_event=cancel_event)
+        )
+
+    def test_close_interrupts_terminal_trace_drain(self):
+        self.h.node.trace_buffer.record(
+            TraceSample(100, 1, 2, 0, 400, 4, int(TraceSampleFlags.POSE_VALID))
+        )
+        result = []
+        waiter = threading.Thread(
+            target=lambda: result.append(self.h.node.wait_for_trace_drain(1.0))
+        )
+        waiter.start()
+
+        self.h.node.close()
+
+        waiter.join(0.5)
+        self.assertEqual([False], result)
+
     def test_invalid_trace_request_does_not_stop_reply_worker(self):
         self.h.node.feed_frame(pack_frame(self.request(
             MessageKind.TRACE_REQUEST,

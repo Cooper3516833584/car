@@ -173,6 +173,7 @@ FINAL_DA_MAX_TOTAL_LEFT_CORRECTION_RAD = 0.170
 FINAL_A_MAX_CAMERA_ERROR_CM = 6.0
 CAR_OPERATION_LOCALIZATION_LOST = 10
 FLEET_TERMINAL_REPORT_GRACE_S = 3.0
+FLEET_TRACE_DRAIN_TIMEOUT_S = 6.0
 
 
 LOG = logging.getLogger("radar-camera-line-main")
@@ -656,6 +657,21 @@ class RadarCameraLineApplication:
                     FLEET_TERMINAL_REPORT_GRACE_S,
                 )
                 self._stop_event.wait(FLEET_TERMINAL_REPORT_GRACE_S)
+                if self.fleet_node is not None and not self._stop_event.is_set():
+                    LOG.info(
+                        "waiting up to %.1fs for FleetBus terminal trace drain",
+                        FLEET_TRACE_DRAIN_TIMEOUT_S,
+                    )
+                    drained = self.fleet_node.wait_for_trace_drain(
+                        FLEET_TRACE_DRAIN_TIMEOUT_S,
+                        cancel_event=self._stop_event,
+                    )
+                    if drained:
+                        LOG.info("FleetBus terminal trace drain confirmed")
+                    else:
+                        LOG.warning(
+                            "FleetBus terminal trace drain timed out or was cancelled"
+                        )
         finally:
             with self._lock:
                 self._calibrating = False

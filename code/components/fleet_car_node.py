@@ -2,6 +2,7 @@
 
 import queue
 import threading
+import time
 from typing import Callable, Optional
 
 from .fleet_models import (
@@ -18,6 +19,7 @@ from .fleet_models import (
     NodeTiming,
     PathReportPayload,
     ReportPayload,
+    TraceRequestPayload,
 )
 from .fleet_protocol import (
     FrameParser,
@@ -89,6 +91,9 @@ class FleetCarNode:
         self._active_command_status = 0
         self._error_code = 0
         self._trace_buffer = PoseTraceBuffer(trace_options)
+        self._trace_progress = threading.Condition()
+        self._observed_trace_session = 0
+        self._observed_after_sample_seq = 0
         self._trace_sampler = (
             PoseTraceSampler(
                 state_provider=state_provider,
@@ -167,12 +172,45 @@ class FleetCarNode:
         if self._trace_sampler is not None:
             self._trace_sampler.close()
         self._stop_event.set()
+        with self._trace_progress:
+            self._trace_progress.notify_all()
         try:
             self._queue.put_nowait((-1, 0, None))
         except queue.Full:
             pass
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+
+    def wait_for_trace_drain(
+        self,
+        timeout_s: float,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> bool:
+        """Freeze sampling and wait until ground confirms the final cursor."""
+        if timeout_s < 0:
+            raise ValueError("timeout_s must not be negative")
+        if self._trace_sampler is not None:
+            self._trace_sampler.close()
+        trace_session, latest_sample_seq = self._trace_buffer.latest_cursor()
+        if latest_sample_seq == 0:
+            return True
+
+        deadline = time.monotonic() + timeout_s
+        with self._trace_progress:
+            while True:
+                if (
+                    self._observed_trace_session == trace_session
+                    and self._observed_after_sample_seq >= latest_sample_seq
+                ):
+                    return True
+                if self._stop_event.is_set() or (
+                    cancel_event is not None and cancel_event.is_set()
+                ):
+                    return False
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0:
+                    return False
+                self._trace_progress.wait(min(remaining_s, 0.1))
 
     @staticmethod
     def _priority(frame: Frame) -> int:
@@ -219,10 +257,12 @@ class FleetCarNode:
         if request.kind == MessageKind.PATH_REQUEST:
             return self._path_report(request)
         if request.kind == MessageKind.TRACE_REQUEST:
+            trace_request = decode_trace_request(request.payload)
+            self._observe_trace_cursor(trace_request)
             cached = self._cache.get(request.session, request.seq)
             if cached is not None:
                 return cached
-            reply = self._trace_report(request)
+            reply = self._trace_report(request, trace_request)
             self._cache.put(request.session, request.seq, reply)
             return reply
         if request.kind != MessageKind.COMMAND:
@@ -386,8 +426,25 @@ class FleetCarNode:
         )
         return self._frame(MessageKind.PATH_REPORT, encode_path_report(payload))
 
-    def _trace_report(self, request: Frame) -> bytes:
-        trace_request = decode_trace_request(request.payload)
+    def _observe_trace_cursor(self, trace_request: TraceRequestPayload) -> None:
+        trace_session, _ = self._trace_buffer.latest_cursor()
+        if trace_request.known_trace_session != trace_session:
+            return
+        with self._trace_progress:
+            if self._observed_trace_session != trace_session:
+                self._observed_trace_session = trace_session
+                self._observed_after_sample_seq = 0
+            self._observed_after_sample_seq = max(
+                self._observed_after_sample_seq,
+                trace_request.after_sample_seq,
+            )
+            self._trace_progress.notify_all()
+
+    def _trace_report(
+        self,
+        request: Frame,
+        trace_request: TraceRequestPayload,
+    ) -> bytes:
         report = self._trace_buffer.build_report(
             request.session,
             request.seq,

@@ -69,6 +69,7 @@ from main_radar_camera_line_following import (
     FINAL_DA_VISUAL_MAX_RESIDUAL_RAD,
     FINAL_A_MAX_CAMERA_ERROR_CM,
     FLEET_TERMINAL_REPORT_GRACE_S,
+    FLEET_TRACE_DRAIN_TIMEOUT_S,
     FLEET_POSITION_REPORTING_ENABLED,
     RADAR_CENTER_BEHIND_A_ALONG_AB_CM,
     MainConfig,
@@ -181,6 +182,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
         self.assertEqual(FINAL_A_MAX_CAMERA_ERROR_CM, 6.0)
         self.assertEqual(CAR_OPERATION_LOCALIZATION_LOST, 10)
         self.assertEqual(FLEET_TERMINAL_REPORT_GRACE_S, 3.0)
+        self.assertEqual(FLEET_TRACE_DRAIN_TIMEOUT_S, 6.0)
         self.assertEqual(
             (
                 config.speed_profile.ab_cm_s,
