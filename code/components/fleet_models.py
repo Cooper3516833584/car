@@ -42,6 +42,12 @@ class CommandId(IntEnum):
     CANCEL_TASK = 0x22
     DRONE_START_MISSION = 0x23
     DRONE_PREPARE_MISSION = 0x24
+    DRONE_SELECT_MISSION = 0x25
+
+
+class MissionId(IntEnum):
+    MISSION1 = 1
+    MISSION2 = 2
 
 
 class AckStatus(IntEnum):

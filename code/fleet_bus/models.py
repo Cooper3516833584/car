@@ -7,6 +7,7 @@ from components.fleet_models import (
     AckPayload, AckReason, AckStatus, CarNavigateCommand, CommandId,
     CommandPayload, Frame, MapReportPayload, MessageKind, NodeFlags, NodeId,
     NodeTiming, ParserStats, PathReportPayload, PollPayload, ReportPayload,
+    MissionId,
 )
 
 
@@ -25,6 +26,7 @@ class CarOperationState(IntEnum):
     FAILED = 11
     CLOSED = 12
     MISSION1_REQUESTED = 13
+    MISSION2_REQUESTED = 14
 
 
 @dataclass(frozen=True)

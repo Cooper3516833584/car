@@ -35,6 +35,9 @@ def build_core_argv(argv: list[str] | None = None) -> list[str]:
 
     forwarded = list(sys.argv[1:] if argv is None else argv)
     return [
+        "--wait-for-fleet-start",
+        "--fleet-mission-request-state",
+        "14",
         "--ab-speed-cm-s",
         str(TASK2_AB_SPEED_CM_S),
         "--bc-speed-cm-s",
