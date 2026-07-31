@@ -37,6 +37,8 @@ def build_core_argv(argv: list[str] | None = None) -> list[str]:
         "--wait-for-fleet-start",
         "--fleet-mission-request-state",
         "13",
+        "--completion-alarm-seconds",
+        "1.0",
         "--ab-speed-cm-s",
         str(TASK1_AB_SPEED_CM_S),
         "--bc-speed-cm-s",

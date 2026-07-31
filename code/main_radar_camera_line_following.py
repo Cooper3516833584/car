@@ -41,6 +41,8 @@ from components import (
     SerialCommunicationDriver,
     SoundLightAlarm,
     AlarmGPIOError,
+    alarm_off,
+    alarm_on,
     TrackFollowerState,
     TrackSegment,
     WallFusionConfig,
@@ -304,6 +306,7 @@ class MainConfig:
     fleet_position_only: bool = False
     fleet_wait_for_start: bool = False
     fleet_mission_request_state: int | None = None
+    completion_alarm_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         if self.startup_scan_count <= 0:
@@ -340,6 +343,13 @@ class MainConfig:
             and not 0 <= self.fleet_mission_request_state <= 255
         ):
             raise ValueError("fleet_mission_request_state must fit u8")
+        if (
+            not math.isfinite(self.completion_alarm_seconds)
+            or self.completion_alarm_seconds < 0.0
+        ):
+            raise ValueError(
+                "completion_alarm_seconds must be finite and non-negative"
+            )
 
     @property
     def speed_profile(self) -> CompetitionTrackSpeedProfile:
@@ -421,6 +431,10 @@ class RadarCameraLineApplication:
         self._started_at = time.monotonic()
         self._calibrating = False
         self._alarm = None
+        self._completion_alarm_lock = threading.Lock()
+        self._completion_alarm_started = False
+        self._completion_alarm_thread = None
+        self._completion_alarm_device = None
 
         max_wheel_speed_mm_s = max(
             300.0,
@@ -1073,6 +1087,7 @@ class RadarCameraLineApplication:
             state.segment in (TrackSegment.BC, TrackSegment.DA)
         )
         with self._lock:
+            was_completed = self._follower_state.completed
             self._follower_state = state
         if state.completed:
             now_s = time.monotonic()
@@ -1109,6 +1124,44 @@ class RadarCameraLineApplication:
                     "one lap plus %.1f cm complete; rear axle stopped at A",
                     self.config.radar_center_behind_a_cm,
                 )
+            if (
+                not was_completed
+                and self.config.completion_alarm_seconds > 0.0
+            ):
+                self._start_completion_alarm()
+
+    def _start_completion_alarm(self) -> None:
+        with self._completion_alarm_lock:
+            if self._completion_alarm_started:
+                return
+            self._completion_alarm_started = True
+            self._completion_alarm_thread = threading.Thread(
+                target=self._run_completion_alarm,
+                name="mission1-car-completion-alarm",
+                daemon=False,
+            )
+            self._completion_alarm_thread.start()
+
+    def _run_completion_alarm(self) -> None:
+        alarm = None
+        try:
+            alarm = alarm_on()
+            with self._completion_alarm_lock:
+                self._completion_alarm_device = alarm
+            self._stop_event.wait(self.config.completion_alarm_seconds)
+        except Exception:
+            LOG.exception("MISSION1 completion sound/light alarm failed")
+        finally:
+            try:
+                if alarm is not None:
+                    alarm.off()
+                else:
+                    alarm_off()
+            except Exception:
+                LOG.exception("failed to turn off MISSION1 completion alarm")
+            finally:
+                with self._completion_alarm_lock:
+                    self._completion_alarm_device = None
 
     def request_stop(self) -> None:
         self._stop_event.set()
@@ -1673,6 +1726,25 @@ class RadarCameraLineApplication:
             self._ready = False
             self._map_ready = False
             self._calibrating = False
+        self._stop_event.set()
+        with self._completion_alarm_lock:
+            completion_thread = self._completion_alarm_thread
+        if (
+            completion_thread is not None
+            and completion_thread is not threading.current_thread()
+        ):
+            completion_thread.join(
+                timeout=self.config.completion_alarm_seconds + 0.5
+            )
+        with self._completion_alarm_lock:
+            completion_alarm = self._completion_alarm_device
+        if completion_alarm is not None:
+            try:
+                completion_alarm.off()
+            except Exception:
+                LOG.exception(
+                    "failed to silence completion alarm during close"
+                )
         if self.fleet_node is not None:
             self.fleet_node.close()
         if self.fleet_link is not None:
@@ -1736,6 +1808,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="operation-state value reported while waiting for mission start",
     )
     parser.add_argument(
+        "--completion-alarm-seconds",
+        type=float,
+        default=0.0,
+        help="sound/light duration after a completed lap; zero disables it",
+    )
+    parser.add_argument(
         "--log-level",
         choices=("OFF", "DEBUG", "INFO", "WARNING", "ERROR"),
         default="INFO",
@@ -1787,6 +1865,7 @@ def main(argv: list[str] | None = None) -> int:
                 fleet_position_only=args.fleet_position_only,
                 fleet_wait_for_start=args.wait_for_fleet_start,
                 fleet_mission_request_state=args.fleet_mission_request_state,
+                completion_alarm_seconds=args.completion_alarm_seconds,
             )
         )
 

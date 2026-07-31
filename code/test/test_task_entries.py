@@ -11,11 +11,11 @@ class TaskEntryTests(unittest.TestCase):
     def test_each_task_has_an_independent_segment_profile(self):
         self.assertEqual(
             main_task1.TASK1_SPEED_PROFILE,
-            CompetitionTrackSpeedProfile(12.0, 15.0, 30.0, 15.0),
+            CompetitionTrackSpeedProfile(4.0, 15.0, 15.0, 15.0),
         )
         self.assertEqual(
             main_task2.TASK2_SPEED_PROFILE,
-            CompetitionTrackSpeedProfile(15.0, 15.0, 30.0, 15.0),
+            CompetitionTrackSpeedProfile(15.0, 15.0, 6.0, 15.0),
         )
         self.assertIsNot(
             main_task1.TASK1_SPEED_PROFILE,
@@ -51,7 +51,10 @@ class TaskEntryTests(unittest.TestCase):
         )
         self.assertTrue(task1_args.wait_for_fleet_start)
         self.assertEqual(13, task1_args.fleet_mission_request_state)
-        self.assertFalse(task2_args.wait_for_fleet_start)
+        self.assertEqual(1.0, task1_args.completion_alarm_seconds)
+        self.assertTrue(task2_args.wait_for_fleet_start)
+        self.assertEqual(14, task2_args.fleet_mission_request_state)
+        self.assertEqual(0.0, task2_args.completion_alarm_seconds)
 
     def test_explicit_cli_speed_overrides_task_default(self):
         args = build_argument_parser().parse_args(
