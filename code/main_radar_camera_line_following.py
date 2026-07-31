@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import queue
 import signal
+import statistics
 import sys
 import threading
 import time
@@ -98,27 +99,31 @@ CAMERA_MAX_STEERING_CORRECTION_RAD = 0.140
 # Strong camera-heading alignment for an imperfect initial pose at A.  The
 # start line/marker is explicitly rejected; once the longitudinal AB line is
 # reliable, use its fitted heading to square the car before the first curve.
-AB_START_ALIGNMENT_FULL_END_PROGRESS_CM = 90.0
-AB_START_ALIGNMENT_FADE_END_PROGRESS_CM = 135.0
+AB_START_ALIGNMENT_FULL_END_PROGRESS_CM = 80.0
+AB_START_ALIGNMENT_FADE_END_PROGRESS_CM = 100.0
 AB_START_HEADING_GAIN = 1.30
 AB_START_MAX_HEADING_CORRECTION_RAD = 0.180
 AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD = 0.220
 AB_START_MIN_VALID_FRAMES = 2
+AB_START_MAX_CURVATURE_PER_CM = 0.003
+AB_START_MAX_FORWARD_HEADING_CHANGE_RAD = 0.080
 
 # A small placement yaw error makes the radar's startup frame diverge from the
 # painted AB direction.  During the first AB only, reliable straight-line
-# vision estimates a bounded, slowly filtered static transform from that raw
-# radar frame to the competition-track frame.  The transform then remains
-# fixed for the rest of the lap: radar still supplies all motion and validity,
-# while vision only calibrates the frame in which Pure Pursuit sees that pose.
-AB_FRAME_LEARNING_END_PROGRESS_CM = 135.0
-AB_FRAME_MIN_VALID_FRAMES = 3
-AB_FRAME_HEADING_ADAPTATION_GAIN = 0.25
-AB_FRAME_LATERAL_ADAPTATION_GAIN = 0.20
-AB_FRAME_MAX_HEADING_OFFSET_DEG = 10.0
-AB_FRAME_MAX_LATERAL_OFFSET_CM = 15.0
-AB_FRAME_MAX_VISUAL_HEADING_DEG = 12.0
-AB_FRAME_MAX_VISUAL_LATERAL_CM = 25.0
+# vision estimates only a bounded static heading transform from that raw radar
+# frame to the competition-track frame.  Absolute camera lateral position is
+# deliberately excluded: camera mounting/perspective bias and a live tracking
+# error cannot be distinguished from a true startup translation while moving.
+# The heading transform remains fixed for the rest of the lap, while radar
+# continues to supply all position changes and localization validity.
+AB_FRAME_LEARNING_END_PROGRESS_CM = 80.0
+AB_FRAME_MIN_VALID_FRAMES = 4
+AB_FRAME_REQUIRED_MEASUREMENTS = 3
+AB_FRAME_MAX_HEADING_OFFSET_DEG = 6.0
+AB_FRAME_MAX_VISUAL_HEADING_DEG = 8.0
+AB_FRAME_MAX_HEADING_MAD_DEG = 1.0
+AB_FRAME_MAX_CURVATURE_PER_CM = 0.003
+AB_FRAME_MAX_FORWARD_HEADING_CHANGE_RAD = 0.080
 
 # The 60-degree camera mount makes the entrance of the first right semicircle
 # look like a persistent right-side line offset.  Keep that ambiguous
@@ -403,8 +408,8 @@ class RadarCameraLineApplication:
         self._final_da_visual_timestamp_s: float | None = None
         self._terminal_camera_disagreement = False
         self._ab_frame_heading_offset_deg = 0.0
-        self._ab_frame_lateral_offset_cm = 0.0
         self._ab_frame_learning_samples = 0
+        self._ab_frame_heading_measurements_deg: list[float] = []
         self._ab_frame_last_camera_timestamp_s: float | None = None
         self._started_at = time.monotonic()
         self._calibrating = False
@@ -895,7 +900,7 @@ class RadarCameraLineApplication:
         *,
         now_s: float | None = None,
     ) -> NavigationPose:
-        """Apply the static AB vision calibration to a raw radar pose."""
+        """Apply a robust AB heading calibration to a raw radar pose."""
 
         now = time.monotonic() if now_s is None else float(now_s)
         camera_state = self.camera_corrector.state
@@ -931,89 +936,79 @@ class RadarCameraLineApplication:
             and not observation.round_marker_detected
             and not observation.transverse_line_detected
             and math.isfinite(observation.heading_error_rad)
-            and all(
-                math.isfinite(value)
-                for value in observation.polynomial_y_left_by_x
-            )
+            and math.isfinite(observation.curvature_per_cm)
+            and abs(observation.curvature_per_cm)
+            <= AB_FRAME_MAX_CURVATURE_PER_CM
+            and math.isfinite(observation.forward_heading_change_rad)
+            and abs(observation.forward_heading_change_rad)
+            <= AB_FRAME_MAX_FORWARD_HEADING_CHANGE_RAD
         )
         if learning_allowed:
             visual_heading_deg = -math.degrees(
                 observation.heading_error_rad
             )
-            visual_lateral_cm = -float(
-                observation.polynomial_y_left_by_x[2]
+            measured_heading_offset_deg = signed_heading_error_deg(
+                visual_heading_deg,
+                radar_pose.heading_deg,
             )
             if (
                 abs(visual_heading_deg)
                 <= AB_FRAME_MAX_VISUAL_HEADING_DEG
-                and abs(visual_lateral_cm)
-                <= AB_FRAME_MAX_VISUAL_LATERAL_CM
+                and abs(measured_heading_offset_deg)
+                <= AB_FRAME_MAX_HEADING_OFFSET_DEG
             ):
-                measured_heading_offset_deg = max(
-                    -AB_FRAME_MAX_HEADING_OFFSET_DEG,
-                    min(
-                        AB_FRAME_MAX_HEADING_OFFSET_DEG,
-                        signed_heading_error_deg(
-                            visual_heading_deg,
-                            radar_pose.heading_deg,
-                        ),
-                    ),
-                )
                 with self._lock:
-                    previous_heading_offset_deg = (
-                        self._ab_frame_heading_offset_deg
+                    self._ab_frame_heading_measurements_deg.append(
+                        measured_heading_offset_deg
                     )
-                heading_step_deg = signed_heading_error_deg(
-                    measured_heading_offset_deg,
-                    previous_heading_offset_deg,
-                )
-                heading_offset_deg = max(
-                    -AB_FRAME_MAX_HEADING_OFFSET_DEG,
-                    min(
-                        AB_FRAME_MAX_HEADING_OFFSET_DEG,
-                        previous_heading_offset_deg
-                        + AB_FRAME_HEADING_ADAPTATION_GAIN
-                        * heading_step_deg,
-                    ),
-                )
-                heading_offset_rad = math.radians(heading_offset_deg)
-                rotated_y_cm = (
-                    math.sin(heading_offset_rad) * radar_pose.x_cm
-                    + math.cos(heading_offset_rad) * radar_pose.y_cm
-                )
-                measured_lateral_offset_cm = max(
-                    -AB_FRAME_MAX_LATERAL_OFFSET_CM,
-                    min(
-                        AB_FRAME_MAX_LATERAL_OFFSET_CM,
-                        visual_lateral_cm - rotated_y_cm,
-                    ),
-                )
-                with self._lock:
-                    self._ab_frame_heading_offset_deg = heading_offset_deg
-                    self._ab_frame_lateral_offset_cm += (
-                        AB_FRAME_LATERAL_ADAPTATION_GAIN
-                        * (
-                            measured_lateral_offset_cm
-                            - self._ab_frame_lateral_offset_cm
-                        )
+                    self._ab_frame_learning_samples = len(
+                        self._ab_frame_heading_measurements_deg
                     )
-                    self._ab_frame_lateral_offset_cm = max(
-                        -AB_FRAME_MAX_LATERAL_OFFSET_CM,
-                        min(
-                            AB_FRAME_MAX_LATERAL_OFFSET_CM,
-                            self._ab_frame_lateral_offset_cm,
-                        ),
-                    )
-                    self._ab_frame_learning_samples += 1
                     self._ab_frame_last_camera_timestamp_s = (
                         camera_state.timestamp_s
                     )
+                    measurements = tuple(
+                        self._ab_frame_heading_measurements_deg
+                    )
+                LOG.debug(
+                    "AB frame heading sample=%d measured_offset_deg=%.2f "
+                    "visual_heading_deg=%.2f radar_heading_deg=%.2f "
+                    "curvature_per_cm=%.5f forward_heading_change_deg=%.2f",
+                    len(measurements),
+                    measured_heading_offset_deg,
+                    visual_heading_deg,
+                    radar_pose.heading_deg,
+                    observation.curvature_per_cm,
+                    math.degrees(
+                        observation.forward_heading_change_rad
+                    ),
+                )
+                if (
+                    len(measurements)
+                    >= AB_FRAME_REQUIRED_MEASUREMENTS
+                ):
+                    median_offset_deg = statistics.median(measurements)
+                    median_absolute_deviation_deg = statistics.median(
+                        abs(value - median_offset_deg)
+                        for value in measurements
+                    )
+                    if (
+                        median_absolute_deviation_deg
+                        <= AB_FRAME_MAX_HEADING_MAD_DEG
+                    ):
+                        with self._lock:
+                            self._ab_frame_heading_offset_deg = (
+                                median_offset_deg
+                            )
 
         with self._lock:
             heading_offset_deg = self._ab_frame_heading_offset_deg
-            lateral_offset_cm = self._ab_frame_lateral_offset_cm
             learning_samples = self._ab_frame_learning_samples
-        if learning_samples <= 0:
+        correction_applied = (
+            learning_samples >= AB_FRAME_REQUIRED_MEASUREMENTS
+            and abs(heading_offset_deg) > 1e-9
+        )
+        if not correction_applied:
             return radar_pose
         heading_offset_rad = math.radians(heading_offset_deg)
         cos_offset = math.cos(heading_offset_rad)
@@ -1026,7 +1021,6 @@ class RadarCameraLineApplication:
             y_cm=(
                 sin_offset * radar_pose.x_cm
                 + cos_offset * radar_pose.y_cm
-                + lateral_offset_cm
             ),
             heading_deg=normalize_heading_deg(
                 radar_pose.heading_deg + heading_offset_deg
@@ -1034,17 +1028,17 @@ class RadarCameraLineApplication:
             timestamp_s=radar_pose.timestamp_s,
         )
         LOG.debug(
-            "AB frame fusion active=%s samples=%d "
+            "AB frame alignment learning=%s applied=%s samples=%d "
             "radar_x_cm=%.2f radar_y_cm=%.2f radar_heading_deg=%.2f "
-            "heading_offset_deg=%.2f lateral_offset_cm=%.2f "
-            "fused_x_cm=%.2f fused_y_cm=%.2f fused_heading_deg=%.2f",
+            "heading_offset_deg=%.2f fused_x_cm=%.2f fused_y_cm=%.2f "
+            "fused_heading_deg=%.2f",
             learning_allowed,
+            correction_applied,
             learning_samples,
             radar_pose.x_cm,
             radar_pose.y_cm,
             radar_pose.heading_deg,
             heading_offset_deg,
-            lateral_offset_cm,
             fused_pose.x_cm,
             fused_pose.y_cm,
             fused_pose.heading_deg,
@@ -1240,6 +1234,14 @@ class RadarCameraLineApplication:
             < self.config.camera_correction.minimum_visible_bands
             or observation.fit_rmse_cm
             > self.config.camera_correction.maximum_fit_rmse_cm
+            or not math.isfinite(observation.curvature_per_cm)
+            or abs(observation.curvature_per_cm)
+            > AB_START_MAX_CURVATURE_PER_CM
+            or not math.isfinite(
+                observation.forward_heading_change_rad
+            )
+            or abs(observation.forward_heading_change_rad)
+            > AB_START_MAX_FORWARD_HEADING_CHANGE_RAD
             or observation.round_marker_detected
             or observation.transverse_line_detected
         ):
@@ -1487,7 +1489,8 @@ class RadarCameraLineApplication:
             "camera correction running=%s active=%s curve=%s recovery=%s "
             "valid_frames=%d large_frames=%d "
             "confidence=%.2f used_lateral_cm=%.2f raw_lateral_cm=%.2f "
-            "correction_rad=%.4f "
+            "heading_error_deg=%.2f curvature_per_cm=%.5f "
+            "forward_heading_change_deg=%.2f correction_rad=%.4f "
             "detected=%s bands=%d rmse_cm=%.2f "
             "round=%s transverse=%s",
             state.running,
@@ -1502,6 +1505,23 @@ class RadarCameraLineApplication:
                 0.0
                 if state.observation is None
                 else state.observation.near_lateral_error_cm
+            ),
+            (
+                0.0
+                if state.observation is None
+                else math.degrees(state.observation.heading_error_rad)
+            ),
+            (
+                0.0
+                if state.observation is None
+                else state.observation.curvature_per_cm
+            ),
+            (
+                0.0
+                if state.observation is None
+                else math.degrees(
+                    state.observation.forward_heading_change_rad
+                )
             ),
             state.correction_rad,
             (

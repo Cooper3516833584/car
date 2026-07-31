@@ -7,6 +7,7 @@ from components.competition_track import (
     CompetitionTrackSpeedProfile,
     FINISH_APPROACH_DISTANCE_CM,
     FINISH_APPROACH_SPEED_CM_S,
+    FINISH_HEADING_TOLERANCE_DEG,
     FINISH_MAX_OVERSHOOT_CM,
     S_FINISH_CM,
     TrackSegment,
@@ -294,13 +295,14 @@ class CompetitionTrackFollowerTests(unittest.TestCase):
         self.assertEqual(self.drive.stops, 0)
 
         controller.cross_track_error_cm = 2.0
-        controller.heading_error_deg = 4.0
+        controller.heading_error_deg = 2.0
         inside = follower.update_from_radar(
             radar_update(self.track, finish_index)
         )
         self.assertFalse(inside.running)
         self.assertTrue(inside.completed)
         self.assertTrue(follower.terminal_tolerance_met)
+        self.assertEqual(FINISH_HEADING_TOLERANCE_DEG, 3.0)
         self.assertEqual(self.drive.stops, 1)
 
     def test_terminal_hard_stop_prevents_unbounded_overshoot(self):
@@ -380,6 +382,7 @@ class CompetitionTrackFollowerTests(unittest.TestCase):
         controller = FakeController(
             index=track.wrap_start_index,
             steering_angle_rad=0.0,
+            heading_error_deg=2.0,
         )
         follower = CompetitionTrackFollower(
             drive=self.drive,
