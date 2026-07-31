@@ -90,6 +90,9 @@ class Harness:
 
 
 class FleetCarNodeTests(unittest.TestCase):
+    def test_start_mission_command_value_matches_ground_station(self):
+        self.assertEqual(0x16, int(CommandId.CAR_START_MISSION))
+
     def test_default_turnaround_supports_dense_pose_polling(self):
         self.assertAlmostEqual(0.10, NodeTiming().turnaround_s)
 
