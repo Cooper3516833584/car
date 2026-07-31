@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import queue
 import signal
+import statistics
 import sys
 import threading
 import time
@@ -106,8 +107,10 @@ AB_START_MAX_CURVATURE_PER_CM = 0.003
 AB_START_MAX_FORWARD_HEADING_CHANGE_RAD = 0.080
 
 # On the first AB only, fill the normal 10 cm camera deadband with a smaller,
-# bounded lateral assist.  It fades before B and never changes the radar pose,
-# ICP map, FleetBus coordinates or the remainder of the fixed track.
+# bounded lateral assist while a robust mission-frame lateral alignment is
+# learned.  The alignment is translation-only: radar still supplies every
+# motion update and heading, while vision contributes one fixed bounded Y
+# offset shared by Pure Pursuit and FleetBus for the remainder of the lap.
 AB_LINE_ASSIST_FULL_END_PROGRESS_CM = 100.0
 AB_LINE_ASSIST_FADE_END_PROGRESS_CM = 135.0
 AB_LINE_ASSIST_LATERAL_DEADBAND_CM = 2.0
@@ -116,6 +119,17 @@ AB_LINE_ASSIST_MAX_CORRECTION_RAD = 0.060
 AB_LINE_ASSIST_MIN_VALID_FRAMES = 3
 AB_LINE_ASSIST_MAX_CURVATURE_PER_CM = 0.004
 AB_LINE_ASSIST_MAX_FORWARD_HEADING_CHANGE_RAD = 0.100
+
+AB_LATERAL_ALIGNMENT_LEARNING_START_PROGRESS_CM = 50.0
+AB_LATERAL_ALIGNMENT_LEARNING_END_PROGRESS_CM = 90.0
+AB_LATERAL_ALIGNMENT_RAMP_START_PROGRESS_CM = 60.0
+AB_LATERAL_ALIGNMENT_FULL_PROGRESS_CM = 100.0
+AB_LATERAL_ALIGNMENT_MIN_VALID_FRAMES = 4
+AB_LATERAL_ALIGNMENT_REQUIRED_MEASUREMENTS = 5
+AB_LATERAL_ALIGNMENT_MAX_ABS_OFFSET_CM = 12.0
+AB_LATERAL_ALIGNMENT_MAX_MAD_CM = 1.5
+AB_LATERAL_ALIGNMENT_MAX_CURVATURE_PER_CM = 0.003
+AB_LATERAL_ALIGNMENT_MAX_FORWARD_HEADING_CHANGE_RAD = 0.080
 
 # The 60-degree camera mount makes the entrance of the first right semicircle
 # look like a persistent right-side line offset.  Keep that ambiguous
@@ -399,6 +413,10 @@ class RadarCameraLineApplication:
         self._final_da_visual_residual_rad = 0.0
         self._final_da_visual_timestamp_s: float | None = None
         self._terminal_camera_disagreement = False
+        self._ab_lateral_alignment_offset_cm = 0.0
+        self._ab_lateral_alignment_locked = False
+        self._ab_lateral_alignment_measurements_cm: list[float] = []
+        self._ab_lateral_alignment_last_camera_timestamp_s: float | None = None
         self._started_at = time.monotonic()
         self._calibrating = False
         self._alarm = None
@@ -842,6 +860,7 @@ class RadarCameraLineApplication:
         )
 
     def _on_radar_update(self, update: RadarLocalizationUpdate) -> None:
+        raw_pose: NavigationPose | None = None
         with self._lock:
             ready = self._ready
             if not ready:
@@ -853,7 +872,7 @@ class RadarCameraLineApplication:
             if update.global_pose is None or not update.odometry.accepted:
                 self._localization_degraded = True
             else:
-                self._latest_navigation_pose = NavigationPose(
+                raw_pose = NavigationPose(
                     x_cm=update.global_pose.x_cm,
                     y_cm=update.global_pose.y_cm,
                     heading_deg=radar_yaw_to_navigation_heading(
@@ -862,11 +881,176 @@ class RadarCameraLineApplication:
                     timestamp_s=time.monotonic(),
                 )
                 self._localization_degraded = False
+        control_pose = None
+        if raw_pose is not None:
+            control_pose = self._ab_lateral_aligned_control_pose(raw_pose)
+            with self._lock:
+                # FleetBus and Pure Pursuit must expose/consume the same
+                # calibrated mission-frame pose.  ICP remains untouched.
+                self._latest_navigation_pose = control_pose
         try:
-            self.follower.update_from_radar(update)
+            self.follower.update_from_radar(
+                update,
+                control_pose_override=control_pose,
+            )
         except BaseException:
             LOG.exception("track update failed; stopping")
             self.request_stop()
+
+    def _ab_lateral_aligned_control_pose(
+        self,
+        radar_pose: NavigationPose,
+        *,
+        now_s: float | None = None,
+    ) -> NavigationPose:
+        """Return radar pose plus one robust first-AB lateral translation."""
+
+        now = time.monotonic() if now_s is None else float(now_s)
+        camera_state = self.camera_corrector.state
+        observation = camera_state.observation
+        with self._lock:
+            follower_state = self._follower_state
+            locked = self._ab_lateral_alignment_locked
+            last_camera_timestamp_s = (
+                self._ab_lateral_alignment_last_camera_timestamp_s
+            )
+        learning_allowed = (
+            self.config.camera_correction_enabled
+            and not locked
+            and follower_state.running
+            and not follower_state.completed
+            and follower_state.segment is TrackSegment.AB
+            and AB_LATERAL_ALIGNMENT_LEARNING_START_PROGRESS_CM
+            <= follower_state.progress_cm
+            < AB_LATERAL_ALIGNMENT_LEARNING_END_PROGRESS_CM
+            and camera_state.active
+            and camera_state.valid_frames
+            >= AB_LATERAL_ALIGNMENT_MIN_VALID_FRAMES
+            and (
+                last_camera_timestamp_s is None
+                or camera_state.timestamp_s > last_camera_timestamp_s
+            )
+            and now - camera_state.timestamp_s
+            <= self.config.camera_correction.stale_timeout_s
+            and observation is not None
+            and observation.detected
+            and math.isfinite(observation.near_lateral_error_cm)
+            and observation.confidence
+            >= self.config.camera_correction.minimum_confidence
+            and observation.visible_band_count
+            >= self.config.camera_correction.minimum_visible_bands
+            and observation.fit_rmse_cm
+            <= self.config.camera_correction.maximum_fit_rmse_cm
+            and not observation.round_marker_detected
+            and not observation.transverse_line_detected
+            and math.isfinite(observation.curvature_per_cm)
+            and abs(observation.curvature_per_cm)
+            <= AB_LATERAL_ALIGNMENT_MAX_CURVATURE_PER_CM
+            and math.isfinite(observation.forward_heading_change_rad)
+            and abs(observation.forward_heading_change_rad)
+            <= AB_LATERAL_ALIGNMENT_MAX_FORWARD_HEADING_CHANGE_RAD
+        )
+        if learning_allowed:
+            # Positive camera error requests a left correction, meaning the
+            # vehicle is physically right (negative mission Y) of the line.
+            measured_offset_cm = (
+                -float(observation.near_lateral_error_cm)
+                - radar_pose.y_cm
+            )
+            if (
+                abs(measured_offset_cm)
+                <= AB_LATERAL_ALIGNMENT_MAX_ABS_OFFSET_CM
+            ):
+                with self._lock:
+                    self._ab_lateral_alignment_measurements_cm.append(
+                        measured_offset_cm
+                    )
+                    self._ab_lateral_alignment_last_camera_timestamp_s = (
+                        camera_state.timestamp_s
+                    )
+                    measurements = tuple(
+                        self._ab_lateral_alignment_measurements_cm
+                    )
+                LOG.debug(
+                    "AB visual lateral alignment sample=%d "
+                    "camera_error_cm=%.2f raw_radar_y_cm=%.2f "
+                    "measured_offset_y_cm=%.2f",
+                    len(measurements),
+                    observation.near_lateral_error_cm,
+                    radar_pose.y_cm,
+                    measured_offset_cm,
+                )
+                if (
+                    len(measurements)
+                    >= AB_LATERAL_ALIGNMENT_REQUIRED_MEASUREMENTS
+                ):
+                    median_offset_cm = statistics.median(measurements)
+                    median_absolute_deviation_cm = statistics.median(
+                        abs(value - median_offset_cm)
+                        for value in measurements
+                    )
+                    if (
+                        median_absolute_deviation_cm
+                        <= AB_LATERAL_ALIGNMENT_MAX_MAD_CM
+                    ):
+                        with self._lock:
+                            self._ab_lateral_alignment_offset_cm = (
+                                median_offset_cm
+                            )
+                            self._ab_lateral_alignment_locked = True
+                        LOG.info(
+                            "AB visual lateral alignment locked "
+                            "offset_y_cm=%.2f samples=%d mad_cm=%.2f",
+                            median_offset_cm,
+                            len(measurements),
+                            median_absolute_deviation_cm,
+                        )
+
+        with self._lock:
+            offset_cm = self._ab_lateral_alignment_offset_cm
+            locked = self._ab_lateral_alignment_locked
+            follower_state = self._follower_state
+        scale = self._ab_lateral_alignment_scale(
+            follower_state,
+            locked=locked,
+        )
+        if scale <= 0.0:
+            return radar_pose
+        aligned_pose = NavigationPose(
+            x_cm=radar_pose.x_cm,
+            y_cm=radar_pose.y_cm + offset_cm * scale,
+            heading_deg=radar_pose.heading_deg,
+            timestamp_s=radar_pose.timestamp_s,
+        )
+        LOG.debug(
+            "AB lateral mission alignment raw_y_cm=%.2f "
+            "offset_y_cm=%.2f scale=%.3f aligned_y_cm=%.2f",
+            radar_pose.y_cm,
+            offset_cm,
+            scale,
+            aligned_pose.y_cm,
+        )
+        return aligned_pose
+
+    @staticmethod
+    def _ab_lateral_alignment_scale(
+        follower_state: TrackFollowerState,
+        *,
+        locked: bool,
+    ) -> float:
+        if not locked:
+            return 0.0
+        progress_cm = follower_state.progress_cm
+        if progress_cm <= AB_LATERAL_ALIGNMENT_RAMP_START_PROGRESS_CM:
+            return 0.0
+        if progress_cm >= AB_LATERAL_ALIGNMENT_FULL_PROGRESS_CM:
+            return 1.0
+        return (
+            progress_cm - AB_LATERAL_ALIGNMENT_RAMP_START_PROGRESS_CM
+        ) / (
+            AB_LATERAL_ALIGNMENT_FULL_PROGRESS_CM
+            - AB_LATERAL_ALIGNMENT_RAMP_START_PROGRESS_CM
+        )
 
     def _on_follower_state(self, state: TrackFollowerState) -> None:
         self.camera_corrector.set_curve_mode(
@@ -1113,7 +1297,7 @@ class RadarCameraLineApplication:
         *,
         now_s: float | None = None,
     ) -> float | None:
-        """Return a small first-AB lateral assist without changing pose."""
+        """Return first-AB steering assist while pose alignment ramps in."""
 
         now = time.monotonic() if now_s is None else float(now_s)
         with self._lock:
@@ -1181,7 +1365,12 @@ class RadarCameraLineApplication:
                 / fade_span_cm,
             )
         )
-        return requested * fade_scale
+        with self._lock:
+            alignment_scale = self._ab_lateral_alignment_scale(
+                self._follower_state,
+                locked=self._ab_lateral_alignment_locked,
+            )
+        return requested * fade_scale * (1.0 - alignment_scale)
 
     def _apply_course_camera_limit(self, correction_rad: float) -> float:
         with self._lock:

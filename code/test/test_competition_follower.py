@@ -15,6 +15,7 @@ from components.competition_track import (
     TrackSegment,
 )
 from components.navigation import (
+    NavigationPose,
     TrackerCommand,
     navigation_heading_to_radar_yaw,
 )
@@ -183,6 +184,30 @@ class CompetitionTrackFollowerTests(unittest.TestCase):
         self.assertEqual(self.drive.commands[-1][1], -0.123)
         self.assertEqual(state.steering_angle_rad, -0.123)
         self.assertEqual(state.commanded_speed_cm_s, TEST_SPEED_CM_S)
+
+    def test_control_pose_override_keeps_radar_acceptance_authoritative(self):
+        controller = FakeController(index=10, steering_angle_rad=-0.123)
+        follower = CompetitionTrackFollower(
+            drive=self.drive,
+            track=self.track,
+            speed_cm_s=TEST_SPEED_CM_S,
+            controller=controller,
+        )
+        follower.start_mission()
+        override = NavigationPose(12.0, -7.0, 4.0, 123.0)
+
+        follower.update_from_radar(
+            radar_update(self.track, 10),
+            control_pose_override=override,
+        )
+        self.assertIs(controller.calls[-1][0], override)
+
+        calls_before = len(controller.calls)
+        follower.update_from_radar(
+            radar_update(self.track, 11, accepted=False),
+            control_pose_override=NavigationPose(99.0, 99.0, 99.0),
+        )
+        self.assertEqual(len(controller.calls), calls_before)
 
     def test_segment_profile_changes_speed_without_stopping_at_corners(self):
         profile = CompetitionTrackSpeedProfile(6.0, 7.0, 8.0, 9.0)

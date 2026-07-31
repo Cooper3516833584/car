@@ -536,17 +536,29 @@ class CompetitionTrackFollower:
     def update_from_radar(
         self,
         update: RadarLocalizationUpdate,
+        *,
+        control_pose_override: NavigationPose | None = None,
     ) -> TrackFollowerState:
+        """Track an accepted radar update in the calibrated mission frame.
+
+        ``control_pose_override`` may apply a fixed, bounded mission-frame
+        alignment learned from another sensor.  Radar acceptance and freshness
+        remain authoritative; an override can never turn a rejected radar
+        update into a control update.
+        """
+
         if update.global_pose is None or not update.odometry.accepted:
             return self.state
-        pose = NavigationPose(
-            x_cm=update.global_pose.x_cm,
-            y_cm=update.global_pose.y_cm,
-            heading_deg=radar_yaw_to_navigation_heading(
-                update.global_pose.yaw_cw_deg
-            ),
-            timestamp_s=time.monotonic(),
-        )
+        pose = control_pose_override
+        if pose is None:
+            pose = NavigationPose(
+                x_cm=update.global_pose.x_cm,
+                y_cm=update.global_pose.y_cm,
+                heading_deg=radar_yaw_to_navigation_heading(
+                    update.global_pose.yaw_cw_deg
+                ),
+                timestamp_s=time.monotonic(),
+            )
         with self._lock:
             if not self._running or self._completed:
                 return self._state
