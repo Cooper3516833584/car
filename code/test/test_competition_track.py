@@ -112,6 +112,48 @@ class CompetitionTrackGeometryTests(unittest.TestCase):
         self.assertAlmostEqual(track.points[index].x_cm, distance_cm)
         self.assertAlmostEqual(track.points[index].y_cm, 0.0)
 
+    def test_nonzero_start_offset_does_not_shift_the_lap_off_the_line(self):
+        offset_cm = 18.625
+        track = CompetitionTrack.build(reference_offset_cm=offset_cm)
+        starts = track.segment_start_indices
+
+        for x_cm, y_cm in track.field_points_cm[starts[1] : starts[2] + 1]:
+            self.assertAlmostEqual(
+                math.hypot(x_cm - 225.0, y_cm - 350.0),
+                TRACK_RADIUS_CM,
+                places=6,
+            )
+        for x_cm, y_cm in track.field_points_cm[
+            starts[3] : track.wrap_start_index + 1
+        ]:
+            self.assertAlmostEqual(
+                math.hypot(x_cm - 225.0, y_cm - 200.0),
+                TRACK_RADIUS_CM,
+                places=6,
+            )
+
+        finish = track.point_at_index(track.wrap_start_index)
+        self.assertAlmostEqual(track.field_points_cm[track.wrap_start_index][0], 150.0)
+        self.assertAlmostEqual(track.field_points_cm[track.wrap_start_index][1], 200.0)
+        self.assertAlmostEqual(finish.x_cm, offset_cm)
+        self.assertAlmostEqual(finish.y_cm, 0.0)
+        self.assertAlmostEqual(track.finish_progress_cm, offset_cm + S_FINISH_CM)
+
+    def test_nonzero_start_offset_preserves_curve_tangent_headings(self):
+        track = CompetitionTrack.build(reference_offset_cm=18.625)
+        starts = track.segment_start_indices
+        for index in range(starts[1] + 1, starts[2] - 1):
+            previous = track.points[index - 1]
+            following = track.points[index + 1]
+            tangent = math.degrees(
+                math.atan2(
+                    following.y_cm - previous.y_cm,
+                    following.x_cm - previous.x_cm,
+                )
+            )
+            error = (tangent - track.points[index].heading_deg + 180.0) % 360.0 - 180.0
+            self.assertLess(abs(error), 0.1)
+
     def test_navigation_path_is_forward_and_public_accessors_match(self):
         track = CompetitionTrack.build(reference_offset_cm=0.0)
         self.assertEqual(len(track.points), len(track.path.points))

@@ -282,8 +282,10 @@ class CompetitionCarApplication:
         with self._lock:
             self._map_ready = True
         LOG.info(
-            "calibration complete; rear axle rebased to A=(0,0,0deg) "
+            "calibration complete; startup rear axle=(0,0,0deg), "
+            "A is %.1f cm ahead; "
             "bounds=x[%.1f,%.1f] y[%.1f,%.1f] fitted_lines=%d",
+            self.config.radar_center_behind_a_cm,
             calibration.min_x_cm,
             calibration.max_x_cm,
             calibration.min_y_cm,

@@ -233,17 +233,11 @@ class CompetitionTrack:
         reference_offset_cm: float,
         sample_spacing_cm: float = TRACK_SAMPLE_SPACING_CM,
         wrap_extension_cm: float = WRAP_EXTENSION_CM,
-        finish_extension_cm: float = 0.0,
     ) -> "CompetitionTrack":
         if sample_spacing_cm <= 0.0 or wrap_extension_cm <= 0.0:
             raise ValueError("sample spacing and wrap extension must be positive")
-        if (
-            not math.isfinite(finish_extension_cm)
-            or not 0.0 <= finish_extension_cm <= wrap_extension_cm
-        ):
-            raise ValueError(
-                "finish extension must be finite and within the wrap extension"
-            )
+        if not math.isfinite(reference_offset_cm) or reference_offset_cm < 0.0:
+            raise ValueError("reference offset must be finite and non-negative")
         transform = FieldTransform.from_a_reference(
             offset_cm=reference_offset_cm
         )
@@ -252,28 +246,21 @@ class CompetitionTrack:
         starts: list[int] = []
 
         def append(
-            line_x: float,
-            line_y: float,
+            rear_x: float,
+            rear_y: float,
             field_heading: float,
             s_cm: float,
             segment: TrackSegment,
         ) -> None:
-            heading_math = math.radians(90.0 - field_heading)
-            field_x, field_y = line_reference_to_rear_axle(
-                line_x,
-                line_y,
-                heading_math,
-                offset_cm=reference_offset_cm,
-            )
             pose = transform.field_to_navigation(
-                field_x, field_y, field_heading
+                rear_x, rear_y, field_heading
             )
             if field_points and math.hypot(
-                field_x - field_points[-1][0],
-                field_y - field_points[-1][1],
+                rear_x - field_points[-1][0],
+                rear_y - field_points[-1][1],
             ) <= 1e-9:
                 return
-            field_points.append((field_x, field_y))
+            field_points.append((rear_x, rear_y))
             raw_points.append(
                 CompetitionTrackPoint(
                     pose.x_cm,
@@ -284,15 +271,31 @@ class CompetitionTrack:
                 )
             )
 
-        straight_samples = max(1, math.ceil(S_B_CM / sample_spacing_cm))
         starts.append(0)
-        for index in range(straight_samples + 1):
+        approach_samples = max(
+            1, math.ceil(reference_offset_cm / sample_spacing_cm)
+        )
+        for index in range(approach_samples + 1):
+            ratio = index / approach_samples
+            append(
+                A_FIELD_CM[0],
+                A_FIELD_CM[1] - reference_offset_cm * (1.0 - ratio),
+                0.0,
+                reference_offset_cm * ratio,
+                TrackSegment.AB,
+            )
+
+        # After reaching A, the rear-axle-centred radar follows the painted
+        # centreline. Translating every curved point along its tangent creates
+        # a different curve with a conflicting heading and an inside bias.
+        straight_samples = max(1, math.ceil(S_B_CM / sample_spacing_cm))
+        for index in range(1, straight_samples + 1):
             ratio = index / straight_samples
             append(
                 150.0,
                 200.0 + 150.0 * ratio,
                 0.0,
-                150.0 * ratio,
+                reference_offset_cm + 150.0 * ratio,
                 TrackSegment.AB,
             )
 
@@ -308,7 +311,9 @@ class CompetitionTrack:
                 225.0 + TRACK_RADIUS_CM * math.cos(angle),
                 350.0 + TRACK_RADIUS_CM * math.sin(angle),
                 180.0 * ratio,
-                S_B_CM + math.pi * TRACK_RADIUS_CM * ratio,
+                reference_offset_cm
+                + S_B_CM
+                + math.pi * TRACK_RADIUS_CM * ratio,
                 TrackSegment.BC,
             )
 
@@ -320,7 +325,7 @@ class CompetitionTrack:
                 300.0,
                 350.0 - 150.0 * ratio,
                 180.0,
-                S_C_CM + 150.0 * ratio,
+                reference_offset_cm + S_C_CM + 150.0 * ratio,
                 TrackSegment.CD,
             )
 
@@ -333,7 +338,9 @@ class CompetitionTrack:
                 225.0 + TRACK_RADIUS_CM * math.cos(angle),
                 200.0 + TRACK_RADIUS_CM * math.sin(angle),
                 180.0 + 180.0 * ratio,
-                S_D_CM + math.pi * TRACK_RADIUS_CM * ratio,
+                reference_offset_cm
+                + S_D_CM
+                + math.pi * TRACK_RADIUS_CM * ratio,
                 TrackSegment.DA,
             )
 
@@ -348,16 +355,12 @@ class CompetitionTrack:
             wrap_extension_cm * index / wrap_samples
             for index in range(1, wrap_samples + 1)
         }
-        if finish_extension_cm > 0.0:
-            # Preserve the exact requested stop point even when it is not an
-            # integer multiple of the regular path-sampling interval.
-            wrap_distances.add(finish_extension_cm)
         for distance in sorted(wrap_distances):
             append(
                 A_FIELD_CM[0],
                 A_FIELD_CM[1] + distance,
                 0.0,
-                S_FINISH_CM + distance,
+                reference_offset_cm + S_FINISH_CM + distance,
                 TrackSegment.AB,
             )
 
@@ -381,7 +384,7 @@ class CompetitionTrack:
             tuple(field_points),
             tuple(starts),
             wrap_start_index,
-            S_FINISH_CM + finish_extension_cm,
+            reference_offset_cm + S_FINISH_CM,
         )
 
     @property
@@ -404,13 +407,17 @@ class CompetitionTrack:
         return self._points[index]
 
     def segment_at_progress(self, progress_cm: float) -> TrackSegment:
-        if progress_cm < S_B_CM:
+        bc_start = self._points[self.segment_start_indices[1]].progress_cm
+        cd_start = self._points[self.segment_start_indices[2]].progress_cm
+        da_start = self._points[self.segment_start_indices[3]].progress_cm
+        finish = self._points[self.wrap_start_index].progress_cm
+        if progress_cm < bc_start:
             return TrackSegment.AB
-        if progress_cm < S_C_CM:
+        if progress_cm < cd_start:
             return TrackSegment.BC
-        if progress_cm < S_D_CM:
+        if progress_cm < da_start:
             return TrackSegment.CD
-        if progress_cm < S_FINISH_CM:
+        if progress_cm < finish:
             return TrackSegment.DA
         return TrackSegment.AB
 
@@ -423,7 +430,6 @@ def build_competition_track(
     sample_spacing_cm: float = TRACK_SAMPLE_SPACING_CM,
     wrap_extension_cm: float = WRAP_EXTENSION_CM,
     reference_offset_cm: float = 0.0,
-    finish_extension_cm: float = 0.0,
     transform: FieldTransform | None = None,
 ) -> CompetitionTrack:
     if transform is not None:
@@ -438,7 +444,6 @@ def build_competition_track(
         reference_offset_cm=reference_offset_cm,
         sample_spacing_cm=sample_spacing_cm,
         wrap_extension_cm=wrap_extension_cm,
-        finish_extension_cm=finish_extension_cm,
     )
 
 

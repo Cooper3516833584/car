@@ -315,7 +315,6 @@ class CompetitionTrackFollowerTests(unittest.TestCase):
         extension_cm = 18.625
         track = CompetitionTrack.build(
             reference_offset_cm=extension_cm,
-            finish_extension_cm=extension_cm,
         )
         finish_index = next(
             index
@@ -346,11 +345,10 @@ class CompetitionTrackFollowerTests(unittest.TestCase):
         self.assertFalse(follower.terminal_hard_stop_triggered)
         self.assertEqual(self.drive.stops, 1)
 
-    def test_finish_capture_can_stop_one_sample_before_exact_finish_index(self):
+    def test_finish_capture_does_not_complete_before_full_lap_index(self):
         extension_cm = 18.625
         track = CompetitionTrack.build(
             reference_offset_cm=extension_cm,
-            finish_extension_cm=extension_cm,
         )
         finish_index = next(
             index
@@ -380,6 +378,15 @@ class CompetitionTrackFollowerTests(unittest.TestCase):
             radar_update(track, capture_index)
         )
 
+        self.assertTrue(state.running)
+        self.assertFalse(state.completed)
+        self.assertFalse(follower.terminal_tolerance_met)
+        self.assertEqual(self.drive.stops, 0)
+
+        controller.index = finish_index
+        state = follower.update_from_radar(
+            radar_update(track, finish_index)
+        )
         self.assertFalse(state.running)
         self.assertTrue(state.completed)
         self.assertTrue(follower.terminal_tolerance_met)
@@ -454,11 +461,10 @@ class CompetitionTrackFollowerTests(unittest.TestCase):
         self.follower.update_from_radar(radar_update(self.track, wrap + 1))
         self.assertEqual(self.drive.stops, 1)
 
-    def test_finish_extension_keeps_following_until_rear_axle_reaches_a(self):
+    def test_nonzero_start_offset_finishes_when_rear_axle_returns_to_a(self):
         extension_cm = 24.0
         track = CompetitionTrack.build(
             reference_offset_cm=extension_cm,
-            finish_extension_cm=extension_cm,
         )
         controller = FakeController(
             index=track.wrap_start_index,
@@ -472,23 +478,8 @@ class CompetitionTrackFollowerTests(unittest.TestCase):
         )
         follower.start_mission()
 
-        at_front_reference_a = follower.update_from_radar(
-            radar_update(track, track.wrap_start_index)
-        )
-
-        self.assertTrue(at_front_reference_a.running)
-        self.assertFalse(at_front_reference_a.completed)
-        self.assertEqual(at_front_reference_a.segment, TrackSegment.AB)
-        self.assertEqual(self.drive.stops, 0)
-
-        finish_index = next(
-            index
-            for index, point in enumerate(track.points)
-            if point.progress_cm >= track.finish_progress_cm
-        )
-        controller.index = finish_index
         at_rear_axle_a = follower.update_from_radar(
-            radar_update(track, finish_index)
+            radar_update(track, track.wrap_start_index)
         )
 
         self.assertFalse(at_rear_axle_a.running)
