@@ -18,7 +18,6 @@ import os
 from pathlib import Path
 import queue
 import signal
-import statistics
 import sys
 import threading
 import time
@@ -64,9 +63,7 @@ from components.fleet_models import (
 from components.navigation import (
     NavigationPose,
     NavigationState,
-    normalize_heading_deg,
     radar_yaw_to_navigation_heading,
-    signed_heading_error_deg,
 )
 
 
@@ -108,22 +105,17 @@ AB_START_MIN_VALID_FRAMES = 2
 AB_START_MAX_CURVATURE_PER_CM = 0.003
 AB_START_MAX_FORWARD_HEADING_CHANGE_RAD = 0.080
 
-# A small placement yaw error makes the radar's startup frame diverge from the
-# painted AB direction.  During the first AB only, reliable straight-line
-# vision estimates only a bounded static heading transform from that raw radar
-# frame to the competition-track frame.  Absolute camera lateral position is
-# deliberately excluded: camera mounting/perspective bias and a live tracking
-# error cannot be distinguished from a true startup translation while moving.
-# The heading transform remains fixed for the rest of the lap, while radar
-# continues to supply all position changes and localization validity.
-AB_FRAME_LEARNING_END_PROGRESS_CM = 80.0
-AB_FRAME_MIN_VALID_FRAMES = 4
-AB_FRAME_REQUIRED_MEASUREMENTS = 3
-AB_FRAME_MAX_HEADING_OFFSET_DEG = 6.0
-AB_FRAME_MAX_VISUAL_HEADING_DEG = 8.0
-AB_FRAME_MAX_HEADING_MAD_DEG = 1.0
-AB_FRAME_MAX_CURVATURE_PER_CM = 0.003
-AB_FRAME_MAX_FORWARD_HEADING_CHANGE_RAD = 0.080
+# On the first AB only, fill the normal 10 cm camera deadband with a smaller,
+# bounded lateral assist.  It fades before B and never changes the radar pose,
+# ICP map, FleetBus coordinates or the remainder of the fixed track.
+AB_LINE_ASSIST_FULL_END_PROGRESS_CM = 100.0
+AB_LINE_ASSIST_FADE_END_PROGRESS_CM = 135.0
+AB_LINE_ASSIST_LATERAL_DEADBAND_CM = 2.0
+AB_LINE_ASSIST_GAIN_RAD_PER_CM = 0.005
+AB_LINE_ASSIST_MAX_CORRECTION_RAD = 0.060
+AB_LINE_ASSIST_MIN_VALID_FRAMES = 3
+AB_LINE_ASSIST_MAX_CURVATURE_PER_CM = 0.004
+AB_LINE_ASSIST_MAX_FORWARD_HEADING_CHANGE_RAD = 0.100
 
 # The 60-degree camera mount makes the entrance of the first right semicircle
 # look like a persistent right-side line offset.  Keep that ambiguous
@@ -386,7 +378,7 @@ class _CameraCorrectedDrive:
 
 
 class RadarCameraLineApplication:
-    """Radar authority with bounded camera steering and frame correction."""
+    """Radar authority with bounded camera steering correction."""
 
     def __init__(self, config: MainConfig) -> None:
         self.config = config
@@ -407,10 +399,6 @@ class RadarCameraLineApplication:
         self._final_da_visual_residual_rad = 0.0
         self._final_da_visual_timestamp_s: float | None = None
         self._terminal_camera_disagreement = False
-        self._ab_frame_heading_offset_deg = 0.0
-        self._ab_frame_learning_samples = 0
-        self._ab_frame_heading_measurements_deg: list[float] = []
-        self._ab_frame_last_camera_timestamp_s: float | None = None
         self._started_at = time.monotonic()
         self._calibrating = False
         self._alarm = None
@@ -854,7 +842,6 @@ class RadarCameraLineApplication:
         )
 
     def _on_radar_update(self, update: RadarLocalizationUpdate) -> None:
-        control_pose: NavigationPose | None = None
         with self._lock:
             ready = self._ready
             if not ready:
@@ -866,7 +853,7 @@ class RadarCameraLineApplication:
             if update.global_pose is None or not update.odometry.accepted:
                 self._localization_degraded = True
             else:
-                radar_pose = NavigationPose(
+                self._latest_navigation_pose = NavigationPose(
                     x_cm=update.global_pose.x_cm,
                     y_cm=update.global_pose.y_cm,
                     heading_deg=radar_yaw_to_navigation_heading(
@@ -875,175 +862,11 @@ class RadarCameraLineApplication:
                     timestamp_s=time.monotonic(),
                 )
                 self._localization_degraded = False
-        if (
-            ready
-            and update.global_pose is not None
-            and update.odometry.accepted
-        ):
-            control_pose = self._ab_aligned_control_pose(radar_pose)
-            with self._lock:
-                # FleetBus reports the same competition-frame pose that the
-                # follower uses.  The radar map/ICP pose itself is untouched.
-                self._latest_navigation_pose = control_pose
         try:
-            self.follower.update_from_radar(
-                update,
-                control_pose_override=control_pose,
-            )
+            self.follower.update_from_radar(update)
         except BaseException:
             LOG.exception("track update failed; stopping")
             self.request_stop()
-
-    def _ab_aligned_control_pose(
-        self,
-        radar_pose: NavigationPose,
-        *,
-        now_s: float | None = None,
-    ) -> NavigationPose:
-        """Apply a robust AB heading calibration to a raw radar pose."""
-
-        now = time.monotonic() if now_s is None else float(now_s)
-        camera_state = self.camera_corrector.state
-        observation = camera_state.observation
-        with self._lock:
-            follower_state = self._follower_state
-            last_camera_timestamp_s = (
-                self._ab_frame_last_camera_timestamp_s
-            )
-        learning_allowed = (
-            self.config.camera_correction_enabled
-            and follower_state.running
-            and not follower_state.completed
-            and follower_state.segment is TrackSegment.AB
-            and follower_state.progress_cm
-            < AB_FRAME_LEARNING_END_PROGRESS_CM
-            and camera_state.active
-            and camera_state.valid_frames >= AB_FRAME_MIN_VALID_FRAMES
-            and (
-                last_camera_timestamp_s is None
-                or camera_state.timestamp_s > last_camera_timestamp_s
-            )
-            and now - camera_state.timestamp_s
-            <= self.config.camera_correction.stale_timeout_s
-            and observation is not None
-            and observation.detected
-            and observation.confidence
-            >= self.config.camera_correction.minimum_confidence
-            and observation.visible_band_count
-            >= self.config.camera_correction.minimum_visible_bands
-            and observation.fit_rmse_cm
-            <= self.config.camera_correction.maximum_fit_rmse_cm
-            and not observation.round_marker_detected
-            and not observation.transverse_line_detected
-            and math.isfinite(observation.heading_error_rad)
-            and math.isfinite(observation.curvature_per_cm)
-            and abs(observation.curvature_per_cm)
-            <= AB_FRAME_MAX_CURVATURE_PER_CM
-            and math.isfinite(observation.forward_heading_change_rad)
-            and abs(observation.forward_heading_change_rad)
-            <= AB_FRAME_MAX_FORWARD_HEADING_CHANGE_RAD
-        )
-        if learning_allowed:
-            visual_heading_deg = -math.degrees(
-                observation.heading_error_rad
-            )
-            measured_heading_offset_deg = signed_heading_error_deg(
-                visual_heading_deg,
-                radar_pose.heading_deg,
-            )
-            if (
-                abs(visual_heading_deg)
-                <= AB_FRAME_MAX_VISUAL_HEADING_DEG
-                and abs(measured_heading_offset_deg)
-                <= AB_FRAME_MAX_HEADING_OFFSET_DEG
-            ):
-                with self._lock:
-                    self._ab_frame_heading_measurements_deg.append(
-                        measured_heading_offset_deg
-                    )
-                    self._ab_frame_learning_samples = len(
-                        self._ab_frame_heading_measurements_deg
-                    )
-                    self._ab_frame_last_camera_timestamp_s = (
-                        camera_state.timestamp_s
-                    )
-                    measurements = tuple(
-                        self._ab_frame_heading_measurements_deg
-                    )
-                LOG.debug(
-                    "AB frame heading sample=%d measured_offset_deg=%.2f "
-                    "visual_heading_deg=%.2f radar_heading_deg=%.2f "
-                    "curvature_per_cm=%.5f forward_heading_change_deg=%.2f",
-                    len(measurements),
-                    measured_heading_offset_deg,
-                    visual_heading_deg,
-                    radar_pose.heading_deg,
-                    observation.curvature_per_cm,
-                    math.degrees(
-                        observation.forward_heading_change_rad
-                    ),
-                )
-                if (
-                    len(measurements)
-                    >= AB_FRAME_REQUIRED_MEASUREMENTS
-                ):
-                    median_offset_deg = statistics.median(measurements)
-                    median_absolute_deviation_deg = statistics.median(
-                        abs(value - median_offset_deg)
-                        for value in measurements
-                    )
-                    if (
-                        median_absolute_deviation_deg
-                        <= AB_FRAME_MAX_HEADING_MAD_DEG
-                    ):
-                        with self._lock:
-                            self._ab_frame_heading_offset_deg = (
-                                median_offset_deg
-                            )
-
-        with self._lock:
-            heading_offset_deg = self._ab_frame_heading_offset_deg
-            learning_samples = self._ab_frame_learning_samples
-        correction_applied = (
-            learning_samples >= AB_FRAME_REQUIRED_MEASUREMENTS
-            and abs(heading_offset_deg) > 1e-9
-        )
-        if not correction_applied:
-            return radar_pose
-        heading_offset_rad = math.radians(heading_offset_deg)
-        cos_offset = math.cos(heading_offset_rad)
-        sin_offset = math.sin(heading_offset_rad)
-        fused_pose = NavigationPose(
-            x_cm=(
-                cos_offset * radar_pose.x_cm
-                - sin_offset * radar_pose.y_cm
-            ),
-            y_cm=(
-                sin_offset * radar_pose.x_cm
-                + cos_offset * radar_pose.y_cm
-            ),
-            heading_deg=normalize_heading_deg(
-                radar_pose.heading_deg + heading_offset_deg
-            ),
-            timestamp_s=radar_pose.timestamp_s,
-        )
-        LOG.debug(
-            "AB frame alignment learning=%s applied=%s samples=%d "
-            "radar_x_cm=%.2f radar_y_cm=%.2f radar_heading_deg=%.2f "
-            "heading_offset_deg=%.2f fused_x_cm=%.2f fused_y_cm=%.2f "
-            "fused_heading_deg=%.2f",
-            learning_allowed,
-            correction_applied,
-            learning_samples,
-            radar_pose.x_cm,
-            radar_pose.y_cm,
-            radar_pose.heading_deg,
-            heading_offset_deg,
-            fused_pose.x_cm,
-            fused_pose.y_cm,
-            fused_pose.heading_deg,
-        )
-        return fused_pose
 
     def _on_follower_state(self, state: TrackFollowerState) -> None:
         self.camera_corrector.set_curve_mode(
@@ -1108,11 +931,20 @@ class RadarCameraLineApplication:
             ab_start_alignment = self._ab_start_alignment_correction(
                 now_s=now_s
             )
+            ab_line_assist = self._ab_line_assist_correction(
+                now_s=now_s
+            )
+            lateral_camera_correction = observed_correction
+            if ab_line_assist is not None and abs(ab_line_assist) > 1e-9:
+                if observed_correction * ab_line_assist < 0.0:
+                    lateral_camera_correction = ab_line_assist
+                elif abs(ab_line_assist) > abs(observed_correction):
+                    lateral_camera_correction = ab_line_assist
             camera_correction = max(
                 -AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD,
                 min(
                     AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD,
-                    observed_correction + ab_start_alignment,
+                    lateral_camera_correction + ab_start_alignment,
                 ),
             )
             course_limited_correction = self._apply_course_camera_limit(
@@ -1176,6 +1008,7 @@ class RadarCameraLineApplication:
                 "steering fusion radar_rad=%.4f camera_rad=%.4f "
                 "final_rad=%.4f observed_camera_rad=%.4f "
                 "ab_start_alignment_rad=%.4f "
+                "ab_line_assist_rad=%.4f "
                 "course_limited_camera_rad=%.4f c_point_trim_rad=%.4f "
                 "final_da_trim_rad=%.4f da_visible_extra_rad=%.4f "
                 "final_da_visual_residual_rad=%.4f "
@@ -1186,6 +1019,7 @@ class RadarCameraLineApplication:
                 adjusted,
                 observed_correction,
                 ab_start_alignment,
+                0.0 if ab_line_assist is None else ab_line_assist,
                 course_limited_correction,
                 0.0 if c_point_trim is None else c_point_trim,
                 0.0 if final_da_trim is None else final_da_trim,
@@ -1273,6 +1107,81 @@ class RadarCameraLineApplication:
             min(AB_START_MAX_HEADING_CORRECTION_RAD, requested),
         )
         return bounded * fade_scale
+
+    def _ab_line_assist_correction(
+        self,
+        *,
+        now_s: float | None = None,
+    ) -> float | None:
+        """Return a small first-AB lateral assist without changing pose."""
+
+        now = time.monotonic() if now_s is None else float(now_s)
+        with self._lock:
+            follower_state = self._follower_state
+        camera_state = self.camera_corrector.state
+        observation = camera_state.observation
+        if (
+            not follower_state.running
+            or follower_state.completed
+            or follower_state.segment is not TrackSegment.AB
+            or follower_state.progress_cm
+            >= AB_LINE_ASSIST_FADE_END_PROGRESS_CM
+            or now - camera_state.timestamp_s
+            > self.config.camera_correction.stale_timeout_s
+            or camera_state.valid_frames
+            < AB_LINE_ASSIST_MIN_VALID_FRAMES
+            or observation is None
+            or not observation.detected
+            or not math.isfinite(observation.near_lateral_error_cm)
+            or observation.confidence
+            < self.config.camera_correction.minimum_confidence
+            or observation.visible_band_count
+            < self.config.camera_correction.minimum_visible_bands
+            or observation.fit_rmse_cm
+            > self.config.camera_correction.maximum_fit_rmse_cm
+            or not math.isfinite(observation.curvature_per_cm)
+            or abs(observation.curvature_per_cm)
+            > AB_LINE_ASSIST_MAX_CURVATURE_PER_CM
+            or not math.isfinite(
+                observation.forward_heading_change_rad
+            )
+            or abs(observation.forward_heading_change_rad)
+            > AB_LINE_ASSIST_MAX_FORWARD_HEADING_CHANGE_RAD
+            or observation.round_marker_detected
+            or observation.transverse_line_detected
+        ):
+            return None
+
+        magnitude = max(
+            0.0,
+            abs(float(observation.near_lateral_error_cm))
+            - AB_LINE_ASSIST_LATERAL_DEADBAND_CM,
+        )
+        requested = math.copysign(
+            min(
+                AB_LINE_ASSIST_MAX_CORRECTION_RAD,
+                AB_LINE_ASSIST_GAIN_RAD_PER_CM * magnitude,
+            ),
+            observation.near_lateral_error_cm,
+        )
+        fade_span_cm = (
+            AB_LINE_ASSIST_FADE_END_PROGRESS_CM
+            - AB_LINE_ASSIST_FULL_END_PROGRESS_CM
+        )
+        fade_scale = (
+            1.0
+            if follower_state.progress_cm
+            <= AB_LINE_ASSIST_FULL_END_PROGRESS_CM
+            else max(
+                0.0,
+                (
+                    AB_LINE_ASSIST_FADE_END_PROGRESS_CM
+                    - follower_state.progress_cm
+                )
+                / fade_span_cm,
+            )
+        )
+        return requested * fade_scale
 
     def _apply_course_camera_limit(self, correction_rad: float) -> float:
         with self._lock:

@@ -13,7 +13,6 @@ from components.competition_track import (
     TrackSegment,
 )
 from components.navigation import (
-    NavigationPose,
     TrackerCommand,
     navigation_heading_to_radar_yaw,
 )
@@ -183,30 +182,6 @@ class CompetitionTrackFollowerTests(unittest.TestCase):
         self.assertEqual(state.steering_angle_rad, -0.123)
         self.assertEqual(state.commanded_speed_cm_s, TEST_SPEED_CM_S)
 
-    def test_optional_control_pose_does_not_replace_radar_acceptance(self):
-        controller = FakeController(index=10, steering_angle_rad=-0.123)
-        follower = CompetitionTrackFollower(
-            drive=self.drive,
-            track=self.track,
-            speed_cm_s=TEST_SPEED_CM_S,
-            controller=controller,
-        )
-        follower.start_mission()
-        override = NavigationPose(12.0, 7.0, 4.0, 123.0)
-
-        follower.update_from_radar(
-            radar_update(self.track, 10),
-            control_pose_override=override,
-        )
-        self.assertIs(controller.calls[-1][0], override)
-
-        calls_before = len(controller.calls)
-        follower.update_from_radar(
-            radar_update(self.track, 11, accepted=False),
-            control_pose_override=NavigationPose(99.0, 99.0, 99.0),
-        )
-        self.assertEqual(len(controller.calls), calls_before)
-
     def test_segment_profile_changes_speed_without_stopping_at_corners(self):
         profile = CompetitionTrackSpeedProfile(6.0, 7.0, 8.0, 9.0)
         follower = CompetitionTrackFollower(
@@ -295,14 +270,14 @@ class CompetitionTrackFollowerTests(unittest.TestCase):
         self.assertEqual(self.drive.stops, 0)
 
         controller.cross_track_error_cm = 2.0
-        controller.heading_error_deg = 2.0
+        controller.heading_error_deg = 4.0
         inside = follower.update_from_radar(
             radar_update(self.track, finish_index)
         )
         self.assertFalse(inside.running)
         self.assertTrue(inside.completed)
         self.assertTrue(follower.terminal_tolerance_met)
-        self.assertEqual(FINISH_HEADING_TOLERANCE_DEG, 3.0)
+        self.assertEqual(FINISH_HEADING_TOLERANCE_DEG, 6.0)
         self.assertEqual(self.drive.stops, 1)
 
     def test_terminal_hard_stop_prevents_unbounded_overshoot(self):
@@ -382,7 +357,6 @@ class CompetitionTrackFollowerTests(unittest.TestCase):
         controller = FakeController(
             index=track.wrap_start_index,
             steering_angle_rad=0.0,
-            heading_error_deg=2.0,
         )
         follower = CompetitionTrackFollower(
             drive=self.drive,

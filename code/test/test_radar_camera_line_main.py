@@ -17,13 +17,12 @@ from components.fleet_models import (
 )
 from components.navigation import NavigationPose
 from main_radar_camera_line_following import (
-    AB_FRAME_LEARNING_END_PROGRESS_CM,
-    AB_FRAME_MAX_CURVATURE_PER_CM,
-    AB_FRAME_MAX_FORWARD_HEADING_CHANGE_RAD,
-    AB_FRAME_MAX_HEADING_MAD_DEG,
-    AB_FRAME_MAX_HEADING_OFFSET_DEG,
-    AB_FRAME_MIN_VALID_FRAMES,
-    AB_FRAME_REQUIRED_MEASUREMENTS,
+    AB_LINE_ASSIST_FADE_END_PROGRESS_CM,
+    AB_LINE_ASSIST_FULL_END_PROGRESS_CM,
+    AB_LINE_ASSIST_GAIN_RAD_PER_CM,
+    AB_LINE_ASSIST_LATERAL_DEADBAND_CM,
+    AB_LINE_ASSIST_MAX_CORRECTION_RAD,
+    AB_LINE_ASSIST_MIN_VALID_FRAMES,
     AB_TRACK_SPEED_CM_S,
     AB_START_ALIGNMENT_FADE_END_PROGRESS_CM,
     AB_START_ALIGNMENT_FULL_END_PROGRESS_CM,
@@ -129,16 +128,12 @@ class RadarCameraLineMainTests(unittest.TestCase):
             AB_START_MAX_FORWARD_HEADING_CHANGE_RAD,
             0.080,
         )
-        self.assertEqual(AB_FRAME_LEARNING_END_PROGRESS_CM, 80.0)
-        self.assertEqual(AB_FRAME_MIN_VALID_FRAMES, 4)
-        self.assertEqual(AB_FRAME_REQUIRED_MEASUREMENTS, 3)
-        self.assertEqual(AB_FRAME_MAX_HEADING_OFFSET_DEG, 6.0)
-        self.assertEqual(AB_FRAME_MAX_HEADING_MAD_DEG, 1.0)
-        self.assertEqual(AB_FRAME_MAX_CURVATURE_PER_CM, 0.003)
-        self.assertEqual(
-            AB_FRAME_MAX_FORWARD_HEADING_CHANGE_RAD,
-            0.080,
-        )
+        self.assertEqual(AB_LINE_ASSIST_FULL_END_PROGRESS_CM, 100.0)
+        self.assertEqual(AB_LINE_ASSIST_FADE_END_PROGRESS_CM, 135.0)
+        self.assertEqual(AB_LINE_ASSIST_LATERAL_DEADBAND_CM, 2.0)
+        self.assertEqual(AB_LINE_ASSIST_GAIN_RAD_PER_CM, 0.005)
+        self.assertEqual(AB_LINE_ASSIST_MAX_CORRECTION_RAD, 0.060)
+        self.assertEqual(AB_LINE_ASSIST_MIN_VALID_FRAMES, 3)
         self.assertEqual(BC_ENTRY_LIMIT_END_PROGRESS_CM, 210.0)
         self.assertEqual(BC_ENTRY_MIN_RIGHT_CORRECTION_RAD, -0.012)
         self.assertEqual(C_VISIBLE_TRIM_START_PROGRESS_CM, 300.0)
@@ -770,7 +765,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
             -0.065,
         )
 
-    def test_ab_vision_learns_radar_frame_rotation_with_expected_sign(self):
+    def test_ab_line_assist_fills_small_lateral_deadband(self):
         correction = CameraLineCorrectionConfig(
             required_consecutive_frames=2,
             large_error_required_frames=2,
@@ -785,7 +780,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
                 running=True,
                 completed=False,
                 segment=TrackSegment.AB,
-                progress_cm=50.0,
+                progress_cm=75.0,
                 target_speed_cm_s=30.0,
                 commanded_speed_cm_s=30.0,
                 steering_angle_rad=0.0,
@@ -793,45 +788,19 @@ class RadarCameraLineMainTests(unittest.TestCase):
                 heading_error_deg=0.0,
             )
         )
-        heading_rad = math.radians(-5.0)
-        physical_y_cm = math.sin(math.radians(5.0)) * 50.0
-        for index in range(2):
+        for index in range(3):
+            timestamp_s = 1.0 + 0.06 * index
             application.camera_corrector.update_from_observation(
-                observation(
-                    lateral_cm=-physical_y_cm,
-                    heading_error_rad=heading_rad,
-                ),
-                now_s=1.0 + 0.06 * index,
-            )
-
-        radar_pose = NavigationPose(50.0, 0.0, 0.0, 1.12)
-        fused_pose = radar_pose
-        for index in range(12):
-            timestamp_s = 1.12 + 0.06 * index
-            application.camera_corrector.update_from_observation(
-                observation(
-                    lateral_cm=-physical_y_cm,
-                    heading_error_rad=heading_rad,
-                ),
-                now_s=timestamp_s,
-            )
-            fused_pose = application._ab_aligned_control_pose(
-                radar_pose,
+                observation(lateral_cm=7.0),
                 now_s=timestamp_s,
             )
 
-        self.assertGreater(fused_pose.heading_deg, 4.5)
-        self.assertAlmostEqual(fused_pose.y_cm, physical_y_cm, delta=0.5)
-        self.assertAlmostEqual(fused_pose.x_cm, 49.8, delta=0.5)
-        self.assertGreater(application._ab_frame_learning_samples, 0)
-        samples = application._ab_frame_learning_samples
-        application._ab_aligned_control_pose(
-            radar_pose,
-            now_s=timestamp_s,
+        self.assertAlmostEqual(
+            application._ab_line_assist_correction(now_s=1.12),
+            0.025,
         )
-        self.assertEqual(application._ab_frame_learning_samples, samples)
 
-    def test_learned_ab_frame_persists_without_camera_on_later_segments(self):
+    def test_ab_line_assist_fades_before_b_without_persisting(self):
         correction = CameraLineCorrectionConfig(
             required_consecutive_frames=2,
             large_error_required_frames=2,
@@ -846,7 +815,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
                 running=True,
                 completed=False,
                 segment=TrackSegment.AB,
-                progress_cm=60.0,
+                progress_cm=117.5,
                 target_speed_cm_s=30.0,
                 commanded_speed_cm_s=30.0,
                 steering_angle_rad=0.0,
@@ -854,24 +823,16 @@ class RadarCameraLineMainTests(unittest.TestCase):
                 heading_error_deg=0.0,
             )
         )
-        for index in range(2):
+        for index in range(3):
+            timestamp_s = 1.0 + 0.06 * index
             application.camera_corrector.update_from_observation(
-                observation(heading_error_rad=math.radians(-4.0)),
-                now_s=2.0 + 0.06 * index,
-            )
-        for index in range(8):
-            timestamp_s = 2.12 + 0.06 * index
-            application.camera_corrector.update_from_observation(
-                observation(heading_error_rad=math.radians(-4.0)),
+                observation(lateral_cm=20.0),
                 now_s=timestamp_s,
             )
-            application._ab_aligned_control_pose(
-                NavigationPose(60.0, -4.2, 0.0, timestamp_s),
-                now_s=timestamp_s,
-            )
-        learned = (
-            application._ab_frame_heading_offset_deg,
-            application._ab_frame_learning_samples,
+
+        self.assertAlmostEqual(
+            application._ab_line_assist_correction(now_s=1.12),
+            0.030,
         )
 
         application._on_follower_state(
@@ -879,75 +840,19 @@ class RadarCameraLineMainTests(unittest.TestCase):
                 running=True,
                 completed=False,
                 segment=TrackSegment.BC,
-                progress_cm=180.0,
+                progress_cm=160.0,
                 target_speed_cm_s=30.0,
                 commanded_speed_cm_s=30.0,
-                steering_angle_rad=-0.2,
+                steering_angle_rad=-0.1,
                 cross_track_error_cm=0.0,
                 heading_error_deg=0.0,
             )
         )
-        later_raw = NavigationPose(180.0, 20.0, 45.0, 3.0)
-        later_fused = application._ab_aligned_control_pose(
-            later_raw,
-            now_s=3.0,
+        self.assertIsNone(
+            application._ab_line_assist_correction(now_s=1.12)
         )
 
-        self.assertEqual(
-            (
-                application._ab_frame_heading_offset_deg,
-                application._ab_frame_learning_samples,
-            ),
-            learned,
-        )
-        self.assertNotAlmostEqual(later_fused.y_cm, later_raw.y_cm)
-        self.assertAlmostEqual(
-            later_fused.heading_deg,
-            later_raw.heading_deg + learned[0],
-        )
-
-    def test_ab_frame_alignment_never_learns_camera_lateral_bias(self):
-        correction = CameraLineCorrectionConfig(
-            required_consecutive_frames=2,
-            large_error_required_frames=2,
-            correction_filter_time_constant_s=0.0,
-            maximum_correction_rate_rad_s=100.0,
-        )
-        application = RadarCameraLineApplication(
-            MainConfig(camera_correction=correction)
-        )
-        application._on_follower_state(
-            TrackFollowerState(
-                running=True,
-                completed=False,
-                segment=TrackSegment.AB,
-                progress_cm=60.0,
-                target_speed_cm_s=30.0,
-                commanded_speed_cm_s=30.0,
-                steering_angle_rad=0.0,
-                cross_track_error_cm=0.0,
-                heading_error_deg=0.0,
-            )
-        )
-        radar_pose = NavigationPose(60.0, -3.0, 0.0, 1.0)
-        fused_pose = radar_pose
-        for index in range(5):
-            timestamp_s = 1.0 + 0.06 * index
-            application.camera_corrector.update_from_observation(
-                observation(lateral_cm=-20.0),
-                now_s=timestamp_s,
-            )
-            fused_pose = application._ab_aligned_control_pose(
-                radar_pose,
-                now_s=timestamp_s,
-            )
-
-        self.assertEqual(fused_pose, radar_pose)
-        self.assertFalse(
-            hasattr(application, "_ab_frame_lateral_offset_cm")
-        )
-
-    def test_ab_heading_alignment_rejects_non_straight_camera_fit(self):
+    def test_ab_visual_assists_reject_non_straight_camera_fit(self):
         correction = CameraLineCorrectionConfig(
             required_consecutive_frames=2,
             large_error_required_frames=2,
@@ -971,28 +876,22 @@ class RadarCameraLineMainTests(unittest.TestCase):
             )
         )
         curved = observation(
+            lateral_cm=20.0,
             heading_error_rad=math.radians(4.0),
             curvature_per_cm=0.01,
             forward_heading_change_rad=0.20,
         )
-        for index in range(5):
-            timestamp_s = 1.0 + 0.06 * index
+        for index in range(3):
             application.camera_corrector.update_from_observation(
                 curved,
-                now_s=timestamp_s,
+                now_s=1.0 + 0.06 * index,
             )
 
-        radar_pose = NavigationPose(60.0, 0.0, 0.0, 1.3)
-        self.assertEqual(
-            application._ab_aligned_control_pose(
-                radar_pose,
-                now_s=1.3,
-            ),
-            radar_pose,
+        self.assertIsNone(
+            application._ab_line_assist_correction(now_s=1.12)
         )
-        self.assertEqual(application._ab_frame_learning_samples, 0)
         self.assertEqual(
-            application._ab_start_alignment_correction(now_s=1.3),
+            application._ab_start_alignment_correction(now_s=1.12),
             0.0,
         )
 
