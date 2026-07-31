@@ -72,8 +72,8 @@ from components.navigation import (
 
 # Fixed-track segment speeds. Change these four values for the next real-car
 # run; the stable steering/camera parameters below are not changed.
-AB_TRACK_SPEED_CM_S = 30.0
-BC_TRACK_SPEED_CM_S = 30.0
+AB_TRACK_SPEED_CM_S = 4.0
+BC_TRACK_SPEED_CM_S = 15.0
 CD_TRACK_SPEED_CM_S = 30.0
 DA_TRACK_SPEED_CM_S = 30.0
 
