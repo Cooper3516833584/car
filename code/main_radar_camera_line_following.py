@@ -63,7 +63,9 @@ from components.fleet_models import (
 from components.navigation import (
     NavigationPose,
     NavigationState,
+    normalize_heading_deg,
     radar_yaw_to_navigation_heading,
+    signed_heading_error_deg,
 )
 
 
@@ -96,12 +98,27 @@ CAMERA_MAX_STEERING_CORRECTION_RAD = 0.140
 # Strong camera-heading alignment for an imperfect initial pose at A.  The
 # start line/marker is explicitly rejected; once the longitudinal AB line is
 # reliable, use its fitted heading to square the car before the first curve.
-AB_START_ALIGNMENT_FULL_END_PROGRESS_CM = 30.0
-AB_START_ALIGNMENT_FADE_END_PROGRESS_CM = 80.0
+AB_START_ALIGNMENT_FULL_END_PROGRESS_CM = 90.0
+AB_START_ALIGNMENT_FADE_END_PROGRESS_CM = 135.0
 AB_START_HEADING_GAIN = 1.30
 AB_START_MAX_HEADING_CORRECTION_RAD = 0.180
 AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD = 0.220
 AB_START_MIN_VALID_FRAMES = 2
+
+# A small placement yaw error makes the radar's startup frame diverge from the
+# painted AB direction.  During the first AB only, reliable straight-line
+# vision estimates a bounded, slowly filtered static transform from that raw
+# radar frame to the competition-track frame.  The transform then remains
+# fixed for the rest of the lap: radar still supplies all motion and validity,
+# while vision only calibrates the frame in which Pure Pursuit sees that pose.
+AB_FRAME_LEARNING_END_PROGRESS_CM = 135.0
+AB_FRAME_MIN_VALID_FRAMES = 3
+AB_FRAME_HEADING_ADAPTATION_GAIN = 0.25
+AB_FRAME_LATERAL_ADAPTATION_GAIN = 0.20
+AB_FRAME_MAX_HEADING_OFFSET_DEG = 10.0
+AB_FRAME_MAX_LATERAL_OFFSET_CM = 15.0
+AB_FRAME_MAX_VISUAL_HEADING_DEG = 12.0
+AB_FRAME_MAX_VISUAL_LATERAL_CM = 25.0
 
 # The 60-degree camera mount makes the entrance of the first right semicircle
 # look like a persistent right-side line offset.  Keep that ambiguous
@@ -364,7 +381,7 @@ class _CameraCorrectedDrive:
 
 
 class RadarCameraLineApplication:
-    """Radar authority with a bounded camera steering correction."""
+    """Radar authority with bounded camera steering and frame correction."""
 
     def __init__(self, config: MainConfig) -> None:
         self.config = config
@@ -385,6 +402,10 @@ class RadarCameraLineApplication:
         self._final_da_visual_residual_rad = 0.0
         self._final_da_visual_timestamp_s: float | None = None
         self._terminal_camera_disagreement = False
+        self._ab_frame_heading_offset_deg = 0.0
+        self._ab_frame_lateral_offset_cm = 0.0
+        self._ab_frame_learning_samples = 0
+        self._ab_frame_last_camera_timestamp_s: float | None = None
         self._started_at = time.monotonic()
         self._calibrating = False
         self._alarm = None
@@ -828,6 +849,7 @@ class RadarCameraLineApplication:
         )
 
     def _on_radar_update(self, update: RadarLocalizationUpdate) -> None:
+        control_pose: NavigationPose | None = None
         with self._lock:
             ready = self._ready
             if not ready:
@@ -839,7 +861,7 @@ class RadarCameraLineApplication:
             if update.global_pose is None or not update.odometry.accepted:
                 self._localization_degraded = True
             else:
-                self._latest_navigation_pose = NavigationPose(
+                radar_pose = NavigationPose(
                     x_cm=update.global_pose.x_cm,
                     y_cm=update.global_pose.y_cm,
                     heading_deg=radar_yaw_to_navigation_heading(
@@ -848,11 +870,186 @@ class RadarCameraLineApplication:
                     timestamp_s=time.monotonic(),
                 )
                 self._localization_degraded = False
+        if (
+            ready
+            and update.global_pose is not None
+            and update.odometry.accepted
+        ):
+            control_pose = self._ab_aligned_control_pose(radar_pose)
+            with self._lock:
+                # FleetBus reports the same competition-frame pose that the
+                # follower uses.  The radar map/ICP pose itself is untouched.
+                self._latest_navigation_pose = control_pose
         try:
-            self.follower.update_from_radar(update)
+            self.follower.update_from_radar(
+                update,
+                control_pose_override=control_pose,
+            )
         except BaseException:
             LOG.exception("track update failed; stopping")
             self.request_stop()
+
+    def _ab_aligned_control_pose(
+        self,
+        radar_pose: NavigationPose,
+        *,
+        now_s: float | None = None,
+    ) -> NavigationPose:
+        """Apply the static AB vision calibration to a raw radar pose."""
+
+        now = time.monotonic() if now_s is None else float(now_s)
+        camera_state = self.camera_corrector.state
+        observation = camera_state.observation
+        with self._lock:
+            follower_state = self._follower_state
+            last_camera_timestamp_s = (
+                self._ab_frame_last_camera_timestamp_s
+            )
+        learning_allowed = (
+            self.config.camera_correction_enabled
+            and follower_state.running
+            and not follower_state.completed
+            and follower_state.segment is TrackSegment.AB
+            and follower_state.progress_cm
+            < AB_FRAME_LEARNING_END_PROGRESS_CM
+            and camera_state.active
+            and camera_state.valid_frames >= AB_FRAME_MIN_VALID_FRAMES
+            and (
+                last_camera_timestamp_s is None
+                or camera_state.timestamp_s > last_camera_timestamp_s
+            )
+            and now - camera_state.timestamp_s
+            <= self.config.camera_correction.stale_timeout_s
+            and observation is not None
+            and observation.detected
+            and observation.confidence
+            >= self.config.camera_correction.minimum_confidence
+            and observation.visible_band_count
+            >= self.config.camera_correction.minimum_visible_bands
+            and observation.fit_rmse_cm
+            <= self.config.camera_correction.maximum_fit_rmse_cm
+            and not observation.round_marker_detected
+            and not observation.transverse_line_detected
+            and math.isfinite(observation.heading_error_rad)
+            and all(
+                math.isfinite(value)
+                for value in observation.polynomial_y_left_by_x
+            )
+        )
+        if learning_allowed:
+            visual_heading_deg = -math.degrees(
+                observation.heading_error_rad
+            )
+            visual_lateral_cm = -float(
+                observation.polynomial_y_left_by_x[2]
+            )
+            if (
+                abs(visual_heading_deg)
+                <= AB_FRAME_MAX_VISUAL_HEADING_DEG
+                and abs(visual_lateral_cm)
+                <= AB_FRAME_MAX_VISUAL_LATERAL_CM
+            ):
+                measured_heading_offset_deg = max(
+                    -AB_FRAME_MAX_HEADING_OFFSET_DEG,
+                    min(
+                        AB_FRAME_MAX_HEADING_OFFSET_DEG,
+                        signed_heading_error_deg(
+                            visual_heading_deg,
+                            radar_pose.heading_deg,
+                        ),
+                    ),
+                )
+                with self._lock:
+                    previous_heading_offset_deg = (
+                        self._ab_frame_heading_offset_deg
+                    )
+                heading_step_deg = signed_heading_error_deg(
+                    measured_heading_offset_deg,
+                    previous_heading_offset_deg,
+                )
+                heading_offset_deg = max(
+                    -AB_FRAME_MAX_HEADING_OFFSET_DEG,
+                    min(
+                        AB_FRAME_MAX_HEADING_OFFSET_DEG,
+                        previous_heading_offset_deg
+                        + AB_FRAME_HEADING_ADAPTATION_GAIN
+                        * heading_step_deg,
+                    ),
+                )
+                heading_offset_rad = math.radians(heading_offset_deg)
+                rotated_y_cm = (
+                    math.sin(heading_offset_rad) * radar_pose.x_cm
+                    + math.cos(heading_offset_rad) * radar_pose.y_cm
+                )
+                measured_lateral_offset_cm = max(
+                    -AB_FRAME_MAX_LATERAL_OFFSET_CM,
+                    min(
+                        AB_FRAME_MAX_LATERAL_OFFSET_CM,
+                        visual_lateral_cm - rotated_y_cm,
+                    ),
+                )
+                with self._lock:
+                    self._ab_frame_heading_offset_deg = heading_offset_deg
+                    self._ab_frame_lateral_offset_cm += (
+                        AB_FRAME_LATERAL_ADAPTATION_GAIN
+                        * (
+                            measured_lateral_offset_cm
+                            - self._ab_frame_lateral_offset_cm
+                        )
+                    )
+                    self._ab_frame_lateral_offset_cm = max(
+                        -AB_FRAME_MAX_LATERAL_OFFSET_CM,
+                        min(
+                            AB_FRAME_MAX_LATERAL_OFFSET_CM,
+                            self._ab_frame_lateral_offset_cm,
+                        ),
+                    )
+                    self._ab_frame_learning_samples += 1
+                    self._ab_frame_last_camera_timestamp_s = (
+                        camera_state.timestamp_s
+                    )
+
+        with self._lock:
+            heading_offset_deg = self._ab_frame_heading_offset_deg
+            lateral_offset_cm = self._ab_frame_lateral_offset_cm
+            learning_samples = self._ab_frame_learning_samples
+        if learning_samples <= 0:
+            return radar_pose
+        heading_offset_rad = math.radians(heading_offset_deg)
+        cos_offset = math.cos(heading_offset_rad)
+        sin_offset = math.sin(heading_offset_rad)
+        fused_pose = NavigationPose(
+            x_cm=(
+                cos_offset * radar_pose.x_cm
+                - sin_offset * radar_pose.y_cm
+            ),
+            y_cm=(
+                sin_offset * radar_pose.x_cm
+                + cos_offset * radar_pose.y_cm
+                + lateral_offset_cm
+            ),
+            heading_deg=normalize_heading_deg(
+                radar_pose.heading_deg + heading_offset_deg
+            ),
+            timestamp_s=radar_pose.timestamp_s,
+        )
+        LOG.debug(
+            "AB frame fusion active=%s samples=%d "
+            "radar_x_cm=%.2f radar_y_cm=%.2f radar_heading_deg=%.2f "
+            "heading_offset_deg=%.2f lateral_offset_cm=%.2f "
+            "fused_x_cm=%.2f fused_y_cm=%.2f fused_heading_deg=%.2f",
+            learning_allowed,
+            learning_samples,
+            radar_pose.x_cm,
+            radar_pose.y_cm,
+            radar_pose.heading_deg,
+            heading_offset_deg,
+            lateral_offset_cm,
+            fused_pose.x_cm,
+            fused_pose.y_cm,
+            fused_pose.heading_deg,
+        )
+        return fused_pose
 
     def _on_follower_state(self, state: TrackFollowerState) -> None:
         self.camera_corrector.set_curve_mode(
