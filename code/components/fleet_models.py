@@ -173,6 +173,7 @@ class ReportPayload:
     active_command_seq: int
     active_command_status: int
     error_code: int
+    radar_center_behind_a_centi_cm: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -313,6 +314,7 @@ class CarFleetState:
     active_command_seq: int = 0
     active_command_status: int = 0
     error_code: int = 0
+    radar_center_behind_a_centi_cm: Optional[int] = None
     map_revision: int = 0
     field_corners: Tuple[Tuple[int, int], ...] = ()
     path_revision: int = 0

@@ -308,6 +308,7 @@ class FleetCarNode:
             self._active_command_seq,
             self._active_command_status,
             self._error_code,
+            state.radar_center_behind_a_centi_cm,
         )
         return self._frame(MessageKind.REPORT, encode_report(payload))
 

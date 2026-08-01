@@ -24,6 +24,11 @@ from pathlib import Path
 from typing import Final
 
 from components.sound_light_alarm import AlarmGPIOError, SoundLightAlarm
+from radar_center_config import (
+    CONFIG_FILENAME,
+    load_radar_center_behind_a_cm,
+    save_radar_center_behind_a_cm,
+)
 
 try:
     import termios
@@ -39,6 +44,10 @@ DEFAULT_BAUDRATE: Final[int] = 9600
 TOKEN_TO_TASK: Final[dict[bytes, str]] = {
     b"MISSION1": "main_task1.py",
     b"MISSION2": "main_task2.py",
+}
+RADAR_DISTANCE_TOKENS: Final[dict[bytes, float]] = {
+    b"20": 20.0,
+    b"36.5": 36.5,
 }
 MISSION_SELECTION_BEEP_COUNT: Final[int] = 3
 MISSION_SELECTION_BEEP_ON_S: Final[float] = 0.15
@@ -85,14 +94,30 @@ class MissionScreenLauncher:
     """Serial token recognizer and single-child task supervisor."""
 
     def __init__(
-        self, task_directory: Path, delay_s: float, alarm_duration_s: float = 5.0
+        self,
+        task_directory: Path,
+        delay_s: float,
+        alarm_duration_s: float = 5.0,
+        config_path: Path | None = None,
     ) -> None:
         self.task_directory = task_directory
         self.delay_s = delay_s
         self.alarm_duration_s = alarm_duration_s
         self.pending: PendingLaunch | None = None
         self.child: subprocess.Popen[bytes] | None = None
-        self._buffer: deque[int] = deque(maxlen=max(map(len, TOKEN_TO_TASK)))
+        self.config_path = (
+            task_directory / CONFIG_FILENAME
+            if config_path is None
+            else Path(config_path)
+        )
+        self.radar_center_behind_a_cm = load_radar_center_behind_a_cm(
+            self.config_path
+        )
+        maximum_token_length = 1 + max(
+            *(map(len, TOKEN_TO_TASK)),
+            *(map(len, RADAR_DISTANCE_TOKENS)),
+        )
+        self._buffer: deque[int] = deque(maxlen=maximum_token_length)
 
     def receive(self, data: bytes, now: float) -> None:
         """Accept raw serial bytes and schedule the recognized mission."""
@@ -100,6 +125,27 @@ class MissionScreenLauncher:
         for value in data.upper():
             self._buffer.append(value)
             window = bytes(self._buffer)
+            for token, distance_cm in RADAR_DISTANCE_TOKENS.items():
+                preceding_index = len(window) - len(token) - 1
+                has_numeric_prefix = (
+                    preceding_index >= 0
+                    and window[preceding_index] in b"0123456789."
+                )
+                if window.endswith(token) and not has_numeric_prefix:
+                    try:
+                        selected = save_radar_center_behind_a_cm(
+                            self.config_path, distance_cm
+                        )
+                    except OSError as exc:
+                        LOG.error("could not save radar centre distance: %s", exc)
+                    else:
+                        self.radar_center_behind_a_cm = selected
+                        LOG.info(
+                            "radar centre distance behind A set to %g cm",
+                            selected,
+                        )
+                    self._buffer.clear()
+                    return
             for token, task_name in TOKEN_TO_TASK.items():
                 if window.endswith(token):
                     self._sound_selection_acknowledgement(task_name)
@@ -193,7 +239,12 @@ class MissionScreenLauncher:
             LOG.error("cannot launch missing task file: %s", pending.task_path)
             return
         self.child = subprocess.Popen(
-            [sys.executable, str(pending.task_path)],
+            [
+                sys.executable,
+                str(pending.task_path),
+                "--radar-center-behind-a-cm",
+                format(self.radar_center_behind_a_cm, "g"),
+            ],
             cwd=self.task_directory,
             start_new_session=True,
         )

@@ -29,6 +29,7 @@ class Harness:
             field_corners=((0, 0), (100, 0), (100, 100), (0, 100)),
             path_revision=3,
             path_points=((0, 0), (50, 50), (100, 100)),
+            radar_center_behind_a_centi_cm=3650,
         )
         self.node = FleetCarNode(
             writer=self.write,
@@ -128,6 +129,7 @@ class FleetCarNodeTests(unittest.TestCase):
         report = decode_report(frame.payload)
         self.assertEqual((report.x_cm, report.y_cm, report.z_cm), (10, 20, 0))
         self.assertEqual((report.request_session, report.request_seq), (55, 1))
+        self.assertEqual(3650, report.radar_center_behind_a_centi_cm)
 
     def test_duplicate_coordinate_command_executes_once_and_ack_is_identical(self):
         body = encode_coordinate_frame(CoordinateFrameCommand(1, 2, 300))

@@ -86,7 +86,7 @@ FLEET_POSITION_STALE_TIMEOUT_S = 0.5
 # 23.0 cm body and the rear axle 7.125 cm behind its centre, the rear axle is
 # 18.625 cm behind that front reference. The rear axle first approaches A by
 # this distance, then follows the painted centreline and finishes at A.
-RADAR_CENTER_BEHIND_A_ALONG_AB_CM = 18.625
+RADAR_CENTER_BEHIND_A_ALONG_AB_CM = 20
 
 # Camera correction stays filtered and gated, but must be strong enough to
 # overcome the repeatable radar bias once the line error is already large.
@@ -745,6 +745,9 @@ class RadarCameraLineApplication:
                 else (4 if pose_valid else (2 if pose is not None else 0))
             ),
             error_code=error_code,
+            radar_center_behind_a_centi_cm=round(
+                self.config.radar_center_behind_a_cm * 100.0
+            ),
         )
 
     @staticmethod

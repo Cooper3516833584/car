@@ -22,6 +22,7 @@ HEADER = struct.Struct("<2sBBBBBIHH")
 CRC = struct.Struct("<H")
 POLL = struct.Struct("<H")
 REPORT = struct.Struct("<IHHIiiiHhhhHBBHBB")
+REPORT_RADAR_DISTANCE = struct.Struct("<H")
 ACK_HEADER = struct.Struct("<IHBBBB")
 COORDINATE_FRAME = struct.Struct("<iiH")
 CAR_NAVIGATE = struct.Struct("<Bii")
@@ -235,7 +236,7 @@ def decode_poll(data: bytes) -> PollPayload:
 
 
 def encode_report(value: ReportPayload) -> bytes:
-    return REPORT.pack(
+    encoded = REPORT.pack(
         _u32("request_session", value.request_session), _u16("request_seq", value.request_seq),
         _u16("node_flags", value.node_flags), _u32("node_uptime_ms", value.node_uptime_ms),
         _i32("x_cm", value.x_cm), _i32("y_cm", value.y_cm), _i32("z_cm", value.z_cm),
@@ -246,12 +247,23 @@ def encode_report(value: ReportPayload) -> bytes:
         _u16("active_command_seq", value.active_command_seq),
         _u8("active_command_status", value.active_command_status), _u8("error_code", value.error_code),
     )
+    if value.radar_center_behind_a_centi_cm is not None:
+        encoded += REPORT_RADAR_DISTANCE.pack(
+            _u16(
+                "radar_center_behind_a_centi_cm",
+                value.radar_center_behind_a_centi_cm,
+            )
+        )
+    return encoded
 
 
 def decode_report(data: bytes) -> ReportPayload:
-    if len(data) != REPORT.size:
+    if len(data) not in (REPORT.size, REPORT.size + REPORT_RADAR_DISTANCE.size):
         raise ProtocolError("payload", "REPORT payload has invalid length")
-    value = ReportPayload(*REPORT.unpack(data))
+    distance = None
+    if len(data) > REPORT.size:
+        distance = REPORT_RADAR_DISTANCE.unpack_from(data, REPORT.size)[0]
+    value = ReportPayload(*REPORT.unpack_from(data), distance)
     _heading(value.heading_cdeg)
     _range("pose_quality", value.pose_quality, 0, 4)
     return value
