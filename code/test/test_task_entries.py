@@ -54,7 +54,7 @@ class TaskEntryTests(unittest.TestCase):
         self.assertEqual(1.0, task1_args.completion_alarm_seconds)
         self.assertTrue(task2_args.wait_for_fleet_start)
         self.assertEqual(14, task2_args.fleet_mission_request_state)
-        self.assertEqual(0.0, task2_args.completion_alarm_seconds)
+        self.assertEqual(1.0, task2_args.completion_alarm_seconds)
 
     def test_explicit_cli_speed_overrides_task_default(self):
         args = build_argument_parser().parse_args(

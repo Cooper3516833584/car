@@ -4,8 +4,8 @@
 The serial screen may send its text with framing bytes or a line ending.  This
 program therefore searches the received byte stream for the ASCII tokens
 ``MISSION1`` and ``MISSION2`` rather than requiring a particular line format.
-``MISSION1`` is acknowledged immediately with three fast alarm pulses and
-launched at once; ``MISSION2`` retains the delayed-selection behavior.
+Both missions are acknowledged immediately with three fast alarm pulses and
+launched at once.
 """
 
 from __future__ import annotations
@@ -40,9 +40,9 @@ TOKEN_TO_TASK: Final[dict[bytes, str]] = {
     b"MISSION1": "main_task1.py",
     b"MISSION2": "main_task2.py",
 }
-MISSION1_FAST_BEEP_COUNT: Final[int] = 3
-MISSION1_FAST_BEEP_ON_S: Final[float] = 0.15
-MISSION1_FAST_BEEP_OFF_S: Final[float] = 0.10
+MISSION_SELECTION_BEEP_COUNT: Final[int] = 3
+MISSION_SELECTION_BEEP_ON_S: Final[float] = 0.15
+MISSION_SELECTION_BEEP_OFF_S: Final[float] = 0.10
 
 
 def configure_serial(port: str, baudrate: int) -> int:
@@ -102,16 +102,13 @@ class MissionScreenLauncher:
             window = bytes(self._buffer)
             for token, task_name in TOKEN_TO_TASK.items():
                 if window.endswith(token):
-                    if token == b"MISSION1":
-                        self._sound_mission1_acknowledgement()
-                        self.schedule(
-                            self.task_directory / task_name,
-                            now,
-                            delay_s=0.0,
-                            prelaunch_alarm=False,
-                        )
-                    else:
-                        self.schedule(self.task_directory / task_name, now)
+                    self._sound_selection_acknowledgement(task_name)
+                    self.schedule(
+                        self.task_directory / task_name,
+                        now,
+                        delay_s=0.0,
+                        prelaunch_alarm=False,
+                    )
                     self._buffer.clear()  # One token must produce one launch.
                     return
 
@@ -139,21 +136,21 @@ class MissionScreenLauncher:
             launch_delay,
         )
 
-    def _sound_mission1_acknowledgement(self) -> None:
+    def _sound_selection_acknowledgement(self, task_name: str) -> None:
         alarm = None
         try:
             alarm = SoundLightAlarm()
             if not alarm.is_initialized:
                 alarm.initialize()
-            for index in range(MISSION1_FAST_BEEP_COUNT):
+            for index in range(MISSION_SELECTION_BEEP_COUNT):
                 alarm.on()
-                time.sleep(MISSION1_FAST_BEEP_ON_S)
+                time.sleep(MISSION_SELECTION_BEEP_ON_S)
                 alarm.off()
-                if index + 1 < MISSION1_FAST_BEEP_COUNT:
-                    time.sleep(MISSION1_FAST_BEEP_OFF_S)
-            LOG.info("MISSION1 acknowledged with three fast alarm pulses")
+                if index + 1 < MISSION_SELECTION_BEEP_COUNT:
+                    time.sleep(MISSION_SELECTION_BEEP_OFF_S)
+            LOG.info("%s acknowledged with three fast alarm pulses", task_name)
         except AlarmGPIOError as exc:
-            LOG.warning("MISSION1 acknowledgement alarm unavailable: %s", exc)
+            LOG.warning("%s acknowledgement alarm unavailable: %s", task_name, exc)
         finally:
             self._silence_alarm(alarm)
 
