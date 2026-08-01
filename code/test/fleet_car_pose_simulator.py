@@ -7,9 +7,16 @@ entry point and exits after a bounded duration or a TARGETED_STOP command.
 
 import argparse
 import math
+from pathlib import Path
 import signal
+import sys
 import threading
 import time
+
+
+CODE_DIR = Path(__file__).resolve().parents[1]
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(CODE_DIR))
 
 
 def build_parser():
