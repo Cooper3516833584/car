@@ -15,10 +15,10 @@ class TaskEntryTests(unittest.TestCase):
         )
         self.assertEqual(
             main_task2.TASK2_SPEED_PROFILE,
-            CompetitionTrackSpeedProfile(15.0, 15.0, 6.0, 15.0),
+            CompetitionTrackSpeedProfile(25.0, 9.0, 4.0, 30.0),
         )
         self.assertEqual(
-            15.0,
+            30.0,
             main_task2.TASK2_CD_SPEED_AFTER_RETAKEOFF_CM_S,
         )
         self.assertIsNot(
@@ -59,7 +59,7 @@ class TaskEntryTests(unittest.TestCase):
         self.assertTrue(task2_args.wait_for_fleet_start)
         self.assertEqual(14, task2_args.fleet_mission_request_state)
         self.assertEqual(1.0, task2_args.completion_alarm_seconds)
-        self.assertEqual(15.0, task2_args.cd_second_speed_cm_s)
+        self.assertEqual(30.0, task2_args.cd_second_speed_cm_s)
 
     def test_explicit_cli_speed_overrides_task_default(self):
         args = build_argument_parser().parse_args(
