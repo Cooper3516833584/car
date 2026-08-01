@@ -213,6 +213,13 @@ class MissionScreenLauncher:
                     and window[preceding_index] in b"0123456789."
                 )
                 if window.endswith(token) and not has_numeric_prefix:
+                    if self.child is not None and self.child.poll() is None:
+                        LOG.warning(
+                            "ignored radar centre distance %g cm while task is running",
+                            distance_cm,
+                        )
+                        self._buffer.clear()
+                        return
                     try:
                         selected = save_radar_center_behind_a_cm(
                             self.config_path, distance_cm

@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 venv/
 logs/
+code/radar_center_config.json
 
 # Local state created by coding agents; never commit it to the project.
 .agents/

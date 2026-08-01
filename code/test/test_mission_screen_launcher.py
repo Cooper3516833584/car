@@ -154,6 +154,21 @@ class MissionScreenLauncherTests(unittest.TestCase):
 
             self.assertEqual(36.5, second.radar_center_behind_a_cm)
 
+    def test_distance_change_is_ignored_while_task_is_running(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            task_directory = Path(directory)
+            config_path = task_directory / "radar-center.json"
+            launcher = MissionScreenLauncher(
+                task_directory, 10.0, config_path=config_path
+            )
+            launcher.child = unittest.mock.Mock()
+            launcher.child.poll.return_value = None
+
+            launcher.receive(b"36.5\xff\xff\xff", 1.0)
+
+            self.assertEqual(20.0, launcher.radar_center_behind_a_cm)
+            self.assertFalse(config_path.exists())
+
     def test_distance_digits_inside_a_larger_number_are_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             task_directory = Path(directory)
