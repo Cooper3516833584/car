@@ -314,6 +314,12 @@ class HC14SerialDriver:
         except OSError as exc:
             raise SerialDriverError(f"cannot open HC-14 serial port {self.port}") from exc
         try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise SerialDriverError(
+                    f"HC-14 serial port {self.port} is already in use"
+                ) from exc
             settings = termios.tcgetattr(fd)
             settings[0] = termios.IGNPAR
             settings[1] = 0
