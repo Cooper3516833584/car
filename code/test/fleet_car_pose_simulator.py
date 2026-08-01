@@ -61,7 +61,7 @@ class SimulatedCarStateProvider:
             vy_cm_s=round(vy_cm_s),
             battery_cV=1200,
             operation_state=0,
-            pose_quality=100,
+            pose_quality=4,
         )
 
 
@@ -153,8 +153,11 @@ def main():
         link.close()
         node.close()
         print(
-            "Car pose simulator stopped; trace_samples={}".format(
-                node.trace_buffer.recorded_samples
+            "Car pose simulator stopped; trace_samples={} sample_errors={} "
+            "last_sample_error={}".format(
+                node.trace_buffer.recorded_samples,
+                node.trace_sampler.sample_errors,
+                node.trace_sampler.last_error,
             ),
             flush=True,
         )
