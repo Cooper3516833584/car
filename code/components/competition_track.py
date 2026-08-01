@@ -538,6 +538,16 @@ class CompetitionTrackFollower:
             state = self._state
         self._notify(state)
 
+    def switch_cd_speed(self, speed_cm_s: float) -> bool:
+        """Change the active CD target without disturbing steering control."""
+
+        updated_profile = replace(self.speed_profile, cd_cm_s=speed_cm_s)
+        with self._lock:
+            if not self._running or self._state.segment is not TrackSegment.CD:
+                return False
+            self.speed_profile = updated_profile
+        return True
+
     def update_from_radar(
         self,
         update: RadarLocalizationUpdate,

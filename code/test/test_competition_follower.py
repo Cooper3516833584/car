@@ -227,6 +227,27 @@ class CompetitionTrackFollowerTests(unittest.TestCase):
             self.assertEqual(self.drive.commands[-1][0], expected_speed * 10.0)
         self.assertEqual(self.drive.stops, 0)
 
+    def test_cd_speed_switch_only_applies_during_active_cd_segment(self):
+        profile = CompetitionTrackSpeedProfile(6.0, 7.0, 8.0, 9.0)
+        follower = CompetitionTrackFollower(
+            drive=self.drive,
+            track=self.track,
+            speed_profile=profile,
+        )
+        follower.start_mission()
+        self.assertFalse(follower.switch_cd_speed(12.0))
+
+        cd_index = self.track.segment_start_indices[2]
+        follower._progress_index = cd_index - 1
+        follower.update_from_radar(radar_update(self.track, cd_index))
+
+        self.assertTrue(follower.switch_cd_speed(12.0))
+        state = follower.update_from_radar(
+            radar_update(self.track, cd_index + 1)
+        )
+        self.assertEqual(12.0, state.target_speed_cm_s)
+        self.assertEqual(120.0, self.drive.commands[-1][0])
+
     def test_terminal_approach_speed_ramps_to_eight_cm_s(self):
         finish_index = next(
             index

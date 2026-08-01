@@ -260,6 +260,7 @@ class MainConfig:
     ab_speed_cm_s: float = AB_TRACK_SPEED_CM_S
     bc_speed_cm_s: float = BC_TRACK_SPEED_CM_S
     cd_speed_cm_s: float = CD_TRACK_SPEED_CM_S
+    cd_second_speed_cm_s: float | None = None
     da_speed_cm_s: float = DA_TRACK_SPEED_CM_S
     camera_source: int | str = 0
     camera_correction_enabled: bool = CAMERA_CORRECTION_ENABLED
@@ -296,6 +297,13 @@ class MainConfig:
         ):
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be positive and finite")
+        if self.cd_second_speed_cm_s is not None and (
+            not math.isfinite(self.cd_second_speed_cm_s)
+            or self.cd_second_speed_cm_s <= 0.0
+        ):
+            raise ValueError(
+                "cd_second_speed_cm_s must be positive and finite"
+            )
         if isinstance(self.camera_source, int) and self.camera_source < 0:
             raise ValueError("camera_source cannot be negative")
         if isinstance(self.camera_source, str) and not self.camera_source:
@@ -411,6 +419,7 @@ class RadarCameraLineApplication:
         max_wheel_speed_mm_s = max(
             300.0,
             config.speed_profile.max_speed_cm_s * 12.0,
+            (config.cd_second_speed_cm_s or 0.0) * 12.0,
         )
         self.drive = AckermannDrive(
             max_wheel_speed_mm_s=max_wheel_speed_mm_s,
@@ -481,6 +490,11 @@ class RadarCameraLineApplication:
                 on_stop=self._fleet_stop,
                 on_set_alarm=self._fleet_set_alarm,
                 on_start_mission=self._fleet_start_mission,
+                on_switch_task2_cd_speed=(
+                    self._fleet_switch_task2_cd_speed
+                    if config.cd_second_speed_cm_s is not None
+                    else None
+                ),
                 trace_options=TraceSamplingOptions(
                     enabled=True,
                     sample_interval_s=0.50,
@@ -772,6 +786,21 @@ class RadarCameraLineApplication:
                 "car calibration is not complete",
             )
         self._mission_start_event.set()
+        return FleetCommandResult(FleetAckStatus.COMPLETED)
+
+    def _fleet_switch_task2_cd_speed(self) -> FleetCommandResult:
+        speed_cm_s = self.config.cd_second_speed_cm_s
+        if speed_cm_s is None:
+            return self._fleet_unsupported()
+        if not self.follower.switch_cd_speed(speed_cm_s):
+            LOG.warning(
+                "task 2 CD speed switch rejected outside active CD segment"
+            )
+            return FleetCommandResult(
+                FleetAckStatus.REJECTED,
+                FleetAckReason.NOT_READY,
+            )
+        LOG.info("task 2 CD speed switched to %.1f cm/s", speed_cm_s)
         return FleetCommandResult(FleetAckStatus.COMPLETED)
 
     def _fleet_set_alarm(self, active: bool) -> FleetCommandResult:
@@ -1534,6 +1563,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ab-speed-cm-s", type=float, default=AB_TRACK_SPEED_CM_S)
     parser.add_argument("--bc-speed-cm-s", type=float, default=BC_TRACK_SPEED_CM_S)
     parser.add_argument("--cd-speed-cm-s", type=float, default=CD_TRACK_SPEED_CM_S)
+    parser.add_argument("--cd-second-speed-cm-s", type=float, default=None)
     parser.add_argument("--da-speed-cm-s", type=float, default=DA_TRACK_SPEED_CM_S)
     parser.add_argument("--camera", type=_camera_source, default=0)
     parser.add_argument(
@@ -1608,6 +1638,7 @@ def main(argv: list[str] | None = None) -> int:
                 ab_speed_cm_s=args.ab_speed_cm_s,
                 bc_speed_cm_s=args.bc_speed_cm_s,
                 cd_speed_cm_s=args.cd_speed_cm_s,
+                cd_second_speed_cm_s=args.cd_second_speed_cm_s,
                 da_speed_cm_s=args.da_speed_cm_s,
                 camera_source=args.camera,
                 camera_correction_enabled=(

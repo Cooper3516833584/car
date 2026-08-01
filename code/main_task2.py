@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """D-task 2 one-key entry using the shared radar+camera line follower.
 
-Only the four task-specific speeds live here.  Steering, radar localization,
+Only the task-specific speeds live here.  Steering, radar localization,
 camera correction, FleetBus reporting and later tuning are always inherited
 from ``main_radar_camera_line_following.py``.
 """
@@ -15,17 +15,19 @@ from main_radar_camera_line_following import main as _run_core
 
 
 # Task 2 (dynamic landing) segment speeds.  A faster AB default provides margin
-# for the rule requiring the car to reach B within 15 seconds.  The four values
-# remain independently adjustable for field timing.
+# for the rule requiring the car to reach B within 15 seconds.  The five values
+# remain independently adjustable for field timing.  CD uses the first value
+# until the drone confirms platform retakeoff, then switches to the second.
 TASK2_AB_SPEED_CM_S = 15.0
 TASK2_BC_SPEED_CM_S = 15.0
-TASK2_CD_SPEED_CM_S = 6.0
+TASK2_CD_SPEED_BEFORE_RETAKEOFF_CM_S = 6.0
+TASK2_CD_SPEED_AFTER_RETAKEOFF_CM_S = 15.0
 TASK2_DA_SPEED_CM_S = 15.0
 
 TASK2_SPEED_PROFILE = CompetitionTrackSpeedProfile(
     TASK2_AB_SPEED_CM_S,
     TASK2_BC_SPEED_CM_S,
-    TASK2_CD_SPEED_CM_S,
+    TASK2_CD_SPEED_BEFORE_RETAKEOFF_CM_S,
     TASK2_DA_SPEED_CM_S,
 )
 
@@ -45,7 +47,9 @@ def build_core_argv(argv: list[str] | None = None) -> list[str]:
         "--bc-speed-cm-s",
         str(TASK2_BC_SPEED_CM_S),
         "--cd-speed-cm-s",
-        str(TASK2_CD_SPEED_CM_S),
+        str(TASK2_CD_SPEED_BEFORE_RETAKEOFF_CM_S),
+        "--cd-second-speed-cm-s",
+        str(TASK2_CD_SPEED_AFTER_RETAKEOFF_CM_S),
         "--da-speed-cm-s",
         str(TASK2_DA_SPEED_CM_S),
         *forwarded,

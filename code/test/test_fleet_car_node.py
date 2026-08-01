@@ -20,6 +20,7 @@ class Harness:
         self.mapping_calls = []
         self.alarm_calls = []
         self.start_calls = 0
+        self.switch_task2_cd_speed_calls = 0
         self.callback_threads = []
         self.event = threading.Event()
         self.state = CarFleetState(
@@ -40,6 +41,7 @@ class Harness:
             on_start_mapping=self.start_mapping,
             on_set_alarm=self.set_alarm,
             on_start_mission=self.start_mission,
+            on_switch_task2_cd_speed=self.switch_task2_cd_speed,
             timing=NodeTiming(0, 16),
             wait=lambda _: False,
         )
@@ -79,6 +81,10 @@ class Harness:
         self.start_calls += 1
         return CommandResult(AckStatus.COMPLETED)
 
+    def switch_task2_cd_speed(self):
+        self.switch_task2_cd_speed_calls += 1
+        return CommandResult(AckStatus.COMPLETED)
+
     def send(self, frame):
         self.event.clear()
         self.node.feed_frame(pack_frame(frame))
@@ -93,6 +99,7 @@ class Harness:
 class FleetCarNodeTests(unittest.TestCase):
     def test_start_mission_command_value_matches_ground_station(self):
         self.assertEqual(0x16, int(CommandId.CAR_START_MISSION))
+        self.assertEqual(0x17, int(CommandId.CAR_SWITCH_TASK2_CD_SPEED))
 
     def test_default_turnaround_supports_dense_pose_polling(self):
         self.assertAlmostEqual(0.10, NodeTiming().turnaround_s)
@@ -204,6 +211,20 @@ class FleetCarNodeTests(unittest.TestCase):
             decode_ack(unpack_frame(raw).payload).status,
         )
         self.assertEqual(1, self.h.start_calls)
+
+    def test_task2_cd_speed_switch_calls_task_handler(self):
+        raw = self.h.send(self.request(
+            MessageKind.COMMAND,
+            encode_command(
+                CommandPayload(CommandId.CAR_SWITCH_TASK2_CD_SPEED)
+            ),
+            seq=13,
+        ))
+        self.assertEqual(
+            AckStatus.COMPLETED,
+            decode_ack(unpack_frame(raw).payload).status,
+        )
+        self.assertEqual(1, self.h.switch_task2_cd_speed_calls)
 
     def test_disaster_rescue_is_decoded_by_optional_task_handler(self):
         self.h.node.close()

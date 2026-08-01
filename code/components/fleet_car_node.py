@@ -60,6 +60,7 @@ class FleetCarNode:
         on_start_mapping: Optional[Callable[[int], CommandResult]] = None,
         on_set_alarm: Optional[Callable[[bool], CommandResult]] = None,
         on_start_mission: Optional[Callable[[], CommandResult]] = None,
+        on_switch_task2_cd_speed: Optional[Callable[[], CommandResult]] = None,
         timing: NodeTiming = NodeTiming(),
         wait: Optional[Callable[[float], bool]] = None,
         trace_options: TraceSamplingOptions = TraceSamplingOptions(),
@@ -72,6 +73,7 @@ class FleetCarNode:
         self._on_start_mapping = on_start_mapping
         self._on_set_alarm = on_set_alarm
         self._on_start_mission = on_start_mission
+        self._on_switch_task2_cd_speed = on_switch_task2_cd_speed
         self._on_disaster_rescue = None
         self._timing = timing
         self._parser = FrameParser(local_node=NodeId.CAR)
@@ -376,6 +378,17 @@ class FleetCarNode:
                     )
                 else:
                     result = self._on_start_mission()
+            elif command_id == CommandId.CAR_SWITCH_TASK2_CD_SPEED:
+                if command.command_body:
+                    raise ValueError(
+                        "CAR_SWITCH_TASK2_CD_SPEED body must be empty"
+                    )
+                if self._on_switch_task2_cd_speed is None:
+                    result = CommandResult(
+                        AckStatus.REJECTED, AckReason.UNSUPPORTED
+                    )
+                else:
+                    result = self._on_switch_task2_cd_speed()
             else:
                 result = CommandResult(AckStatus.REJECTED, AckReason.UNSUPPORTED)
         except ValueError as exc:

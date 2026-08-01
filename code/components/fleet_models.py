@@ -37,6 +37,7 @@ class CommandId(IntEnum):
     CAR_ALARM_ON = 0x14
     CAR_ALARM_OFF = 0x15
     CAR_START_MISSION = 0x16
+    CAR_SWITCH_TASK2_CD_SPEED = 0x17
     DRONE_GOTO = 0x20
     DRONE_HOLD = 0x21
     CANCEL_TASK = 0x22
