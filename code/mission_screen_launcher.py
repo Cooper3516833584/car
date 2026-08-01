@@ -23,6 +23,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+from components import DEFAULT_HC14_PORT, SerialCommunicationDriver
+from components.fleet_car_node import FleetCarNode
+from components.fleet_models import (
+    AckReason,
+    AckStatus,
+    CarFleetState,
+    CommandResult,
+)
 from components.sound_light_alarm import AlarmGPIOError, SoundLightAlarm
 from radar_center_config import (
     CONFIG_FILENAME,
@@ -52,6 +60,62 @@ RADAR_DISTANCE_TOKENS: Final[dict[bytes, float]] = {
 MISSION_SELECTION_BEEP_COUNT: Final[int] = 3
 MISSION_SELECTION_BEEP_ON_S: Final[float] = 0.15
 MISSION_SELECTION_BEEP_OFF_S: Final[float] = 0.10
+
+
+class IdleFleetReporter:
+    """Answer ground-station polls while no competition task owns HC-14."""
+
+    def __init__(self, distance_provider, port: str = DEFAULT_HC14_PORT) -> None:
+        self._started_at = time.monotonic()
+        self._distance_provider = distance_provider
+        self._link = SerialCommunicationDriver(
+            port=port,
+            on_bytes=self._on_frame,
+            on_connected=lambda: LOG.info("idle FleetBus reporter connected"),
+            on_disconnected=lambda error: LOG.warning(
+                "idle FleetBus reporter disconnected: %s", error
+            ) if error is not None else None,
+        )
+        self._node = FleetCarNode(
+            writer=self._link.write,
+            state_provider=self._state,
+            on_set_coordinate_frame=self._unsupported,
+            on_navigate=self._unsupported,
+            on_stop=self._unsupported,
+        )
+
+    @staticmethod
+    def _unsupported(*_args) -> CommandResult:
+        return CommandResult(
+            AckStatus.REJECTED,
+            AckReason.NOT_READY,
+            "competition task is not running",
+        )
+
+    def _state(self) -> CarFleetState:
+        return CarFleetState(
+            node_flags=0,
+            uptime_ms=round(
+                (time.monotonic() - self._started_at) * 1000.0
+            ) & 0xFFFFFFFF,
+            x_cm=0,
+            y_cm=0,
+            heading_cdeg=0,
+            radar_center_behind_a_centi_cm=round(
+                float(self._distance_provider()) * 100.0
+            ),
+        )
+
+    def _on_frame(self, frame: bytes) -> None:
+        self._node.feed_frame(frame)
+
+    def start(self) -> None:
+        self._node.start()
+        self._link.start()
+
+    def close(self) -> None:
+        self._link.close()
+        self._node.close()
 
 
 def configure_serial(port: str, baudrate: int) -> int:
@@ -99,6 +163,7 @@ class MissionScreenLauncher:
         delay_s: float,
         alarm_duration_s: float = 5.0,
         config_path: Path | None = None,
+        idle_reporter_factory=None,
     ) -> None:
         self.task_directory = task_directory
         self.delay_s = delay_s
@@ -118,6 +183,22 @@ class MissionScreenLauncher:
             *(map(len, RADAR_DISTANCE_TOKENS)),
         )
         self._buffer: deque[int] = deque(maxlen=maximum_token_length)
+        self._idle_reporter_factory = idle_reporter_factory
+        self._idle_reporter = None
+
+    def start_idle_reporting(self) -> None:
+        if self._idle_reporter is not None or self._idle_reporter_factory is None:
+            return
+        reporter = self._idle_reporter_factory(
+            lambda: self.radar_center_behind_a_cm
+        )
+        reporter.start()
+        self._idle_reporter = reporter
+
+    def _stop_idle_reporting(self) -> None:
+        reporter, self._idle_reporter = self._idle_reporter, None
+        if reporter is not None:
+            reporter.close()
 
     def receive(self, data: bytes, now: float) -> None:
         """Accept raw serial bytes and schedule the recognized mission."""
@@ -204,6 +285,7 @@ class MissionScreenLauncher:
         if self.child is not None and self.child.poll() is not None:
             LOG.info("task exited with status %s", self.child.returncode)
             self.child = None
+            self.start_idle_reporting()
         if self.pending is None:
             return
         pending = self.pending
@@ -238,6 +320,7 @@ class MissionScreenLauncher:
         if not pending.task_path.is_file():
             LOG.error("cannot launch missing task file: %s", pending.task_path)
             return
+        self._stop_idle_reporting()
         self.child = subprocess.Popen(
             [
                 sys.executable,
@@ -252,6 +335,7 @@ class MissionScreenLauncher:
 
     def stop(self) -> None:
         self._silence_pending_alarm()
+        self._stop_idle_reporting()
         if self.child is not None and self.child.poll() is None:
             LOG.info("stopping task process group %d", self.child.pid)
             os.killpg(self.child.pid, signal.SIGTERM)
@@ -294,8 +378,12 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--startup-quiet-s must be non-negative")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     launcher = MissionScreenLauncher(
-        args.task_directory.resolve(), args.delay_s, args.alarm_duration_s
+        args.task_directory.resolve(),
+        args.delay_s,
+        args.alarm_duration_s,
+        idle_reporter_factory=IdleFleetReporter,
     )
+    launcher.start_idle_reporting()
     stopping = False
 
     def request_stop(_signum: int, _frame: object) -> None:

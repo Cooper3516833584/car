@@ -12,6 +12,42 @@ from radar_center_config import load_radar_center_behind_a_cm  # noqa: E402
 
 
 class MissionScreenLauncherTests(unittest.TestCase):
+    def test_idle_reporter_restarts_around_child_task(self) -> None:
+        events = []
+
+        class Reporter:
+            def __init__(self, distance_provider):
+                self.distance_provider = distance_provider
+
+            def start(self):
+                events.append(("start", self.distance_provider()))
+
+            def close(self):
+                events.append(("close", self.distance_provider()))
+
+        launcher = MissionScreenLauncher(
+            Path("/tasks"), 10.0, idle_reporter_factory=Reporter
+        )
+        launcher.start_idle_reporting()
+        launcher.start_idle_reporting()
+        self.assertEqual([("start", 20.0)], events)
+
+        with patch("mission_screen_launcher.Path.is_file", return_value=True), patch(
+            "mission_screen_launcher.subprocess.Popen"
+        ) as popen:
+            process = popen.return_value
+            process.poll.return_value = 0
+            process.pid = 42
+            launcher.schedule(Path("/tasks/main_task1.py"), 1.0, delay_s=0.0)
+            launcher.poll(1.0)
+            self.assertEqual([("start", 20.0), ("close", 20.0)], events)
+            launcher.poll(2.0)
+
+        self.assertEqual(
+            [("start", 20.0), ("close", 20.0), ("start", 20.0)],
+            events,
+        )
+
     @patch("mission_screen_launcher.time.sleep")
     @patch("mission_screen_launcher.SoundLightAlarm")
     def test_fragmented_case_insensitive_token_schedules_task_one(
