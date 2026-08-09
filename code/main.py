@@ -36,8 +36,8 @@ from fleet_bus.models import CarOperationState
 
 
 # Competition-site tuning: edit this one point when the final coordinate is known.
-TARGET_X_CM = 100.0
-TARGET_Y_CM = 0.0
+TARGET_X_CM = 160.0
+TARGET_Y_CM = 100.0
 TARGET_HOLD_SECONDS = 3.0
 RETURN_X_CM = 0.0
 RETURN_Y_CM = 0.0
