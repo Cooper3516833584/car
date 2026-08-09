@@ -2,6 +2,8 @@ import unittest
 
 from main import (
     MissionPhase,
+    ROAD_PATROL_ENFORCE_FIELD_BOUNDS,
+    ROAD_PATROL_MAP_MARGIN_CM,
     RETURN_X_CM,
     RETURN_Y_CM,
     TARGET_HOLD_SECONDS,
@@ -13,7 +15,11 @@ from main import (
 
 class RoadPatrolMainTests(unittest.TestCase):
     def test_default_target_is_easy_to_edit_at_module_top(self):
-        self.assertEqual((100.0, 0.0), (TARGET_X_CM, TARGET_Y_CM))
+        self.assertEqual((160.0, 100.0), (TARGET_X_CM, TARGET_Y_CM))
+
+    def test_fixed_target_mission_does_not_enforce_fitted_field_bounds(self):
+        self.assertFalse(ROAD_PATROL_ENFORCE_FIELD_BOUNDS)
+        self.assertGreaterEqual(ROAD_PATROL_MAP_MARGIN_CM, 250.0)
 
     def test_route_visits_target_holds_three_seconds_and_returns_without_heading(self):
         calls = []

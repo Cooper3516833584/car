@@ -42,6 +42,12 @@ TARGET_HOLD_SECONDS = 3.0
 RETURN_X_CM = 0.0
 RETURN_Y_CM = 0.0
 
+# The competition target is fixed and field-verified.  Keep obstacle, stale-pose,
+# planning-timeout and stop protections, but do not use the fitted startup
+# rectangle as a hard driving boundary for this mission.
+ROAD_PATROL_ENFORCE_FIELD_BOUNDS = False
+ROAD_PATROL_MAP_MARGIN_CM = 250.0
+
 NAVIGATION_CRUISE_SPEED_CM_S = 30.0
 NAVIGATION_REVERSE_SPEED_CM_S = 15.0
 MISSION_LEG_TIMEOUT_S = 120.0
@@ -130,6 +136,8 @@ class RoadPatrolCarApplication:
                 allow_reverse=True,
                 cruise_speed_cm_s=NAVIGATION_CRUISE_SPEED_CM_S,
                 reverse_speed_cm_s=NAVIGATION_REVERSE_SPEED_CM_S,
+                map_margin_cm=ROAD_PATROL_MAP_MARGIN_CM,
+                enforce_field_bounds=ROAD_PATROL_ENFORCE_FIELD_BOUNDS,
             ),
             on_state_changed=self._on_navigation_state,
         )

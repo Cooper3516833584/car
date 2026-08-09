@@ -70,10 +70,17 @@ class FakeNavigation:
 
 
 class CoordinateNavigationTests(unittest.TestCase):
-    def make_component(self) -> tuple[CoordinateNavigation, FakeNavigation]:
+    def make_component(
+        self,
+        *,
+        enforce_field_bounds: bool = True,
+        map_margin_cm: float = 15.0,
+    ) -> tuple[CoordinateNavigation, FakeNavigation]:
         component = CoordinateNavigation(
             CoordinateNavigationConfig(
                 radar_mount=RadarMount(0.01, 0.0, 0.0),
+                enforce_field_bounds=enforce_field_bounds,
+                map_margin_cm=map_margin_cm,
             )
         )
         calibration = make_calibration()
@@ -107,5 +114,16 @@ class CoordinateNavigationTests(unittest.TestCase):
 
         self.assertIs(caught.exception.reason, CoordinateGoalRejectReason.OUTSIDE_FIELD)
         self.assertEqual(navigation.calls, [])
+
+    def test_outside_goal_is_forwarded_when_field_bounds_are_disabled(self) -> None:
+        component, navigation = self.make_component(
+            enforce_field_bounds=False,
+            map_margin_cm=100.0,
+        )
+
+        goal = component.navigate_to(250.0, 0.0, 0.0)
+
+        self.assertEqual(goal, NavigationGoal(250.0, 0.0, 0.0))
+        self.assertEqual(navigation.calls, [(250.0, 0.0, 0.0, 5.0, 8.0)])
 if __name__ == "__main__":
     unittest.main()

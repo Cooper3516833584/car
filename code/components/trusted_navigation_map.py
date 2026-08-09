@@ -41,6 +41,7 @@ class TrustedNavigationMapConfig:
     max_icp_error_cm: float = 10.0
     footprint_clearance_cm: float = 2.0
     navigation_safety_margin_cm: float = 2.0
+    enforce_field_bounds: bool = True
 
     def __post_init__(self) -> None:
         if self.resolution_cm <= 0 or self.margin_cm < 0:
@@ -175,13 +176,14 @@ class TrustedNavigationMap:
             previous = self._last_pose
         if calibration is None:
             return "field calibration unavailable"
-        outside_corners = [
-            corner
-            for corner in self.vehicle_footprint_corners(pose)
-            if not calibration.contains_point(*corner)
-        ]
-        if outside_corners:
-            return f"vehicle footprint outside fitted field at {outside_corners[0]}"
+        if self.config.enforce_field_bounds:
+            outside_corners = [
+                corner
+                for corner in self.vehicle_footprint_corners(pose)
+                if not calibration.contains_point(*corner)
+            ]
+            if outside_corners:
+                return f"vehicle footprint outside fitted field at {outside_corners[0]}"
         if previous is not None:
             step_cm = math.hypot(
                 pose.x_cm - previous.x_cm,
@@ -373,7 +375,10 @@ class TrustedNavigationMap:
             grid = self._grid
         if calibration is None or grid is None:
             return False
-        if not calibration.contains_point(goal.x_cm, goal.y_cm):
+        if (
+            self.config.enforce_field_bounds
+            and not calibration.contains_point(goal.x_cm, goal.y_cm)
+        ):
             return False
         checker = VehicleCollisionChecker(
             grid,
@@ -397,10 +402,14 @@ class TrustedNavigationMap:
                 goal.y_cm,
                 (-heading_deg) % 360.0,
             )
-            if all(
-                calibration.contains_point(*corner)
-                for corner in self.vehicle_footprint_corners(radar_pose)
-            ) and checker.is_pose_free(navigation_pose):
+            footprint_inside_field = (
+                not self.config.enforce_field_bounds
+                or all(
+                    calibration.contains_point(*corner)
+                    for corner in self.vehicle_footprint_corners(radar_pose)
+                )
+            )
+            if footprint_inside_field and checker.is_pose_free(navigation_pose):
                 return True
         return False
 
@@ -440,7 +449,10 @@ class TrustedNavigationMap:
         for iy in range(height):
             for ix in range(width):
                 x_cm, y_cm = grid.cell_center(ix, iy)
-                if not calibration.contains_point(x_cm, y_cm):
+                if (
+                    self.config.enforce_field_bounds
+                    and not calibration.contains_point(x_cm, y_cm)
+                ):
                     cells[iy * width + ix] = 100
         result = OccupancyGrid(
             grid.resolution_cm,

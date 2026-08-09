@@ -84,6 +84,7 @@ class CoordinateNavigationConfig:
     trusted_max_yaw_step_deg: float = 15.0
     trusted_max_icp_error_cm: float = 10.0
     footprint_clearance_cm: float = 2.0
+    enforce_field_bounds: bool = True
     wall_rotation_adaptation: bool = True
     wall_low_pass_ratio: float = 0.20
 
@@ -187,6 +188,7 @@ class CoordinateNavigation:
                 max_icp_error_cm=config.trusted_max_icp_error_cm,
                 footprint_clearance_cm=config.footprint_clearance_cm,
                 navigation_safety_margin_cm=safety_margin_cm,
+                enforce_field_bounds=config.enforce_field_bounds,
             ),
             self.navigation.geometry,
         )
@@ -318,7 +320,10 @@ class CoordinateNavigation:
                     CoordinateGoalRejectReason.BUSY,
                     "navigation already active",
                 )
-        if not calibration.contains_point(goal.x_cm, goal.y_cm):
+        if (
+            self.config.enforce_field_bounds
+            and not calibration.contains_point(goal.x_cm, goal.y_cm)
+        ):
             raise CoordinateGoalRejected(
                 CoordinateGoalRejectReason.OUTSIDE_FIELD,
                 "goal lies outside the startup field",
