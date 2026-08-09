@@ -15,7 +15,7 @@ from main import (
 
 class RoadPatrolMainTests(unittest.TestCase):
     def test_default_target_is_easy_to_edit_at_module_top(self):
-        self.assertEqual((160.0, 100.0), (TARGET_X_CM, TARGET_Y_CM))
+        self.assertEqual((230.0, 40.0), (TARGET_X_CM, TARGET_Y_CM))
 
     def test_fixed_target_mission_does_not_enforce_fitted_field_bounds(self):
         self.assertFalse(ROAD_PATROL_ENFORCE_FIELD_BOUNDS)
