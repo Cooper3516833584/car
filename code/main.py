@@ -36,8 +36,8 @@ from fleet_bus.models import CarOperationState
 
 
 # Competition-site tuning: edit this one point when the final coordinate is known.
-TARGET_X_CM = 230.0
-TARGET_Y_CM = 40.0
+TARGET_X_CM = 250.0
+TARGET_Y_CM = -40.0
 TARGET_HEADING_DEG = 0.0
 TARGET_HOLD_SECONDS = 3.0
 RETURN_X_CM = 0.0
@@ -198,13 +198,7 @@ class RoadPatrolCarApplication:
                     self._mission_running = True
                     self._error_code = 0
                 try:
-                    succeeded = execute_point_return_mission(
-                        self._navigate_leg,
-                        self._stop_event.wait,
-                        target_x_cm=self.config.target_x_cm,
-                        target_y_cm=self.config.target_y_cm,
-                        hold_seconds=self.config.hold_seconds,
-                    )
+                    succeeded = self._recalibrate_and_execute_mission()
                 finally:
                     with self._lock:
                         self._mission_running = False
@@ -229,6 +223,27 @@ class RoadPatrolCarApplication:
             return completed_missions > 0
         finally:
             self.close()
+
+    def _recalibrate_and_execute_mission(self) -> bool:
+        self._set_phase(MissionPhase.CALIBRATING)
+        with self._lock:
+            self._ready = False
+        LOG.info("start command received; rebuilding map at current stopped pose")
+        try:
+            self.navigation.recalibrate_from_current_pose()
+        except Exception as exc:
+            self._set_failed(f"mission-start recalibration failed: {exc}")
+            return False
+        with self._lock:
+            self._ready = True
+        LOG.info("mission-start map rebuild complete; current pose is (0,0,0deg)")
+        return execute_point_return_mission(
+            self._navigate_leg,
+            self._stop_event.wait,
+            target_x_cm=self.config.target_x_cm,
+            target_y_cm=self.config.target_y_cm,
+            hold_seconds=self.config.hold_seconds,
+        )
 
     def request_stop(self) -> None:
         self._stop_event.set()

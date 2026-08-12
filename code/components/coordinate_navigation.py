@@ -238,6 +238,30 @@ class CoordinateNavigation:
             self._stop_event.clear()
             self._startup_scans.clear()
 
+        calibration = self._calibrate_from_current_pose()
+        self.navigation.start()
+        return calibration
+
+    def recalibrate_from_current_pose(self) -> RectangleFieldCalibration:
+        """Rebuild localization and the trusted map with the stopped car as origin."""
+
+        with self._lock:
+            if not self._ready:
+                raise RuntimeError("coordinate navigation is not ready")
+            if self.navigation.active:
+                raise RuntimeError("cannot recalibrate while navigation is active")
+            self._ready = False
+            self._stop_event.clear()
+            self._startup_scans.clear()
+        self.navigation.cancel(reason="recalibrating from current stopped pose")
+        return self._calibrate_from_current_pose()
+
+    def _calibrate_from_current_pose(self) -> RectangleFieldCalibration:
+        self.radar.close()
+        self.radar.disable_wall_fusion()
+        self.radar.assembler.reset()
+        self.radar.odometry.reset(Pose2D())
+        self.radar.global_map.clear()
         self.radar.start()
         if not self.radar.serial.wait_connected(
             min(3.0, self.config.calibration_timeout_s)
@@ -267,6 +291,7 @@ class CoordinateNavigation:
                 fusion_config=fusion_config,
             )
         else:
+            self.radar.disable_wall_fusion()
             LOG.warning("open-field calibration active; wall fusion disabled")
 
         startup_points: list[tuple[float, float]] = []
@@ -288,7 +313,6 @@ class CoordinateNavigation:
         )
         self.navigation.update_pose(NavigationPose(0.0, 0.0, 0.0))
         self._install_navigation_grid(grid)
-        self.navigation.start()
         with self._lock:
             self._ready = True
         self.radar.start()

@@ -28,7 +28,36 @@ class RoadPatrolMainTests(unittest.TestCase):
         return app
 
     def test_default_target_is_easy_to_edit_at_module_top(self):
-        self.assertEqual((230.0, 40.0), (TARGET_X_CM, TARGET_Y_CM))
+        self.assertEqual((250.0, -40.0), (TARGET_X_CM, TARGET_Y_CM))
+
+    def test_each_mission_recalibrates_before_driving(self):
+        app = RoadPatrolCarApplication.__new__(RoadPatrolCarApplication)
+        app._lock = threading.RLock()
+        app._ready = True
+        app._stop_event = threading.Event()
+        app.config = type(
+            "Config",
+            (),
+            {
+                "target_x_cm": TARGET_X_CM,
+                "target_y_cm": TARGET_Y_CM,
+                "hold_seconds": 0.0,
+            },
+        )()
+        calls = []
+        app.navigation = type(
+            "Navigation",
+            (),
+            {"recalibrate_from_current_pose": lambda _self: calls.append("rebuild")},
+        )()
+        app._set_phase = lambda phase: calls.append(phase)
+        app._navigate_leg = (
+            lambda x, y, heading, phase: calls.append((x, y, heading, phase)) or True
+        )
+
+        self.assertTrue(app._recalibrate_and_execute_mission())
+        self.assertEqual("rebuild", calls[1])
+        self.assertEqual(MissionPhase.OUTBOUND, calls[2][3])
 
     def test_fixed_target_mission_does_not_enforce_fitted_field_bounds(self):
         self.assertFalse(ROAD_PATROL_ENFORCE_FIELD_BOUNDS)
