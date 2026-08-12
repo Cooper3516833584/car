@@ -38,6 +38,7 @@ from fleet_bus.models import CarOperationState
 # Competition-site tuning: edit this one point when the final coordinate is known.
 TARGET_X_CM = 230.0
 TARGET_Y_CM = 40.0
+TARGET_HEADING_DEG = 0.0
 TARGET_HOLD_SECONDS = 3.0
 RETURN_X_CM = 0.0
 RETURN_Y_CM = 0.0
@@ -93,7 +94,7 @@ class MainConfig:
 
 
 def execute_point_return_mission(
-    navigate_leg: Callable[[float, float, MissionPhase], bool],
+    navigate_leg: Callable[[float, float, float | None, MissionPhase], bool],
     wait: Callable[[float], bool],
     *,
     target_x_cm: float = TARGET_X_CM,
@@ -102,11 +103,16 @@ def execute_point_return_mission(
 ) -> bool:
     """Run the task route; ``True`` means both coordinate legs arrived."""
 
-    if not navigate_leg(target_x_cm, target_y_cm, MissionPhase.OUTBOUND):
+    if not navigate_leg(
+        target_x_cm,
+        target_y_cm,
+        TARGET_HEADING_DEG,
+        MissionPhase.OUTBOUND,
+    ):
         return False
     if wait(hold_seconds):
         return False
-    return navigate_leg(RETURN_X_CM, RETURN_Y_CM, MissionPhase.RETURNING)
+    return navigate_leg(RETURN_X_CM, RETURN_Y_CM, None, MissionPhase.RETURNING)
 
 
 class RoadPatrolCarApplication:
@@ -138,6 +144,8 @@ class RoadPatrolCarApplication:
                 reverse_speed_cm_s=NAVIGATION_REVERSE_SPEED_CM_S,
                 map_margin_cm=ROAD_PATROL_MAP_MARGIN_CM,
                 enforce_field_bounds=ROAD_PATROL_ENFORCE_FIELD_BOUNDS,
+                open_field_calibration_fallback=True,
+                ingest_radar_obstacles=False,
             ),
             on_state_changed=self._on_navigation_state,
         )
@@ -231,12 +239,18 @@ class RoadPatrolCarApplication:
         self.navigation.close()
         LOG.info("application closed; drive outputs are stopped and steering is centred")
 
-    def _navigate_leg(self, x_cm: float, y_cm: float, phase: MissionPhase) -> bool:
+    def _navigate_leg(
+        self,
+        x_cm: float,
+        y_cm: float,
+        heading_deg: float | None,
+        phase: MissionPhase,
+    ) -> bool:
         self._set_phase(phase)
         with self._navigation_condition:
             generation = self._terminal_generation
         try:
-            self.navigation.navigate_to(x_cm, y_cm, None)
+            self.navigation.navigate_to(x_cm, y_cm, heading_deg)
         except Exception as exc:
             self._set_failed(f"goal ({x_cm:.1f},{y_cm:.1f}) rejected: {exc}")
             return False

@@ -125,5 +125,16 @@ class CoordinateNavigationTests(unittest.TestCase):
 
         self.assertEqual(goal, NavigationGoal(250.0, 0.0, 0.0))
         self.assertEqual(navigation.calls, [(250.0, 0.0, 0.0, 5.0, 8.0)])
+
+    def test_open_field_fallback_uses_startup_frame_without_walls(self) -> None:
+        component = CoordinateNavigation(
+            CoordinateNavigationConfig(open_field_calibration_fallback=True)
+        )
+
+        calibration = component._make_open_field_calibration()
+
+        self.assertEqual(calibration.initial_global_pose, Pose2D())
+        self.assertEqual(calibration.fitted_lines, 0)
+        self.assertTrue(calibration.contains_point(230.0, 40.0))
 if __name__ == "__main__":
     unittest.main()

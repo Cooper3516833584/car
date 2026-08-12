@@ -42,6 +42,7 @@ class TrustedNavigationMapConfig:
     footprint_clearance_cm: float = 2.0
     navigation_safety_margin_cm: float = 2.0
     enforce_field_bounds: bool = True
+    ingest_obstacle_points: bool = True
 
     def __post_init__(self) -> None:
         if self.resolution_cm <= 0 or self.margin_cm < 0:
@@ -238,12 +239,13 @@ class TrustedNavigationMap:
                 )
             )
         )
-        filtered_points = self.filter_vehicle_footprint_points(
-            update.global_points_cm,
-            pose,
+        filtered_points = (
+            self.filter_vehicle_footprint_points(update.global_points_cm, pose)
+            if self.config.ingest_obstacle_points
+            else []
         )
         purged_cells = self.purge_vehicle_footprint(pose)
-        if not wall_hard_rejected:
+        if not wall_hard_rejected and self.config.ingest_obstacle_points:
             self.point_map.add_points(filtered_points)
         return TrustedMapIngestResult(
             self.refresh_grid(now=timestamp),

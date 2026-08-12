@@ -29,12 +29,14 @@ from .navigation import (
 from .radar_driver import (
     DEFAULT_D500_PORT,
     D500RadarComponent,
+    DroneGlobalAlignment,
     Pose2D,
     RadarLocalizationUpdate,
     RadarMount,
     RadarScan,
     RectangleFieldCalibration,
     RectangleFieldCalibrator,
+    RectangularWallReference,
     WallFusionConfig,
     WallLineConfig,
     rebase_calibration_to_start_pose,
@@ -87,6 +89,9 @@ class CoordinateNavigationConfig:
     enforce_field_bounds: bool = True
     wall_rotation_adaptation: bool = True
     wall_low_pass_ratio: float = 0.20
+    open_field_calibration_fallback: bool = False
+    ingest_radar_obstacles: bool = True
+    open_field_half_extent_cm: float = 350.0
 
     def __post_init__(self) -> None:
         if not self.radar_port:
@@ -111,6 +116,8 @@ class CoordinateNavigationConfig:
             raise ValueError("invalid trusted localization configuration")
         if not 0.0 < self.wall_low_pass_ratio <= 1.0:
             raise ValueError("wall_low_pass_ratio must be in (0, 1]")
+        if self.open_field_half_extent_cm <= 0.0:
+            raise ValueError("open_field_half_extent_cm must be positive")
 
 
 class CoordinateNavigation:
@@ -189,6 +196,7 @@ class CoordinateNavigation:
                 footprint_clearance_cm=config.footprint_clearance_cm,
                 navigation_safety_margin_cm=safety_margin_cm,
                 enforce_field_bounds=config.enforce_field_bounds,
+                ingest_obstacle_points=config.ingest_radar_obstacles,
             ),
             self.navigation.geometry,
         )
@@ -247,27 +255,31 @@ class CoordinateNavigation:
         self.radar.odometry.reset(Pose2D())
         self.radar.global_map.clear()
         self.radar.alignment = calibration.local_to_global
-        fusion_config = WallFusionConfig.car_slow_drift(
-            position_gain=self.config.wall_low_pass_ratio,
-        )
-        self.radar.enable_wall_fusion(
-            calibration.wall_reference,
-            line_config=WallLineConfig(
-                rotation_adaptation=self.config.wall_rotation_adaptation,
-            ),
-            fusion_config=fusion_config,
-        )
+        if calibration.fitted_lines > 0:
+            fusion_config = WallFusionConfig.car_slow_drift(
+                position_gain=self.config.wall_low_pass_ratio,
+            )
+            self.radar.enable_wall_fusion(
+                calibration.wall_reference,
+                line_config=WallLineConfig(
+                    rotation_adaptation=self.config.wall_rotation_adaptation,
+                ),
+                fusion_config=fusion_config,
+            )
+        else:
+            LOG.warning("open-field calibration active; wall fusion disabled")
 
         startup_points: list[tuple[float, float]] = []
-        for scan in scans:
-            startup_points.extend(
-                scan_points_in_drone_global(
-                    scan,
-                    Pose2D(),
-                    self.config.radar_mount,
-                    calibration.local_to_global,
+        if self.config.ingest_radar_obstacles:
+            for scan in scans:
+                startup_points.extend(
+                    scan_points_in_drone_global(
+                        scan,
+                        Pose2D(),
+                        self.config.radar_mount,
+                        calibration.local_to_global,
+                    )
                 )
-            )
         self.radar.global_map.add_points(startup_points)
         grid = self.trusted_map.initialize(
             calibration,
@@ -413,6 +425,11 @@ class CoordinateNavigation:
                 )
             if len(scans) < self.config.startup_scan_count:
                 continue
+            if self.config.open_field_calibration_fallback:
+                LOG.warning(
+                    "open-field startup frame selected; rectangle fitting skipped"
+                )
+                return self._make_open_field_calibration(), scans
             try:
                 return self.calibrator.calibrate(scans), scans
             except (ValueError, RuntimeError) as exc:
@@ -420,6 +437,21 @@ class CoordinateNavigation:
                     LOG.warning("rectangle calibration retry: %s", exc)
                     last_error = str(exc)
         raise RuntimeError(f"rectangle field calibration timed out: {last_error}")
+
+    def _make_open_field_calibration(self) -> RectangleFieldCalibration:
+        extent = self.config.open_field_half_extent_cm
+        identity = DroneGlobalAlignment(0.0, 0.0, 0.0)
+        return RectangleFieldCalibration(
+            identity,
+            RectangularWallReference(identity, -extent, -extent, extent, extent),
+            Pose2D(),
+            -extent,
+            extent,
+            -extent,
+            extent,
+            0.0,
+            0,
+        )
 
     def _on_radar_update(self, update: RadarLocalizationUpdate) -> None:
         with self._lock:

@@ -7,6 +7,7 @@ from main import (
     RETURN_X_CM,
     RETURN_Y_CM,
     TARGET_HOLD_SECONDS,
+    TARGET_HEADING_DEG,
     TARGET_X_CM,
     TARGET_Y_CM,
     execute_point_return_mission,
@@ -25,8 +26,8 @@ class RoadPatrolMainTests(unittest.TestCase):
         calls = []
         waits = []
 
-        def navigate(x_cm, y_cm, phase):
-            calls.append((x_cm, y_cm, phase))
+        def navigate(x_cm, y_cm, heading_deg, phase):
+            calls.append((x_cm, y_cm, heading_deg, phase))
             return True
 
         succeeded = execute_point_return_mission(
@@ -37,8 +38,8 @@ class RoadPatrolMainTests(unittest.TestCase):
         self.assertTrue(succeeded)
         self.assertEqual(
             [
-                (TARGET_X_CM, TARGET_Y_CM, MissionPhase.OUTBOUND),
-                (RETURN_X_CM, RETURN_Y_CM, MissionPhase.RETURNING),
+                (TARGET_X_CM, TARGET_Y_CM, TARGET_HEADING_DEG, MissionPhase.OUTBOUND),
+                (RETURN_X_CM, RETURN_Y_CM, None, MissionPhase.RETURNING),
             ],
             calls,
         )
@@ -50,7 +51,7 @@ class RoadPatrolMainTests(unittest.TestCase):
 
         self.assertFalse(
             execute_point_return_mission(
-                lambda x, y, phase: calls.append((x, y, phase)) or False,
+                lambda x, y, heading, phase: calls.append((x, y, heading, phase)) or False,
                 lambda seconds: waits.append(seconds) or False,
             )
         )
@@ -62,7 +63,7 @@ class RoadPatrolMainTests(unittest.TestCase):
 
         self.assertFalse(
             execute_point_return_mission(
-                lambda x, y, phase: calls.append((x, y, phase)) or True,
+                lambda x, y, heading, phase: calls.append((x, y, heading, phase)) or True,
                 lambda _seconds: True,
             )
         )
