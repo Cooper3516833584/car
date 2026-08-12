@@ -1,3 +1,4 @@
+import threading
 import unittest
 
 from main import (
@@ -11,10 +12,21 @@ from main import (
     TARGET_X_CM,
     TARGET_Y_CM,
     execute_point_return_mission,
+    RoadPatrolCarApplication,
 )
+from components.fleet_models import AckReason, AckStatus
 
 
 class RoadPatrolMainTests(unittest.TestCase):
+    def make_start_callback_app(self, phase=MissionPhase.READY, running=False):
+        app = RoadPatrolCarApplication.__new__(RoadPatrolCarApplication)
+        app._lock = threading.RLock()
+        app._ready = True
+        app._phase = phase
+        app._mission_running = running
+        app._mission_start_event = threading.Event()
+        return app
+
     def test_default_target_is_easy_to_edit_at_module_top(self):
         self.assertEqual((230.0, 40.0), (TARGET_X_CM, TARGET_Y_CM))
 
@@ -68,6 +80,30 @@ class RoadPatrolMainTests(unittest.TestCase):
             )
         )
         self.assertEqual(1, len(calls))
+
+    def test_start_command_arms_every_ready_mission(self):
+        app = self.make_start_callback_app()
+
+        first = app._fleet_start_mission()
+        app._mission_start_event.clear()
+        app._phase = MissionPhase.COMPLETED
+        second = app._fleet_start_mission()
+
+        self.assertEqual(AckStatus.COMPLETED, first.status)
+        self.assertEqual(AckStatus.COMPLETED, second.status)
+        self.assertTrue(app._mission_start_event.is_set())
+
+    def test_start_command_is_rejected_while_mission_runs(self):
+        app = self.make_start_callback_app(
+            phase=MissionPhase.OUTBOUND,
+            running=True,
+        )
+
+        result = app._fleet_start_mission()
+
+        self.assertEqual(AckStatus.REJECTED, result.status)
+        self.assertEqual(AckReason.BUSY, result.reason)
+        self.assertFalse(app._mission_start_event.is_set())
 
 
 if __name__ == "__main__":

@@ -130,6 +130,7 @@ class RoadPatrolCarApplication:
         self._navigation_reason = "not started"
         self._terminal_generation = 0
         self._ready = False
+        self._mission_running = False
         self._closed = False
         self._error_code = 0
 
@@ -186,32 +187,46 @@ class RoadPatrolCarApplication:
                 self.config.target_x_cm,
                 self.config.target_y_cm,
             )
-            while (
-                not self._stop_event.is_set()
-                and not self._mission_start_event.wait(0.2)
-            ):
-                pass
-            if self._stop_event.is_set():
-                return False
-
-            succeeded = execute_point_return_mission(
-                self._navigate_leg,
-                self._stop_event.wait,
-                target_x_cm=self.config.target_x_cm,
-                target_y_cm=self.config.target_y_cm,
-                hold_seconds=self.config.hold_seconds,
-            )
-            if succeeded:
-                self._set_phase(MissionPhase.COMPLETED)
-                LOG.info(
-                    "mission complete; returned to (0,0) without heading constraint"
-                )
-            elif not self._stop_event.is_set():
-                self._set_failed("point-and-return mission did not complete")
-
-            while not self._stop_event.wait(0.5):
-                pass
-            return succeeded
+            completed_missions = 0
+            while not self._stop_event.is_set():
+                if not self._mission_start_event.wait(0.2):
+                    continue
+                if self._stop_event.is_set():
+                    break
+                with self._lock:
+                    self._mission_start_event.clear()
+                    self._mission_running = True
+                    self._error_code = 0
+                try:
+                    succeeded = execute_point_return_mission(
+                        self._navigate_leg,
+                        self._stop_event.wait,
+                        target_x_cm=self.config.target_x_cm,
+                        target_y_cm=self.config.target_y_cm,
+                        hold_seconds=self.config.hold_seconds,
+                    )
+                finally:
+                    with self._lock:
+                        self._mission_running = False
+                if succeeded:
+                    completed_missions += 1
+                    self._set_phase(MissionPhase.COMPLETED)
+                    LOG.info(
+                        "mission complete count=%d; returned to (0,0) without "
+                        "heading constraint",
+                        completed_missions,
+                    )
+                    self._set_phase(MissionPhase.READY)
+                    LOG.info(
+                        "ready for next FleetBus CAR_START_MISSION target=(%.1f, %.1f)cm",
+                        self.config.target_x_cm,
+                        self.config.target_y_cm,
+                    )
+                    continue
+                if not self._stop_event.is_set():
+                    self._set_failed("point-and-return mission did not complete")
+                break
+            return completed_missions > 0
         finally:
             self.close()
 
@@ -333,6 +348,12 @@ class RoadPatrolCarApplication:
                     AckReason.INTERNAL_ERROR,
                     "car mission is in failed state",
                 )
+            if self._mission_running:
+                return CommandResult(
+                    AckStatus.REJECTED,
+                    AckReason.BUSY,
+                    "car mission is already running",
+                )
             self._mission_start_event.set()
         return CommandResult(AckStatus.COMPLETED)
 
@@ -362,7 +383,11 @@ class RoadPatrolCarApplication:
             flags |= int(NodeFlags.POSE_VALID)
         if ready:
             flags |= int(NodeFlags.READY | NodeFlags.MAP_READY)
-        if phase in (MissionPhase.OUTBOUND, MissionPhase.RETURNING):
+        if phase in (
+            MissionPhase.OUTBOUND,
+            MissionPhase.HOLDING,
+            MissionPhase.RETURNING,
+        ):
             flags |= int(NodeFlags.BUSY | NodeFlags.ARMED_OR_MOTOR_ACTIVE)
         if ready and not pose_valid:
             flags |= int(NodeFlags.LOCALIZATION_DEGRADED)
