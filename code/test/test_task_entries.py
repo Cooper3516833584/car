@@ -8,7 +8,7 @@ import main_task1
 import main_task2
 from components.competition_track import CompetitionTrackSpeedProfile
 from config.loader import load_car_config
-from main_radar_camera_line_following import build_argument_parser
+from components.radar_camera_line_following import build_argument_parser
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REAL_CONFIG = REPO_ROOT / "configs" / "cooper_rock5a_l150.toml"

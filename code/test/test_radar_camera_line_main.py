@@ -17,7 +17,7 @@ from components.fleet_models import (
 )
 from components.navigation import NavigationPose
 from config.models import MissionControlConfig
-from main_radar_camera_line_following import (
+from components.radar_camera_line_following import (
     CAR_OPERATION_LOCALIZATION_LOST,
     MainConfig,
     RadarCameraLineApplication,

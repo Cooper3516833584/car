@@ -14,7 +14,7 @@ if str(CODE_ROOT) not in sys.path:
     sys.path.insert(0, str(CODE_ROOT))
 
 from components.camera_line_follower import BlackLineDetector
-from main_radar_camera_line_following import RadarCameraLineApplication
+from components.radar_camera_line_following import RadarCameraLineApplication
 
 
 def main() -> int:

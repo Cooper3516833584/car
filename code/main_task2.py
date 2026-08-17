@@ -12,7 +12,7 @@ from __future__ import annotations
 import sys
 
 from config.loader import load_car_config
-from main_radar_camera_line_following import run_mission as _run_mission
+from components.radar_camera_line_following import run_mission as _run_mission
 
 
 def _config_path_from_argv(argv: list[str]) -> str | None:

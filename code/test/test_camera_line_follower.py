@@ -1,16 +1,12 @@
 import math
 from dataclasses import replace
-from pathlib import Path
-import sys
 import unittest
 from types import SimpleNamespace
 
 import numpy as np
 
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-
-from camera_line_follower import (
+from components import camera_line_follower
+from components.camera_line_follower import (
     BlackLineDetector,
     CameraLineFollower,
     LineControlConfig,
@@ -66,7 +62,7 @@ def observation(
     )
 
 
-@unittest.skipIf(__import__("camera_line_follower").cv2 is None, "OpenCV unavailable")
+@unittest.skipIf(camera_line_follower.cv2 is None, "OpenCV unavailable")
 class DetectorTests(unittest.TestCase):
     def setUp(self):
         perspective = PerspectiveConfig(

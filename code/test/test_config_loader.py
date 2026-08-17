@@ -14,7 +14,7 @@ from config.loader import (
     load_car_config,
     resolve_config_path,
 )
-from main_radar_camera_line_following import (
+from components.radar_camera_line_following import (
     build_argument_parser,
     build_main_config,
 )

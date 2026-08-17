@@ -12,8 +12,8 @@ class ImportSafetyTests(unittest.TestCase):
             "import threading;"
             "before=tuple(t.name for t in threading.enumerate());"
             "import components.competition_track;"
-            "import main_fixed_track_test;"
-            "import main_radar_camera_line_following;"
+            "import components.fixed_track_runtime;"
+            "import components.radar_camera_line_following;"
             "after=tuple(t.name for t in threading.enumerate());"
             "assert before == after == ('MainThread',), (before, after)"
         )

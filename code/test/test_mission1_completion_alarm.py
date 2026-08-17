@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from components import TrackSegment
-from main_radar_camera_line_following import (
+from components.radar_camera_line_following import (
     MainConfig,
     RadarCameraLineApplication,
 )

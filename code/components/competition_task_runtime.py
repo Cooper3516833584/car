@@ -12,7 +12,7 @@ from components import (
     CompetitionTrackSpeedProfile,
     RadarMount,
 )
-from main_fixed_track_test import (
+from .fixed_track_runtime import (
     CompetitionCarApplication,
     DEFAULT_D500_PORT,
     LOG,

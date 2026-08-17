@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Run one radar-driven fixed-track lap with conservative camera correction.
 
-``main_fixed_track_test.py`` remains the unchanged radar-only rollback entry.
+``components.fixed_track_runtime`` remains the unchanged radar-only rollback
+runtime.
 This entry uses the same radar calibration, fixed track and Pure Pursuit
 controller, then adds only a small camera-derived steering increment when the
 black line is reliably visible and the lateral error is already significant.
