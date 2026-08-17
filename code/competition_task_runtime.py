@@ -113,7 +113,10 @@ def main(
 
     app: CompetitionTaskApplication | None = None
     try:
-        from config.factory import build_steering_calibration
+        from config.factory import (
+            build_steering_calibration,
+            build_steering_servo,
+        )
         from config.loader import load_car_config
 
         car_config = load_car_config(args.config)
@@ -150,6 +153,7 @@ def main(
                     car_config.vehicle.drive.allow_in_place_rotation
                 ),
                 steering_calibration=build_steering_calibration(car_config),
+                steering_servo=build_steering_servo(car_config),
             ),
             speed_profile,
         )

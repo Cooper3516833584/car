@@ -38,6 +38,7 @@ from components.navigation import (
 )
 from components.steering_servo import (
     DEFAULT_STEERING_CALIBRATION,
+    FrontSteeringServo,
     SteeringCalibration,
 )
 from components.vehicle_defaults import (
@@ -46,7 +47,7 @@ from components.vehicle_defaults import (
     DEFAULT_PHYSICAL_TRACK_WIDTH_MM,
     DEFAULT_WHEELBASE_MM,
 )
-from config.factory import build_steering_calibration
+from config.factory import build_steering_calibration, build_steering_servo
 from config.loader import load_car_config
 
 
@@ -149,6 +150,9 @@ class MainConfig:
     min_turn_radius_mm: float = DEFAULT_MIN_TURN_RADIUS_MM
     allow_in_place_rotation: bool = False
     steering_calibration: SteeringCalibration = DEFAULT_STEERING_CALIBRATION
+    # Ready-made steering servo carrying the configured PWM HAL; the rollback
+    # entry fills it from the TOML profile so drive.start() works on hardware.
+    steering_servo: FrontSteeringServo | None = None
 
     def __post_init__(self) -> None:
         if self.startup_scan_count <= 0:
@@ -201,6 +205,7 @@ class CompetitionCarApplication:
             min_turn_radius_mm=config.min_turn_radius_mm,
             allow_in_place_rotation=config.allow_in_place_rotation,
             steering_calibration=config.steering_calibration,
+            steering=config.steering_servo,
         )
         self.track = CompetitionTrack.build(
             reference_offset_cm=config.radar_center_behind_a_cm,
@@ -475,6 +480,7 @@ def main(argv: list[str] | None = None) -> int:
                     car_config.vehicle.drive.allow_in_place_rotation
                 ),
                 steering_calibration=build_steering_calibration(car_config),
+                steering_servo=build_steering_servo(car_config),
             )
         )
 

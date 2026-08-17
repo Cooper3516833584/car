@@ -438,6 +438,12 @@ def main(argv: list[str] | None = None) -> int:
         config_path=args.config,
         idle_reporter_factory=IdleFleetReporter,
     )
+    if not launcher.car_config.devices.screen.enabled:
+        LOG.info(
+            "mission screen disabled by vehicle profile "
+            "([devices.screen] enabled=false); launcher exits"
+        )
+        return 0
     screen_port = args.port or launcher.screen_port
     screen_baudrate = args.baudrate or launcher.screen_baudrate
     launcher.start_idle_reporting()

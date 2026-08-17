@@ -254,6 +254,25 @@ class MissionScreenLauncherTests(unittest.TestCase):
         )
         self.assertEqual(profile.devices.hc14.port, launcher.hc14_port)
 
+    def test_screen_disabled_does_not_open_serial(self) -> None:
+        import mission_screen_launcher as launcher_module
+
+        content = REAL_CONFIG.read_text(encoding="utf-8")
+        content = content.replace(
+            "[devices.screen]\nenabled = true",
+            "[devices.screen]\nenabled = false",
+        )
+        config_path = self.temporary_directory / "screen-disabled.toml"
+        config_path.write_text(content, encoding="utf-8")
+
+        with patch.object(
+            launcher_module, "configure_serial"
+        ) as configure_serial:
+            code = launcher_module.main(["--config", str(config_path)])
+
+        self.assertEqual(0, code)
+        configure_serial.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

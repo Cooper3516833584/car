@@ -1,4 +1,7 @@
+import shutil
 import unittest
+import uuid
+from pathlib import Path
 from unittest.mock import patch
 
 import main_task1
@@ -6,6 +9,9 @@ import main_task2
 from components.competition_track import CompetitionTrackSpeedProfile
 from config.loader import load_car_config
 from main_radar_camera_line_following import build_argument_parser
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+REAL_CONFIG = REPO_ROOT / "configs" / "cooper_rock5a_l150.toml"
 
 
 class TaskEntryTests(unittest.TestCase):
@@ -86,6 +92,33 @@ class TaskEntryTests(unittest.TestCase):
         )
         self.assertEqual(args.ab_speed_cm_s, 18.0)
         self.assertEqual(args.log_level, "DEBUG")
+
+    def test_build_core_argv_uses_config_flagged_profile(self):
+        # An explicit --config must select that profile's task parameters
+        # instead of silently injecting the Cooper defaults.
+        tmp = (
+            Path(__file__).resolve().parent / f"_hal_tmp_{uuid.uuid4().hex}"
+        )
+        tmp.mkdir()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        other = tmp / "other_school.toml"
+        content = REAL_CONFIG.read_text(encoding="utf-8").replace(
+            "ab_speed_cm_s = 8.0", "ab_speed_cm_s = 99.0"
+        )
+        other.write_text(content, encoding="utf-8")
+
+        args = build_argument_parser().parse_args(
+            main_task1.build_core_argv(["--config", str(other)])
+        )
+        self.assertEqual(99.0, args.ab_speed_cm_s)
+        self.assertEqual(str(other), args.config)
+
+        task2_args = build_argument_parser().parse_args(
+            main_task2.build_core_argv(["--config", str(other)])
+        )
+        # task2 AB default is 25.0 in the Cooper profile; other_school.toml
+        # only changed task1 AB, so task2 must still match its own profile.
+        self.assertEqual(25.0, task2_args.ab_speed_cm_s)
 
     def test_entry_delegates_to_shared_core_without_running_hardware(self):
         with patch.object(main_task1, "_run_mission", return_value=7) as run:

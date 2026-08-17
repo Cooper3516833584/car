@@ -72,6 +72,7 @@ def plan_ackermann_motion(
     track_width_mm: float = DEFAULT_TRACK_WIDTH_MM,
     firmware_track_width_mm: float = DEFAULT_FIRMWARE_TRACK_WIDTH_MM,
     min_turn_radius_mm: float = 350.0,
+    steering_calibration: SteeringCalibration = DEFAULT_STEERING_CALIBRATION,
 ) -> AckermannMotionPlan:
     """Validate and calculate one coordinated Ackermann motion command.
 
@@ -79,6 +80,10 @@ def plan_ackermann_motion(
     rear-wheel differential speed is derived from the calibrated front-wheel
     steering angle.  With linkage disabled both rear wheels receive the same
     signed speed while the front servo still turns.
+
+    ``steering_calibration`` is the vehicle's servo calibration; the pulse
+    width of the produced ``SteeringCommand`` is always computed with it so a
+    non-Cooper car never silently uses the module-level default calibration.
     """
 
     speed = float(speed_mm_s)
@@ -96,7 +101,9 @@ def plan_ackermann_motion(
     if not math.isfinite(firmware_track) or firmware_track <= 0.0:
         raise ValueError("firmware_track_width_mm must be finite and positive")
 
-    steering = make_steering_command(steering_angle_rad)
+    steering = make_steering_command(
+        steering_angle_rad, steering_calibration
+    )
     signed_speed = speed * direction.value
     radius: float | None = None
     if rear_differential_linked and not math.isclose(
@@ -235,12 +242,19 @@ class AckermannDrive:
         allow_in_place_rotation: bool,
         steering_calibration: SteeringCalibration,
         hardware_lock_path: str | os.PathLike[str] | None = DEFAULT_HARDWARE_LOCK_PATH,
+        steering: FrontSteeringServo | None = None,
     ) -> "AckermannDrive":
         """Build the drive from one validated vehicle profile.
 
         ``wheelbase_mm`` / ``track_width_mm`` are the measured physical
         Ackermann dimensions; ``firmware_track_width_mm`` is the C10B protocol
         track and must stay distinct from the physical track.
+
+        ``steering`` is an optional ready-made ``FrontSteeringServo`` carrying
+        the configured PWM output (built by ``config.factory``).  When omitted
+        a servo without a PWM output is created for API compatibility; the
+        competition composition root always passes the configured servo so
+        ``drive.start()`` can actually drive the hardware.
         """
         rear_motors = RearMotorDriver(
             device=device or None,
@@ -249,10 +263,12 @@ class AckermannDrive:
             min_turn_radius_mm=min_turn_radius_mm,
             allow_in_place_rotation=allow_in_place_rotation,
         )
-        steering = FrontSteeringServo(calibration=steering_calibration)
+        steering_servo = steering or FrontSteeringServo(
+            calibration=steering_calibration
+        )
         return cls(
             rear_motors=rear_motors,
-            steering=steering,
+            steering=steering_servo,
             wheelbase_mm=wheelbase_mm,
             track_width_mm=track_width_mm,
             firmware_track_width_mm=firmware_track_width_mm,
@@ -318,7 +334,9 @@ class AckermannDrive:
     ) -> AckermannMotionPlan:
         """Change yaw direction/magnitude and retain the latest centre speed."""
 
-        steering = yaw_to_steering_command(direction, magnitude_rad)
+        steering = yaw_to_steering_command(
+            direction, magnitude_rad, self.steering.calibration
+        )
         return self.set_motion(
             self._speed_mm_s,
             steering.angle_rad,
@@ -412,6 +430,7 @@ class AckermannDrive:
             track_width_mm=self.track_width_mm,
             firmware_track_width_mm=self.firmware_track_width_mm,
             min_turn_radius_mm=self.rear_motors.min_turn_radius_mm,
+            steering_calibration=self.steering.calibration,
         )
 
     def _apply_plan(self, plan: AckermannMotionPlan) -> None:

@@ -100,6 +100,54 @@ class LinuxSysfsBankGPIOOutputTests(unittest.TestCase):
             (self.root / "gpio139/value").read_text().strip(), "0"
         )
 
+    def _raw_value(self) -> str:
+        return (self.root / "gpio139/value").read_text().strip()
+
+    def test_initialize_respects_active_low_and_active_combinations(self) -> None:
+        # active_low=True, active=False -> raw HIGH (safe off on Cooper car)
+        LinuxSysfsBankGPIOOutput(
+            sysfs_root=self.root,
+            bank_label="gpio4",
+            line_offset=11,
+            active_low=True,
+        ).initialize(active=False)
+        self.assertEqual("1", self._raw_value())
+        self.assertFalse(
+            LinuxSysfsBankGPIOOutput(
+                sysfs_root=self.root,
+                bank_label="gpio4",
+                line_offset=11,
+                active_low=True,
+            ).is_active
+        )
+
+        # active_low=True, active=True -> raw LOW
+        LinuxSysfsBankGPIOOutput(
+            sysfs_root=self.root,
+            bank_label="gpio4",
+            line_offset=11,
+            active_low=True,
+        ).initialize(active=True)
+        self.assertEqual("0", self._raw_value())
+
+        # active_low=False, active=False -> raw LOW (safe off for active-high)
+        LinuxSysfsBankGPIOOutput(
+            sysfs_root=self.root,
+            bank_label="gpio4",
+            line_offset=11,
+            active_low=False,
+        ).initialize(active=False)
+        self.assertEqual("0", self._raw_value())
+
+        # active_low=False, active=True -> raw HIGH
+        LinuxSysfsBankGPIOOutput(
+            sysfs_root=self.root,
+            bank_label="gpio4",
+            line_offset=11,
+            active_low=False,
+        ).initialize(active=True)
+        self.assertEqual("1", self._raw_value())
+
     def test_uninitialized_output_is_rejected(self) -> None:
         output = LinuxSysfsBankGPIOOutput(
             sysfs_root=self.root,

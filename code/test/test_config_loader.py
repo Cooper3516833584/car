@@ -27,6 +27,20 @@ MINIMAL_TOML = """
 name = "test"
 description = "test profile"
 
+[hardware.steering_pwm]
+backend = "linux-sysfs"
+channel = 0
+period_ns = 20000000
+polarity = "normal"
+chip_device_match = "fd8b0000.pwm"
+
+[hardware.alarm_gpio]
+backend = "linux-sysfs-bank"
+sysfs_root = "/sys/class/gpio"
+bank_label = "gpio4"
+line_offset = 11
+active_low = true
+
 [devices.motor]
 port = "/dev/ttyACM0"
 
@@ -79,6 +93,11 @@ curve_a2 = 1.269
 curve_a1 = -1.772
 curve_a0 = 1.573
 curve_scale = 640.62
+
+[sensors.radar.mount]
+x_forward_cm = 0.0
+y_left_cm = 0.0
+yaw_cw_deg = 0.0
 
 [missions.task1]
 fleet_mission_request_state = 13
@@ -173,7 +192,81 @@ class ConfigLoaderTests(unittest.TestCase):
                 "[devices.motor]",
             ),
         )
-        with self.assertRaisesRegex(ConfigError, "devices.motor.port"):
+        with self.assertRaisesRegex(ConfigError, r"\[devices\.motor\] port"):
+            load_car_config(path)
+
+    def test_missing_vehicle_geometry_field_raises(self) -> None:
+        path = self._write(
+            "no_wheelbase.toml",
+            MINIMAL_TOML.replace("wheelbase_mm = 142.5\n", ""),
+        )
+        with self.assertRaisesRegex(
+            ConfigError, r"\[vehicle\.geometry\] wheelbase_mm"
+        ):
+            load_car_config(path)
+
+    def test_missing_firmware_track_raises(self) -> None:
+        path = self._write(
+            "no_firmware_track.toml",
+            MINIMAL_TOML.replace("firmware_track_width_mm = 164.0\n", ""),
+        )
+        with self.assertRaisesRegex(
+            ConfigError, r"\[vehicle\.drive\] firmware_track_width_mm"
+        ):
+            load_car_config(path)
+
+    def test_missing_servo_center_raises(self) -> None:
+        path = self._write(
+            "no_center_us.toml",
+            MINIMAL_TOML.replace("center_us = 1580\n", ""),
+        )
+        with self.assertRaisesRegex(
+            ConfigError, r"\[vehicle\.steering\] center_us"
+        ):
+            load_car_config(path)
+
+    def test_missing_pwm_chip_match_raises(self) -> None:
+        path = self._write(
+            "no_chip_match.toml",
+            MINIMAL_TOML.replace('chip_device_match = "fd8b0000.pwm"\n', ""),
+        )
+        with self.assertRaisesRegex(
+            ConfigError, r"\[hardware\.steering_pwm\] chip_device_match"
+        ):
+            load_car_config(path)
+
+    def test_missing_alarm_line_offset_raises(self) -> None:
+        path = self._write(
+            "no_line_offset.toml",
+            MINIMAL_TOML.replace("line_offset = 11\n", ""),
+        )
+        with self.assertRaisesRegex(
+            ConfigError, r"\[hardware\.alarm_gpio\] line_offset"
+        ):
+            load_car_config(path)
+
+    def test_missing_radar_mount_raises(self) -> None:
+        path = self._write(
+            "no_radar_mount.toml",
+            MINIMAL_TOML.replace(
+                "x_forward_cm = 0.0\ny_left_cm = 0.0\nyaw_cw_deg = 0.0\n",
+                "",
+            ),
+        )
+        with self.assertRaisesRegex(
+            ConfigError, r"\[sensors\.radar\.mount\] x_forward_cm"
+        ):
+            load_car_config(path)
+
+    def test_missing_devices_section_raises(self) -> None:
+        path = self._write(
+            "no_devices.toml",
+            MINIMAL_TOML.replace(
+                "[devices.motor]\nport = \"/dev/ttyACM0\"\n",
+                "",
+            ),
+        )
+        with self.assertRaisesRegex(ConfigError, r"\[devices\.motor\]"):
             load_car_config(path)
 
     def test_invalid_steering_direction_raises(self) -> None:

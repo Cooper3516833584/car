@@ -15,11 +15,29 @@ from config.loader import load_car_config
 from main_radar_camera_line_following import run_mission as _run_mission
 
 
+def _config_path_from_argv(argv: list[str]) -> str | None:
+    """Extract an explicit ``--config`` value, if any, from CLI arguments."""
+    for index, item in enumerate(argv):
+        if item == "--config":
+            if index + 1 < len(argv):
+                return argv[index + 1]
+        elif item.startswith("--config="):
+            return item.split("=", 1)[1]
+    return None
+
+
 def build_core_argv(argv: list[str] | None = None) -> list[str]:
-    """Legacy CLI helper mirroring the default profile for task 2."""
+    """Legacy CLI helper mirroring the selected profile for task 2.
+
+    The formal entry loads the profile itself; this helper exists for tests
+    and external launchers that only speak CLI flags.  When the caller passes
+    ``--config <path>``, the task defaults are taken from that profile so an
+    explicit other-school profile is never overridden by the Cooper defaults.
+    """
 
     forwarded = list(sys.argv[1:] if argv is None else argv)
-    task = load_car_config().missions.task2
+    config_path = _config_path_from_argv(forwarded)
+    task = load_car_config(config_path).missions.task2
     return [
         "--wait-for-fleet-start",
         "--fleet-mission-request-state",

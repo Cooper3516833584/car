@@ -51,8 +51,13 @@ def build_steering_calibration(
 
 
 def build_vehicle_geometry(config: CarConfig) -> VehicleGeometry:
-    """Build the single navigation geometry used by Navigation/planning."""
+    """Build the single navigation geometry used by Navigation/planning.
+
+    The servo mechanical limits come from the profile's ``[vehicle.steering]``
+    section so planning/clamp calculations follow the real servo range.
+    """
     geometry = config.vehicle.geometry
+    steering = config.vehicle.steering
     return VehicleGeometry.from_config(
         wheelbase_mm=geometry.wheelbase_mm,
         track_width_mm=geometry.physical_track_width_mm,
@@ -60,6 +65,8 @@ def build_vehicle_geometry(config: CarConfig) -> VehicleGeometry:
         body_width_mm=geometry.body_width_mm,
         min_turn_radius_mm=config.vehicle.drive.min_turn_radius_mm,
         rear_axle_to_body_center_mm=geometry.rear_axle_to_body_center_mm,
+        left_steering_limit_rad=steering.logical_left_max_rad,
+        right_steering_limit_rad=steering.logical_right_max_rad,
     )
 
 
@@ -103,6 +110,8 @@ def build_ackermann_drive(
 
     ``max_wheel_speed_mm_s`` overrides the profile default when the mission
     needs a higher outer-wheel limit (the competition main does this).
+    The steering servo is built with the profile's PWM HAL so the produced
+    drive can actually start on hardware.
     """
     geometry = config.vehicle.geometry
     drive = config.vehicle.drive
@@ -121,6 +130,7 @@ def build_ackermann_drive(
         allow_in_place_rotation=drive.allow_in_place_rotation,
         steering_calibration=build_steering_calibration(config),
         hardware_lock_path=hardware_lock_path,
+        steering=build_steering_servo(config),
     )
 
 

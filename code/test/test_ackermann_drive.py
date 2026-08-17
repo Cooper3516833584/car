@@ -11,11 +11,92 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from components.ackermann_drive import AckermannDrive, plan_ackermann_motion  # noqa: E402
 from components.rear_motor import MotorDirection  # noqa: E402
 from components.steering_servo import (  # noqa: E402
+    FrontSteeringServo,
     STEERING_CENTER_US,
+    SteeringCalibration,
     YawDirection,
     steering_angle_to_pulse_us,
     yaw_to_steering_command,
 )
+
+# A clearly non-Cooper calibration: different direction sign, tighter
+# mechanical range, linear curve and centre at 1500 us.  Used to prove the
+# planning paths really use the injected calibration instead of the module
+# default Cooper values.
+CUSTOM_CALIBRATION = SteeringCalibration(
+    direction_sign=1.0,
+    logical_right_max_rad=-0.20,
+    logical_left_max_rad=0.25,
+    calibration_min_rad=-0.20,
+    calibration_max_rad=0.25,
+    pwm_min_us=700,
+    pwm_max_us=2300,
+    factory_center_us=1500,
+    center_us=1500,
+    curve_a3=0.0,
+    curve_a2=0.0,
+    curve_a1=-1.0,
+    curve_a0=0.0,
+    curve_scale=1000.0,
+)
+
+
+class CustomSteeringCalibrationTests(unittest.TestCase):
+    def test_plan_uses_injected_calibration_not_module_default(self) -> None:
+        plan = plan_ackermann_motion(
+            100,
+            0.10,
+            steering_calibration=CUSTOM_CALIBRATION,
+        )
+        self.assertEqual(
+            steering_angle_to_pulse_us(0.10, CUSTOM_CALIBRATION),
+            plan.steering.pulse_us,
+        )
+        # 0.10 rad with the custom curve is far from the Cooper default pulse.
+        self.assertNotEqual(
+            steering_angle_to_pulse_us(0.10),
+            plan.steering.pulse_us,
+        )
+
+    def test_plan_rejects_angle_beyond_custom_mechanical_range(self) -> None:
+        # 0.30 rad exceeds the custom logical_left_max_rad of 0.25 and must be
+        # rejected even though it is inside the Cooper range (+0.49).
+        with self.assertRaises(ValueError):
+            plan_ackermann_motion(
+                100,
+                0.30,
+                steering_calibration=CUSTOM_CALIBRATION,
+            )
+
+    def test_drive_plan_uses_servo_calibration(self) -> None:
+        steering = FrontSteeringServo(calibration=CUSTOM_CALIBRATION)
+        drive = AckermannDrive(
+            steering=steering,
+            hardware_lock_path=None,
+        )
+        plan = drive._plan(100.0, 0.10, MotorDirection.FORWARD, True)
+        self.assertEqual(
+            steering_angle_to_pulse_us(0.10, CUSTOM_CALIBRATION),
+            plan.steering.pulse_us,
+        )
+
+    def test_drive_set_yaw_uses_servo_calibration(self) -> None:
+        steering = FrontSteeringServo(calibration=CUSTOM_CALIBRATION)
+        drive = AckermannDrive(
+            steering=steering,
+            hardware_lock_path=None,
+        )
+        drive._speed_mm_s = 100.0
+        import unittest.mock
+
+        with unittest.mock.patch(
+            "components.ackermann_drive.yaw_to_steering_command",
+            wraps=yaw_to_steering_command,
+        ) as yaw_command:
+            with self.assertRaises(RuntimeError):  # drive is not started
+                drive.set_yaw(YawDirection.LEFT, 0.10)
+        # The servo calibration must be forwarded, not the module default.
+        self.assertEqual(CUSTOM_CALIBRATION, yaw_command.call_args[0][2])
 
 
 class SteeringCalibrationTests(unittest.TestCase):

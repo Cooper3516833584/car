@@ -155,6 +155,12 @@ class VehicleGeometry:
     rear_axle_to_body_center_cm: float = (
         DEFAULT_REAR_AXLE_TO_BODY_CENTER_MM / 10.0
     )
+    # Servo mechanical steering limits.  The module-level defaults match the
+    # verified Cooper car; ``VehicleGeometry.from_config`` / the config factory
+    # inject the TOML [vehicle.steering] limits so another school's servo
+    # ranges actually affect planning.
+    left_steering_limit_rad: float = STEERING_LEFT_MAX_RAD
+    right_steering_limit_rad: float = STEERING_RIGHT_MAX_RAD
 
     def __post_init__(self) -> None:
         if min(
@@ -167,6 +173,15 @@ class VehicleGeometry:
             raise ValueError("vehicle geometry dimensions must be positive")
         if abs(self.rear_axle_to_body_center_cm) > self.body_length_cm / 2:
             raise ValueError("body centre offset lies outside the vehicle body")
+        if not (
+            math.isfinite(self.left_steering_limit_rad)
+            and math.isfinite(self.right_steering_limit_rad)
+        ):
+            raise ValueError("steering limits must be finite")
+        if self.left_steering_limit_rad <= 0.0:
+            raise ValueError("left steering limit must be positive")
+        if self.right_steering_limit_rad >= 0.0:
+            raise ValueError("right steering limit must be negative")
 
     @classmethod
     def from_config(
@@ -178,6 +193,8 @@ class VehicleGeometry:
         body_width_mm: float,
         min_turn_radius_mm: float,
         rear_axle_to_body_center_mm: float,
+        left_steering_limit_rad: float = STEERING_LEFT_MAX_RAD,
+        right_steering_limit_rad: float = STEERING_RIGHT_MAX_RAD,
     ) -> "VehicleGeometry":
         """Build the navigation geometry from one validated vehicle profile."""
         return cls(
@@ -187,12 +204,14 @@ class VehicleGeometry:
             body_width_cm=float(body_width_mm) / 10.0,
             min_turn_radius_cm=float(min_turn_radius_mm) / 10.0,
             rear_axle_to_body_center_cm=float(rear_axle_to_body_center_mm) / 10.0,
+            left_steering_limit_rad=float(left_steering_limit_rad),
+            right_steering_limit_rad=float(right_steering_limit_rad),
         )
 
     @property
     def left_min_turn_radius_cm(self) -> float:
         servo_radius = (
-            self.wheelbase_cm / math.tan(STEERING_LEFT_MAX_RAD)
+            self.wheelbase_cm / math.tan(self.left_steering_limit_rad)
             - self.track_width_cm / 2.0
         )
         return max(self.min_turn_radius_cm, servo_radius)
@@ -200,7 +219,7 @@ class VehicleGeometry:
     @property
     def right_min_turn_radius_cm(self) -> float:
         servo_radius = abs(
-            self.wheelbase_cm / math.tan(STEERING_RIGHT_MAX_RAD)
+            self.wheelbase_cm / math.tan(self.right_steering_limit_rad)
             - self.track_width_cm / 2.0
         )
         return max(self.min_turn_radius_cm, servo_radius)
@@ -213,7 +232,7 @@ class VehicleGeometry:
         geometry_limit = math.atan(
             self.wheelbase_cm / (radius + self.track_width_cm / 2.0)
         )
-        return min(STEERING_LEFT_MAX_RAD, geometry_limit)
+        return min(self.left_steering_limit_rad, geometry_limit)
 
     @property
     def min_right_steering_rad(self) -> float:
@@ -223,7 +242,7 @@ class VehicleGeometry:
         geometry_limit = math.atan(
             self.wheelbase_cm / (-radius + self.track_width_cm / 2.0)
         )
-        return max(STEERING_RIGHT_MAX_RAD, geometry_limit)
+        return max(self.right_steering_limit_rad, geometry_limit)
 
 
 @dataclass(frozen=True, slots=True)

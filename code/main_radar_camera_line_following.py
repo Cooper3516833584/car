@@ -79,6 +79,7 @@ from components.navigation import (
 )
 from components.steering_servo import (
     DEFAULT_STEERING_CALIBRATION,
+    FrontSteeringServo,
     SteeringCalibration,
 )
 from config.loader import load_car_config
@@ -227,6 +228,10 @@ class MainConfig:
     min_turn_radius_mm: float = DEFAULT_MIN_TURN_RADIUS_MM
     allow_in_place_rotation: bool = False
     steering_calibration: SteeringCalibration = DEFAULT_STEERING_CALIBRATION
+    # Ready-made steering servo carrying the configured PWM HAL, built by the
+    # composition root from [hardware.steering_pwm].  None keeps legacy tests
+    # working; the formal entry always provides it so drive.start() works.
+    steering_servo: FrontSteeringServo | None = None
     hardware_lock_path: str | None = DEFAULT_HARDWARE_LOCK_PATH
     # Alarm GPIO from [hardware.alarm_gpio].
     alarm_sysfs_root: str = "/sys/class/gpio"
@@ -396,6 +401,7 @@ class RadarCameraLineApplication:
             allow_in_place_rotation=config.allow_in_place_rotation,
             steering_calibration=config.steering_calibration,
             hardware_lock_path=config.hardware_lock_path,
+            steering=config.steering_servo,
         )
         self.track = CompetitionTrack.build(
             reference_offset_cm=config.radar_center_behind_a_cm,
@@ -1607,6 +1613,7 @@ def build_main_config(
         build_camera_correction_config,
         build_line_vision_config,
         build_steering_calibration,
+        build_steering_servo,
         derive_steering_clamp_rad,
     )
     from config.runtime_state import load_runtime_radar_center_cm
@@ -1754,6 +1761,7 @@ def build_main_config(
             car_config.vehicle.drive.allow_in_place_rotation
         ),
         steering_calibration=build_steering_calibration(car_config),
+        steering_servo=build_steering_servo(car_config),
         hardware_lock_path=DEFAULT_HARDWARE_LOCK_PATH,
         alarm_sysfs_root=car_config.hardware.alarm_gpio.sysfs_root,
         alarm_bank_label=car_config.hardware.alarm_gpio.bank_label,

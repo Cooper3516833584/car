@@ -130,6 +130,21 @@ def _get_str(
     return value
 
 
+def _require_key(
+    table: Mapping[str, Any],
+    section: str,
+    key: str,
+) -> None:
+    """Fail fast when a critical vehicle/hardware field is missing.
+
+    The TOML profile is the single source of truth for the running car; a
+    profile that omits a critical field must not silently fall back to the
+    verified Cooper car's values.
+    """
+    if key not in table:
+        raise ConfigError(f"missing required key [{section}] {key}")
+
+
 def _get_float_tuple(
     table: Mapping[str, Any],
     section: str,
@@ -177,13 +192,20 @@ def _get_norm_point_list(
 
 
 def _build_hardware(document: Mapping[str, Any]) -> models.HardwareConfig:
-    hardware = _get_table(document, "hardware", required=False)
+    hardware = _get_table(document, "hardware", required=True)
     pwm_table = _get_table(
-        hardware, "steering_pwm", label="hardware.steering_pwm", required=False
+        hardware, "steering_pwm", label="hardware.steering_pwm", required=True
     )
     gpio_table = _get_table(
-        hardware, "alarm_gpio", label="hardware.alarm_gpio", required=False
+        hardware, "alarm_gpio", label="hardware.alarm_gpio", required=True
     )
+
+    # Critical PWM fields must be explicitly provided; physical_pin /
+    # pin_function / device_tree_overlay stay optional documentation.
+    for key in ("backend", "channel", "period_ns", "polarity", "chip_device_match"):
+        _require_key(pwm_table, "hardware.steering_pwm", key)
+    for key in ("backend", "bank_label", "line_offset", "active_low"):
+        _require_key(gpio_table, "hardware.alarm_gpio", key)
 
     steering_pwm = models.SteeringPWMConfig(
         backend=_get_str(
@@ -243,12 +265,15 @@ def _build_hardware(document: Mapping[str, Any]) -> models.HardwareConfig:
 
 
 def _build_devices(document: Mapping[str, Any]) -> models.DevicesConfig:
-    devices = _get_table(document, "devices", required=False)
-    motor = _get_table(devices, "motor", label="devices.motor", required=False)
-    radar = _get_table(devices, "radar", label="devices.radar", required=False)
-    hc14 = _get_table(devices, "hc14", label="devices.hc14", required=False)
+    devices = _get_table(document, "devices", required=True)
+    motor = _get_table(devices, "motor", label="devices.motor", required=True)
+    radar = _get_table(devices, "radar", label="devices.radar", required=True)
+    hc14 = _get_table(devices, "hc14", label="devices.hc14", required=True)
     screen = _get_table(devices, "screen", label="devices.screen", required=False)
     camera = _get_table(devices, "camera", label="devices.camera", required=False)
+    _require_key(motor, "devices.motor", "port")
+    _require_key(radar, "devices.radar", "port")
+    _require_key(hc14, "devices.hc14", "port")
     return models.DevicesConfig(
         motor=models.MotorDeviceConfig(
             port=_get_str(motor, "devices.motor", "port", ""),
@@ -292,14 +317,49 @@ def _get_camera_source(table: Mapping[str, Any]) -> int | str:
 
 
 def _build_vehicle(document: Mapping[str, Any]) -> models.VehicleConfig:
-    vehicle = _get_table(document, "vehicle", required=False)
+    vehicle = _get_table(document, "vehicle", required=True)
     geometry = _get_table(
-        vehicle, "geometry", label="vehicle.geometry", required=False
+        vehicle, "geometry", label="vehicle.geometry", required=True
     )
-    drive = _get_table(vehicle, "drive", label="vehicle.drive", required=False)
+    drive = _get_table(vehicle, "drive", label="vehicle.drive", required=True)
     steering = _get_table(
-        vehicle, "steering", label="vehicle.steering", required=False
+        vehicle, "steering", label="vehicle.steering", required=True
     )
+
+    # Measured geometry must be explicit; wheel_thickness / outer_wheel_width
+    # stay optional diagnostics and never override physical_track_width_mm.
+    for key in (
+        "wheelbase_mm",
+        "physical_track_width_mm",
+        "body_length_mm",
+        "body_width_mm",
+        "rear_axle_to_body_center_mm",
+    ):
+        _require_key(geometry, "vehicle.geometry", key)
+    for key in (
+        "firmware_track_width_mm",
+        "min_turn_radius_mm",
+        "default_max_wheel_speed_mm_s",
+        "allow_in_place_rotation",
+    ):
+        _require_key(drive, "vehicle.drive", key)
+    for key in (
+        "direction_sign",
+        "logical_right_max_rad",
+        "logical_left_max_rad",
+        "calibration_min_rad",
+        "calibration_max_rad",
+        "pwm_min_us",
+        "pwm_max_us",
+        "factory_center_us",
+        "center_us",
+        "curve_a3",
+        "curve_a2",
+        "curve_a1",
+        "curve_a0",
+        "curve_scale",
+    ):
+        _require_key(steering, "vehicle.steering", key)
     return models.VehicleConfig(
         geometry=models.VehicleGeometryConfig(
             wheelbase_mm=_get_float(
@@ -395,11 +455,13 @@ def _build_vehicle(document: Mapping[str, Any]) -> models.VehicleConfig:
 
 
 def _build_sensors(document: Mapping[str, Any]) -> models.SensorsConfig:
-    sensors = _get_table(document, "sensors", required=False)
-    radar = _get_table(sensors, "radar", label="sensors.radar", required=False)
+    sensors = _get_table(document, "sensors", required=True)
+    radar = _get_table(sensors, "radar", label="sensors.radar", required=True)
     mount = _get_table(
-        radar, "mount", label="sensors.radar.mount", required=False
+        radar, "mount", label="sensors.radar.mount", required=True
     )
+    for key in ("x_forward_cm", "y_left_cm", "yaw_cw_deg"):
+        _require_key(mount, "sensors.radar.mount", key)
     camera = _get_table(sensors, "camera", label="sensors.camera", required=False)
     perspective = _get_table(
         camera, "perspective", label="sensors.camera.perspective", required=False

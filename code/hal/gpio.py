@@ -136,14 +136,23 @@ class LinuxSysfsBankGPIOOutput:
                 time.sleep(0.01)
         if not self._gpio.exists():
             raise GPIOBackendError(f"export did not create {self._gpio}")
+        # Select the raw level that makes the requested ``active`` state safe
+        # in one atomic direction write, so an active-high device is not
+        # accidentally energised during initialization:
+        #   active_low=True : inactive -> raw HIGH, active -> raw LOW
+        #   active_low=False: inactive -> raw LOW, active -> raw HIGH
+        raw = 0 if (active == self._active_low) else 1
+        direction = "low" if raw == 0 else "high"
         try:
-            _write(self._gpio / "direction", "high")
+            _write(self._gpio / "direction", direction)
+            # Keep the reported level consistent (the kernel output level
+            # follows the high/low direction selection immediately).
+            _write(self._gpio / "value", raw)
         except OSError as exc:
             raise GPIOBackendError(
-                f"cannot configure GPIO {self._gpio_number} as output-high: {exc}"
+                f"cannot configure GPIO {self._gpio_number} as "
+                f"output-{direction}: {exc}"
             ) from exc
-        if active:
-            self.set_active(True)
         return self
 
     def set_active(self, active: bool) -> None:
