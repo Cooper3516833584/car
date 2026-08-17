@@ -20,7 +20,6 @@ import threading
 import time
 from typing import Callable, Final, Protocol
 
-from .rear_motor import DEFAULT_DEVICE
 from .sound_light_alarm import SoundLightAlarm
 
 try:
@@ -180,13 +179,15 @@ class C10BBatteryVoltageReader:
 
     def __init__(
         self,
-        device: str = DEFAULT_DEVICE,
+        device: str | None = None,
         *,
         min_voltage_v: float = DEFAULT_BATTERY_MIN_VOLTAGE_V,
         max_voltage_v: float = DEFAULT_BATTERY_MAX_VOLTAGE_V,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.device = device
+        if device is not None and not str(device):
+            raise ValueError("device must not be empty when provided")
         self.min_voltage_v = float(min_voltage_v)
         self.max_voltage_v = float(max_voltage_v)
         if not 0 < self.min_voltage_v <= self.max_voltage_v:
@@ -198,6 +199,11 @@ class C10BBatteryVoltageReader:
     def start(self) -> "C10BBatteryVoltageReader":
         if self._fd is not None:
             raise C10BTelemetryError("C10B battery reader is already running")
+        if self.device is None:
+            raise C10BTelemetryError(
+                "C10B battery reader has no serial device; provide the "
+                "device before starting"
+            )
         self._fd = _open_c10b_telemetry_port(self.device)
         return self
 
@@ -339,7 +345,11 @@ class LowBatteryMonitor:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device", default=DEFAULT_DEVICE)
+    parser.add_argument(
+        "--device",
+        required=True,
+        help="C10B serial device (e.g. /dev/ttyACM0); must be provided",
+    )
     parser.add_argument("--threshold-v", type=float, default=11.0)
     parser.add_argument("--period-s", type=float, default=2.0)
     parser.add_argument("--log-level", default="INFO")

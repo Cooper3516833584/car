@@ -11,7 +11,9 @@ from .rear_motor import (
     wheel_speeds_to_chassis,
 )
 from .steering_servo import (
+    DEFAULT_STEERING_CALIBRATION,
     FrontSteeringServo,
+    SteeringCalibration,
     SteeringCommand,
     SteeringStateError,
     YawDirection,
@@ -149,6 +151,8 @@ __all__ = [
     "build_velocity_frame",
     "wheel_speeds_to_chassis",
     "FrontSteeringServo",
+    "SteeringCalibration",
+    "DEFAULT_STEERING_CALIBRATION",
     "SteeringCommand",
     "SteeringStateError",
     "YawDirection",

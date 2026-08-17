@@ -28,15 +28,32 @@ from .ackermann_drive import AckermannDrive, AckermannMotionPlan
 from .rear_motor import MotorDirection
 from .radar_driver import RadarLocalizationUpdate
 from .steering_servo import STEERING_LEFT_MAX_RAD, STEERING_RIGHT_MAX_RAD
+from .vehicle_defaults import (
+    DEFAULT_BODY_LENGTH_MM,
+    DEFAULT_BODY_WIDTH_MM,
+    DEFAULT_MIN_TURN_RADIUS_MM,
+    DEFAULT_OUTER_WHEEL_WIDTH_MM,
+    DEFAULT_PHYSICAL_TRACK_WIDTH_MM,
+    DEFAULT_REAR_AXLE_TO_BODY_CENTER_MM,
+    DEFAULT_WHEEL_THICKNESS_MM,
+    DEFAULT_WHEELBASE_MM,
+)
 
 
-DEFAULT_WHEEL_THICKNESS_MM: Final[float] = 26.4
-DEFAULT_OUTER_WHEEL_WIDTH_MM: Final[float] = 143.5
-DEFAULT_TRACK_WIDTH_MM: Final[float] = 143.5 - 26.4
-DEFAULT_WHEELBASE_MM: Final[float] = 142.5
-DEFAULT_BODY_LENGTH_MM: Final[float] = 230.0
-DEFAULT_BODY_WIDTH_MM: Final[float] = 145.0
-DEFAULT_MIN_TURN_RADIUS_MM: Final[float] = 350.0
+# Backward-compatible defaults equal to the verified current car profile; the
+# competition program builds VehicleGeometry from the TOML profile.
+DEFAULT_WHEEL_THICKNESS_MM: Final[float] = DEFAULT_WHEEL_THICKNESS_MM
+DEFAULT_OUTER_WHEEL_WIDTH_MM: Final[float] = DEFAULT_OUTER_WHEEL_WIDTH_MM
+DEFAULT_TRACK_WIDTH_MM: Final[float] = (
+    DEFAULT_OUTER_WHEEL_WIDTH_MM - DEFAULT_WHEEL_THICKNESS_MM
+)
+DEFAULT_WHEELBASE_MM: Final[float] = DEFAULT_WHEELBASE_MM
+DEFAULT_BODY_LENGTH_MM: Final[float] = DEFAULT_BODY_LENGTH_MM
+DEFAULT_BODY_WIDTH_MM: Final[float] = DEFAULT_BODY_WIDTH_MM
+DEFAULT_MIN_TURN_RADIUS_MM: Final[float] = DEFAULT_MIN_TURN_RADIUS_MM
+DEFAULT_REAR_AXLE_TO_BODY_CENTER_MM: Final[float] = (
+    DEFAULT_REAR_AXLE_TO_BODY_CENTER_MM
+)
 LOG = logging.getLogger("car-navigation")
 
 
@@ -135,7 +152,9 @@ class VehicleGeometry:
     body_length_cm: float = DEFAULT_BODY_LENGTH_MM / 10.0
     body_width_cm: float = DEFAULT_BODY_WIDTH_MM / 10.0
     min_turn_radius_cm: float = DEFAULT_MIN_TURN_RADIUS_MM / 10.0
-    rear_axle_to_body_center_cm: float = DEFAULT_WHEELBASE_MM / 20.0
+    rear_axle_to_body_center_cm: float = (
+        DEFAULT_REAR_AXLE_TO_BODY_CENTER_MM / 10.0
+    )
 
     def __post_init__(self) -> None:
         if min(
@@ -148,6 +167,27 @@ class VehicleGeometry:
             raise ValueError("vehicle geometry dimensions must be positive")
         if abs(self.rear_axle_to_body_center_cm) > self.body_length_cm / 2:
             raise ValueError("body centre offset lies outside the vehicle body")
+
+    @classmethod
+    def from_config(
+        cls,
+        *,
+        wheelbase_mm: float,
+        track_width_mm: float,
+        body_length_mm: float,
+        body_width_mm: float,
+        min_turn_radius_mm: float,
+        rear_axle_to_body_center_mm: float,
+    ) -> "VehicleGeometry":
+        """Build the navigation geometry from one validated vehicle profile."""
+        return cls(
+            wheelbase_cm=float(wheelbase_mm) / 10.0,
+            track_width_cm=float(track_width_mm) / 10.0,
+            body_length_cm=float(body_length_mm) / 10.0,
+            body_width_cm=float(body_width_mm) / 10.0,
+            min_turn_radius_cm=float(min_turn_radius_mm) / 10.0,
+            rear_axle_to_body_center_cm=float(rear_axle_to_body_center_mm) / 10.0,
+        )
 
     @property
     def left_min_turn_radius_cm(self) -> float:

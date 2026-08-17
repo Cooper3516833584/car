@@ -28,13 +28,22 @@ try:
 except ModuleNotFoundError:  # Allows frame/conversion unit tests on Windows.
     termios = None
 
+from .vehicle_defaults import (  # noqa: E402  (after the termios guard)
+    DEFAULT_FIRMWARE_TRACK_WIDTH_MM,
+    DEFAULT_MIN_TURN_RADIUS_MM,
+)
+
 
 FRAME_HEADER: Final[int] = 0x7B
 FRAME_TAIL: Final[int] = 0x7D
 FRAME_LENGTH: Final[int] = 11
-DEFAULT_DEVICE: Final[str] = "/dev/ttyACM0"
-DEFAULT_TRACK_WIDTH_MM: Final[float] = 164.0
-DEFAULT_MIN_TURN_RADIUS_MM: Final[float] = 350.0
+# The C10B Ackermann firmware converts Vx/Vz back to rear-wheel targets with
+# this compiled track width: Vz=(right-left)/0.164.  It is a *protocol*
+# constant of the installed firmware, deliberately different from the measured
+# physical wheel-centre track used by Ackermann geometry.  Production entries
+# still receive the value from the vehicle profile.
+DEFAULT_TRACK_WIDTH_MM: Final[float] = DEFAULT_FIRMWARE_TRACK_WIDTH_MM
+DEFAULT_MIN_TURN_RADIUS_MM: Final[float] = DEFAULT_MIN_TURN_RADIUS_MM
 FIRMWARE_MAX_LINEAR_MM_S: Final[float] = 1200.0
 
 
@@ -203,7 +212,7 @@ class RearMotorDriver:
 
     def __init__(
         self,
-        device: str = DEFAULT_DEVICE,
+        device: str | None = None,
         *,
         max_wheel_speed_mm_s: float = 300.0,
         send_rate_hz: float = 20.0,
@@ -214,6 +223,8 @@ class RearMotorDriver:
         stop_frame_count: int = 5,
     ) -> None:
         self.device = device
+        if device is not None and not str(device):
+            raise ValueError("device must not be empty when provided")
         self.max_wheel_speed_mm_s = _finite_number(
             "max_wheel_speed_mm_s", max_wheel_speed_mm_s
         )
@@ -265,6 +276,11 @@ class RearMotorDriver:
         with self._state_lock:
             if self._fd is not None:
                 raise DriverStateError("rear motor driver is already running")
+            if self.device is None:
+                raise DriverStateError(
+                    "rear motor driver has no serial device; provide the "
+                    "device from the vehicle profile before starting"
+                )
             fd = _open_c10b_serial(self.device)
             self._fd = fd
             self._command = STOP_COMMAND

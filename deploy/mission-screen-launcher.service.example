@@ -1,0 +1,29 @@
+[Unit]
+# 通用模板：串口屏比赛任务启动器
+# 复制到 /etc/systemd/system/mission-screen-launcher.service 后，
+# 把 User/Group/Environment/WorkingDirectory 改成自己主控板的实际值。
+Description=Serial-screen competition mission launcher
+Requires=sound-light-alarm.service
+# 按需启用：等串口屏设备出现后再启动（设备名按自己板子修改）
+# After=sound-light-alarm.service dev-serial-by\x2did-xxxx.device
+# Wants=dev-serial-by\x2did-xxxx.device
+
+[Service]
+Type=simple
+# 运行用户/组：必须是能访问 /dev/ttyACM0、/dev/ttyS6、GPIO、PWM 的用户
+User=your-user
+Group=your-user
+SupplementaryGroups=dialout gpio pwm
+# 仓库根目录，任务程序在 <repo>/code 下
+WorkingDirectory=/path/to/car/code
+# 统一配置文件路径（launcher 会把它传给被启动的 task，保证二者一致）
+Environment=CAR_CONFIG=/path/to/car/configs/cooper_rock5a_l150.toml
+# 串口屏端口/波特率现在从 CAR_CONFIG 的 [devices.screen] 读取，
+# 不需要在 ExecStart 里重复写设备参数。
+ExecStart=/usr/bin/python3 /path/to/car/code/mission_screen_launcher.py --delay-s 10
+Restart=always
+RestartSec=2
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

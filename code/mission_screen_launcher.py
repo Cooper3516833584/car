@@ -6,6 +6,11 @@ program therefore searches the received byte stream for the ASCII tokens
 ``MISSION1`` and ``MISSION2`` rather than requiring a particular line format.
 Both missions are acknowledged immediately with three fast alarm pulses and
 launched at once.
+
+Every hardware parameter (screen port/baudrate, HC-14 port, alarm GPIO and the
+runtime radar-centre state file) comes from the vehicle TOML profile.  The
+launched task receives the same ``--config`` path so launcher and task can
+never disagree about hardware.
 """
 
 from __future__ import annotations
@@ -21,9 +26,9 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Callable, Final
 
-from components import DEFAULT_HC14_PORT, SerialCommunicationDriver
+from components import SerialCommunicationDriver
 from components.fleet_car_node import FleetCarNode
 from components.fleet_models import (
     AckReason,
@@ -32,11 +37,8 @@ from components.fleet_models import (
     CommandResult,
 )
 from components.sound_light_alarm import AlarmGPIOError, SoundLightAlarm
-from radar_center_config import (
-    CONFIG_FILENAME,
-    load_radar_center_behind_a_cm,
-    save_radar_center_behind_a_cm,
-)
+from config.loader import load_car_config, resolve_config_path
+from config.runtime_state import RuntimeRadarCenterState
 
 try:
     import termios
@@ -45,27 +47,30 @@ except ModuleNotFoundError:  # Allows pure scheduling tests on non-Linux hosts.
 
 
 LOG = logging.getLogger("mission_screen_launcher")
-DEFAULT_PORT: Final[str] = (
-    "/dev/serial/by-id/usb-jixin.pro_CMSIS-DAP_LU_LU_2022_8888-if00"
-)
-DEFAULT_BAUDRATE: Final[int] = 9600
 TOKEN_TO_TASK: Final[dict[bytes, str]] = {
     b"MISSION1": "main_task1.py",
     b"MISSION2": "main_task2.py",
-}
-RADAR_DISTANCE_TOKENS: Final[dict[bytes, float]] = {
-    b"20": 20.0,
-    b"36.5": 36.5,
 }
 MISSION_SELECTION_BEEP_COUNT: Final[int] = 3
 MISSION_SELECTION_BEEP_ON_S: Final[float] = 0.15
 MISSION_SELECTION_BEEP_OFF_S: Final[float] = 0.10
 
 
+def _build_alarm(car_config) -> SoundLightAlarm:
+    """Build the alarm from the profile's [hardware.alarm_gpio] section."""
+    gpio = car_config.hardware.alarm_gpio
+    return SoundLightAlarm(
+        sysfs_gpio_root=gpio.sysfs_root,
+        bank_label=gpio.bank_label,
+        line_offset=gpio.line_offset,
+        active_low=gpio.active_low,
+    )
+
+
 class IdleFleetReporter:
     """Answer ground-station polls while no competition task owns HC-14."""
 
-    def __init__(self, distance_provider, port: str = DEFAULT_HC14_PORT) -> None:
+    def __init__(self, distance_provider, port: str) -> None:
         self._started_at = time.monotonic()
         self._distance_provider = distance_provider
         self._link = SerialCommunicationDriver(
@@ -163,7 +168,7 @@ class MissionScreenLauncher:
         delay_s: float,
         alarm_duration_s: float = 5.0,
         config_path: Path | None = None,
-        idle_reporter_factory=None,
+        idle_reporter_factory: Callable | None = None,
     ) -> None:
         self.task_directory = task_directory
         self.delay_s = delay_s
@@ -171,16 +176,35 @@ class MissionScreenLauncher:
         self.pending: PendingLaunch | None = None
         self.child: subprocess.Popen[bytes] | None = None
         self.config_path = (
-            task_directory / CONFIG_FILENAME
+            resolve_config_path()
             if config_path is None
             else Path(config_path)
         )
-        self.radar_center_behind_a_cm = load_radar_center_behind_a_cm(
-            self.config_path
+        self.car_config = load_car_config(self.config_path)
+        self.screen_port = self.car_config.devices.screen.port
+        self.screen_baudrate = self.car_config.devices.screen.baudrate
+        self.hc14_port = self.car_config.devices.hc14.port
+        self._runtime_state = RuntimeRadarCenterState(
+            self.car_config.runtime,
+            base_directory=task_directory.parent,
+        )
+        self.radar_center_behind_a_cm = self._runtime_state.load(
+            self.car_config.missions.common.radar_center_behind_a_cm
         )
         maximum_token_length = 1 + max(
             *(map(len, TOKEN_TO_TASK)),
-            *(map(len, RADAR_DISTANCE_TOKENS)),
+            *(
+                map(
+                    len,
+                    (
+                        format(value, "g")
+                        for value in (
+                            self._runtime_state.config
+                            .allowed_radar_center_behind_a_cm
+                        )
+                    ),
+                )
+            ),
         )
         self._buffer: deque[int] = deque(maxlen=maximum_token_length)
         self._idle_reporter_factory = idle_reporter_factory
@@ -190,7 +214,8 @@ class MissionScreenLauncher:
         if self._idle_reporter is not None or self._idle_reporter_factory is None:
             return
         reporter = self._idle_reporter_factory(
-            lambda: self.radar_center_behind_a_cm
+            lambda: self.radar_center_behind_a_cm,
+            self.hc14_port,
         )
         reporter.start()
         self._idle_reporter = reporter
@@ -203,10 +228,14 @@ class MissionScreenLauncher:
     def receive(self, data: bytes, now: float) -> None:
         """Accept raw serial bytes and schedule the recognized mission."""
 
+        distance_tokens = {
+            format(value, "g").encode("ascii"): float(value)
+            for value in self._runtime_state.config.allowed_radar_center_behind_a_cm
+        }
         for value in data.upper():
             self._buffer.append(value)
             window = bytes(self._buffer)
-            for token, distance_cm in RADAR_DISTANCE_TOKENS.items():
+            for token, distance_cm in distance_tokens.items():
                 preceding_index = len(window) - len(token) - 1
                 has_numeric_prefix = (
                     preceding_index >= 0
@@ -215,17 +244,18 @@ class MissionScreenLauncher:
                 if window.endswith(token) and not has_numeric_prefix:
                     if self.child is not None and self.child.poll() is None:
                         LOG.warning(
-                            "ignored radar centre distance %g cm while task is running",
+                            "ignored radar centre distance %g cm while task "
+                            "is running",
                             distance_cm,
                         )
                         self._buffer.clear()
                         return
                     try:
-                        selected = save_radar_center_behind_a_cm(
-                            self.config_path, distance_cm
-                        )
+                        selected = self._runtime_state.save(distance_cm)
                     except OSError as exc:
-                        LOG.error("could not save radar centre distance: %s", exc)
+                        LOG.error(
+                            "could not save radar centre distance: %s", exc
+                        )
                     else:
                         self.radar_center_behind_a_cm = selected
                         LOG.info(
@@ -273,7 +303,7 @@ class MissionScreenLauncher:
     def _sound_selection_acknowledgement(self, task_name: str) -> None:
         alarm = None
         try:
-            alarm = SoundLightAlarm()
+            alarm = _build_alarm(self.car_config)
             if not alarm.is_initialized:
                 alarm.initialize()
             for index in range(MISSION_SELECTION_BEEP_COUNT):
@@ -304,7 +334,7 @@ class MissionScreenLauncher:
         ):
             pending.alarm_attempted = True
             try:
-                alarm = SoundLightAlarm()
+                alarm = _build_alarm(self.car_config)
                 if not alarm.is_initialized:
                     alarm.initialize()
                 alarm.on()
@@ -332,6 +362,8 @@ class MissionScreenLauncher:
             [
                 sys.executable,
                 str(pending.task_path),
+                "--config",
+                str(self.config_path),
                 "--radar-center-behind-a-cm",
                 format(self.radar_center_behind_a_cm, "g"),
             ],
@@ -363,8 +395,23 @@ class MissionScreenLauncher:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--port", default=DEFAULT_PORT)
-    parser.add_argument("--baudrate", type=int, default=DEFAULT_BAUDRATE)
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="vehicle TOML profile (default: CAR_CONFIG env or "
+        "configs/cooper_rock5a_l150.toml)",
+    )
+    parser.add_argument(
+        "--port",
+        default=None,
+        help="override the screen serial device from the profile",
+    )
+    parser.add_argument(
+        "--baudrate",
+        type=int,
+        default=None,
+        help="override the screen baudrate from the profile",
+    )
     parser.add_argument("--delay-s", type=float, default=10.0)
     parser.add_argument("--alarm-duration-s", type=float, default=5.0)
     parser.add_argument(
@@ -388,8 +435,11 @@ def main(argv: list[str] | None = None) -> int:
         args.task_directory.resolve(),
         args.delay_s,
         args.alarm_duration_s,
+        config_path=args.config,
         idle_reporter_factory=IdleFleetReporter,
     )
+    screen_port = args.port or launcher.screen_port
+    screen_baudrate = args.baudrate or launcher.screen_baudrate
     launcher.start_idle_reporting()
     stopping = False
 
@@ -401,8 +451,8 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, request_stop)
     while not stopping:
         try:
-            fd = configure_serial(args.port, args.baudrate)
-            LOG.info("listening on %s at %d 8N1", args.port, args.baudrate)
+            fd = configure_serial(screen_port, screen_baudrate)
+            LOG.info("listening on %s at %d 8N1", screen_port, screen_baudrate)
             armed_at = time.monotonic() + args.startup_quiet_s
             armed = False
             try:

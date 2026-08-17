@@ -4,7 +4,16 @@ __pycache__/
 .venv/
 venv/
 logs/
+
+# On-site runtime state (现场可改，不属于车辆静态标定)
+runtime/
 code/radar_center_config.json
+
+# Temporary directories created by tests on some platforms.
+test/_launcher_tmp_*/
+test/_alarm_tmp_*/
+test/_hal_tmp_*/
+test/tmp*/
 
 # Local state created by coding agents; never commit it to the project.
 .agents/

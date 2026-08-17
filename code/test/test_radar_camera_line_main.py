@@ -16,53 +16,21 @@ from components.fleet_models import (
     NodeFlags,
 )
 from components.navigation import NavigationPose
+from config.models import MissionControlConfig
 from main_radar_camera_line_following import (
-    AB_LATERAL_ALIGNMENT_FULL_PROGRESS_CM,
-    AB_LATERAL_ALIGNMENT_LEARNING_END_PROGRESS_CM,
-    AB_LATERAL_ALIGNMENT_LEARNING_START_PROGRESS_CM,
-    AB_LATERAL_ALIGNMENT_MAX_ABS_OFFSET_CM,
-    AB_LATERAL_ALIGNMENT_MAX_MAD_CM,
-    AB_LATERAL_ALIGNMENT_MIN_VALID_FRAMES,
-    AB_LATERAL_ALIGNMENT_RAMP_START_PROGRESS_CM,
-    AB_LATERAL_ALIGNMENT_REQUIRED_MEASUREMENTS,
-    AB_LATERAL_ALIGNMENT_TERMINAL_FADE_DISTANCE_CM,
-    AB_LINE_ASSIST_FADE_END_PROGRESS_CM,
-    AB_LINE_ASSIST_FULL_END_PROGRESS_CM,
-    AB_LINE_ASSIST_GAIN_RAD_PER_CM,
-    AB_LINE_ASSIST_LATERAL_DEADBAND_CM,
-    AB_LINE_ASSIST_MAX_CORRECTION_RAD,
-    AB_LINE_ASSIST_MIN_VALID_FRAMES,
-    AB_TRACK_SPEED_CM_S,
-    AB_START_ALIGNMENT_FADE_END_PROGRESS_CM,
-    AB_START_ALIGNMENT_FULL_END_PROGRESS_CM,
-    AB_START_HEADING_GAIN,
-    AB_START_MAX_HEADING_CORRECTION_RAD,
-    AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD,
-    AB_START_MIN_VALID_FRAMES,
-    AB_START_MAX_CURVATURE_PER_CM,
-    AB_START_MAX_FORWARD_HEADING_CHANGE_RAD,
-    BC_ENTRY_LIMIT_END_PROGRESS_CM,
-    BC_ENTRY_MIN_RIGHT_CORRECTION_RAD,
-    CAMERA_CORRECTION_ENABLED,
-    CAMERA_LATERAL_DEADBAND_CM,
-    CAMERA_MAX_STEERING_CORRECTION_RAD,
-    CAMERA_STEERING_GAIN_RAD_PER_CM,
     CAR_OPERATION_LOCALIZATION_LOST,
-    BC_TRACK_SPEED_CM_S,
-    CD_TRACK_SPEED_CM_S,
-    DA_TRACK_SPEED_CM_S,
-    FINAL_DA_VISUAL_HOLD_S,
-    FINAL_DA_VISUAL_WINDOW_CM,
-    FINAL_A_MAX_CAMERA_ERROR_CM,
-    FLEET_TERMINAL_REPORT_GRACE_S,
-    FLEET_TRACE_DRAIN_TIMEOUT_S,
-    FLEET_POSITION_REPORTING_ENABLED,
-    RADAR_CENTER_BEHIND_A_ALONG_AB_CM,
     MainConfig,
     RadarCameraLineApplication,
     _CameraCorrectedDrive,
     build_argument_parser,
 )
+
+# Current-car defaults: the verified profile values that used to live as
+# module constants in the main program.  The TOML profile is the single
+# source of truth; these defaults mirror it so the regression tests below
+# stay readable.
+DEFAULT_CONTROL = MissionControlConfig()
+DEFAULT_MAIN = MainConfig()
 
 
 def observation(
@@ -99,65 +67,65 @@ class RadarCameraLineMainTests(unittest.TestCase):
     def test_editable_defaults_match_radar_fixed_track_entry(self):
         config = MainConfig()
 
-        self.assertEqual(AB_TRACK_SPEED_CM_S, 8.0)
-        self.assertEqual(BC_TRACK_SPEED_CM_S, 15.0)
-        self.assertEqual(CD_TRACK_SPEED_CM_S, 20.0)
-        self.assertEqual(DA_TRACK_SPEED_CM_S, 15.0)
-        self.assertTrue(FLEET_POSITION_REPORTING_ENABLED)
-        self.assertEqual(RADAR_CENTER_BEHIND_A_ALONG_AB_CM, 18.625)
-        self.assertTrue(CAMERA_CORRECTION_ENABLED)
-        self.assertEqual(CAMERA_LATERAL_DEADBAND_CM, 10.0)
-        self.assertEqual(CAMERA_STEERING_GAIN_RAD_PER_CM, 0.010)
-        self.assertEqual(CAMERA_MAX_STEERING_CORRECTION_RAD, 0.140)
-        self.assertEqual(AB_START_ALIGNMENT_FULL_END_PROGRESS_CM, 80.0)
-        self.assertEqual(AB_START_ALIGNMENT_FADE_END_PROGRESS_CM, 100.0)
-        self.assertEqual(AB_START_HEADING_GAIN, 1.30)
-        self.assertEqual(AB_START_MAX_HEADING_CORRECTION_RAD, 0.180)
+        self.assertEqual(DEFAULT_MAIN.ab_speed_cm_s, 8.0)
+        self.assertEqual(DEFAULT_MAIN.bc_speed_cm_s, 15.0)
+        self.assertEqual(DEFAULT_MAIN.cd_speed_cm_s, 20.0)
+        self.assertEqual(DEFAULT_MAIN.da_speed_cm_s, 15.0)
+        self.assertTrue(DEFAULT_MAIN.fleet_position_reporting_enabled)
+        self.assertEqual(DEFAULT_MAIN.radar_center_behind_a_cm, 20.0)
+        self.assertTrue(DEFAULT_MAIN.camera_correction_enabled)
+        self.assertEqual(DEFAULT_MAIN.camera_correction.lateral_deadband_cm, 10.0)
+        self.assertEqual(DEFAULT_MAIN.camera_correction.steering_gain_rad_per_cm, 0.010)
+        self.assertEqual(DEFAULT_MAIN.camera_correction.maximum_abs_correction_rad, 0.140)
+        self.assertEqual(DEFAULT_CONTROL.ab_start_alignment_full_end_progress_cm, 80.0)
+        self.assertEqual(DEFAULT_CONTROL.ab_start_alignment_fade_end_progress_cm, 100.0)
+        self.assertEqual(DEFAULT_CONTROL.ab_start_heading_gain, 1.30)
+        self.assertEqual(DEFAULT_CONTROL.ab_start_max_heading_correction_rad, 0.180)
         self.assertEqual(
-            AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD,
+            DEFAULT_CONTROL.ab_start_max_total_camera_correction_rad,
             0.220,
         )
-        self.assertEqual(AB_START_MIN_VALID_FRAMES, 2)
-        self.assertEqual(AB_START_MAX_CURVATURE_PER_CM, 0.003)
+        self.assertEqual(DEFAULT_CONTROL.ab_start_min_valid_frames, 2)
+        self.assertEqual(DEFAULT_CONTROL.ab_start_max_curvature_per_cm, 0.003)
         self.assertEqual(
-            AB_START_MAX_FORWARD_HEADING_CHANGE_RAD,
+            DEFAULT_CONTROL.ab_start_max_forward_heading_change_rad,
             0.080,
         )
-        self.assertEqual(AB_LINE_ASSIST_FULL_END_PROGRESS_CM, 100.0)
-        self.assertEqual(AB_LINE_ASSIST_FADE_END_PROGRESS_CM, 135.0)
-        self.assertEqual(AB_LINE_ASSIST_LATERAL_DEADBAND_CM, 2.0)
-        self.assertEqual(AB_LINE_ASSIST_GAIN_RAD_PER_CM, 0.005)
-        self.assertEqual(AB_LINE_ASSIST_MAX_CORRECTION_RAD, 0.060)
-        self.assertEqual(AB_LINE_ASSIST_MIN_VALID_FRAMES, 3)
+        self.assertEqual(DEFAULT_CONTROL.ab_line_assist_full_end_progress_cm, 100.0)
+        self.assertEqual(DEFAULT_CONTROL.ab_line_assist_fade_end_progress_cm, 135.0)
+        self.assertEqual(DEFAULT_CONTROL.ab_line_assist_lateral_deadband_cm, 2.0)
+        self.assertEqual(DEFAULT_CONTROL.ab_line_assist_gain_rad_per_cm, 0.005)
+        self.assertEqual(DEFAULT_CONTROL.ab_line_assist_max_correction_rad, 0.060)
+        self.assertEqual(DEFAULT_CONTROL.ab_line_assist_min_valid_frames, 3)
         self.assertEqual(
-            AB_LATERAL_ALIGNMENT_LEARNING_START_PROGRESS_CM,
+            DEFAULT_CONTROL.ab_lateral_alignment_learning_start_progress_cm,
             50.0,
         )
         self.assertEqual(
-            AB_LATERAL_ALIGNMENT_LEARNING_END_PROGRESS_CM,
+            DEFAULT_CONTROL.ab_lateral_alignment_learning_end_progress_cm,
             90.0,
         )
         self.assertEqual(
-            AB_LATERAL_ALIGNMENT_RAMP_START_PROGRESS_CM,
+            DEFAULT_CONTROL.ab_lateral_alignment_ramp_start_progress_cm,
             60.0,
         )
-        self.assertEqual(AB_LATERAL_ALIGNMENT_FULL_PROGRESS_CM, 100.0)
+        self.assertEqual(DEFAULT_CONTROL.ab_lateral_alignment_full_progress_cm, 100.0)
         self.assertEqual(
-            AB_LATERAL_ALIGNMENT_TERMINAL_FADE_DISTANCE_CM,
+            DEFAULT_CONTROL.ab_lateral_alignment_terminal_fade_distance_cm,
             65.0,
         )
-        self.assertEqual(AB_LATERAL_ALIGNMENT_MIN_VALID_FRAMES, 4)
-        self.assertEqual(AB_LATERAL_ALIGNMENT_REQUIRED_MEASUREMENTS, 5)
-        self.assertEqual(AB_LATERAL_ALIGNMENT_MAX_ABS_OFFSET_CM, 12.0)
-        self.assertEqual(AB_LATERAL_ALIGNMENT_MAX_MAD_CM, 1.5)
-        self.assertEqual(BC_ENTRY_LIMIT_END_PROGRESS_CM, 210.0)
-        self.assertEqual(BC_ENTRY_MIN_RIGHT_CORRECTION_RAD, -0.012)
-        self.assertEqual(FINAL_DA_VISUAL_WINDOW_CM, 65.0)
-        self.assertEqual(FINAL_DA_VISUAL_HOLD_S, 0.65)
-        self.assertEqual(FINAL_A_MAX_CAMERA_ERROR_CM, 6.0)
+        self.assertEqual(DEFAULT_CONTROL.ab_lateral_alignment_min_valid_frames, 4)
+        self.assertEqual(DEFAULT_CONTROL.ab_lateral_alignment_required_measurements, 5)
+        self.assertEqual(DEFAULT_CONTROL.ab_lateral_alignment_max_abs_offset_cm, 12.0)
+        self.assertEqual(DEFAULT_CONTROL.ab_lateral_alignment_max_mad_cm, 1.5)
+        self.assertEqual(DEFAULT_CONTROL.bc_entry_limit_end_progress_cm, 210.0)
+        self.assertEqual(DEFAULT_CONTROL.bc_entry_min_right_correction_rad, -0.012)
+        self.assertEqual(DEFAULT_CONTROL.final_da_visual_window_cm, 65.0)
+        self.assertEqual(DEFAULT_CONTROL.final_da_visual_hold_s, 0.65)
+        self.assertEqual(DEFAULT_CONTROL.final_a_max_camera_error_cm, 6.0)
         self.assertEqual(CAR_OPERATION_LOCALIZATION_LOST, 10)
-        self.assertEqual(FLEET_TERMINAL_REPORT_GRACE_S, 3.0)
-        self.assertEqual(FLEET_TRACE_DRAIN_TIMEOUT_S, 6.0)
+        self.assertEqual(DEFAULT_CONTROL.fleet_terminal_report_grace_s, 3.0)
+        self.assertEqual(DEFAULT_CONTROL.fleet_trace_drain_timeout_s, 6.0)
         self.assertEqual(
             (
                 config.speed_profile.ab_cm_s,
@@ -167,7 +135,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
             ),
             (8.0, 15.0, 20.0, 15.0),
         )
-        self.assertEqual(config.radar_center_behind_a_cm, 18.625)
+        self.assertEqual(config.radar_center_behind_a_cm, 20.0)
 
     def test_track_approaches_a_then_finishes_one_lap_at_a(self):
         config = MainConfig()
@@ -584,7 +552,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
         for progress_cm, transverse in (
             (
                 application.track.finish_progress_cm
-                - FINAL_DA_VISUAL_WINDOW_CM
+                - DEFAULT_CONTROL.final_da_visual_window_cm
                 - 1.0,
                 False,
             ),
@@ -981,7 +949,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
         )
         self.assertEqual(
             len(application._ab_lateral_alignment_measurements_cm),
-            AB_LATERAL_ALIGNMENT_REQUIRED_MEASUREMENTS,
+            DEFAULT_CONTROL.ab_lateral_alignment_required_measurements,
         )
         self.assertAlmostEqual(aligned.x_cm, radar_pose.x_cm)
         self.assertAlmostEqual(aligned.heading_deg, radar_pose.heading_deg)
@@ -1016,7 +984,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
                 segment=TrackSegment.DA,
                 progress_cm=(
                     application.track.finish_progress_cm
-                    - AB_LATERAL_ALIGNMENT_TERMINAL_FADE_DISTANCE_CM / 2.0
+                    - DEFAULT_CONTROL.ab_lateral_alignment_terminal_fade_distance_cm / 2.0
                 ),
                 target_speed_cm_s=15.0,
                 commanded_speed_cm_s=15.0,
@@ -1299,7 +1267,14 @@ class RadarCameraLineMainTests(unittest.TestCase):
         self.assertTrue(args.fleet_position_only)
 
     def test_current_front_camera_profile_is_retained(self):
-        profile = RadarCameraLineApplication._front_camera_vision_config()
+        from config.factory import build_line_vision_config
+        from config.loader import load_car_config
+
+        profile = RadarCameraLineApplication(
+            MainConfig(
+                vision_config=build_line_vision_config(load_car_config())
+            )
+        )._front_camera_vision_config()
 
         self.assertEqual(profile.perspective.source_points_norm[0][1], 0.66)
         self.assertFalse(profile.require_adaptive_confirmation)
@@ -1335,7 +1310,7 @@ class RadarCameraLineMainTests(unittest.TestCase):
         self.assertAlmostEqual(adjusted, 0.13)
         self.assertLess(
             adjusted - 0.10,
-            CAMERA_MAX_STEERING_CORRECTION_RAD,
+            DEFAULT_MAIN.camera_correction.maximum_abs_correction_rad,
         )
 
     def test_fusion_drive_applies_correction_without_shared_follower_changes(self):

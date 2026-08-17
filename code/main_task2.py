@@ -1,63 +1,47 @@
 #!/usr/bin/env python3
 """D-task 2 one-key entry using the shared radar+camera line follower.
 
-Only the task-specific speeds live here.  Steering, radar localization,
-camera correction, FleetBus reporting and later tuning are always inherited
-from ``main_radar_camera_line_following.py``.
+This entry only selects the task name and delegates to the shared core.  The
+task speeds (including the CD retakeoff switch), mission-request state and
+completion alarm duration come from the TOML profile
+(``[missions.task2]``); explicit CLI arguments still win.
 """
 
 from __future__ import annotations
 
 import sys
 
-from components.competition_track import CompetitionTrackSpeedProfile
-from main_radar_camera_line_following import main as _run_core
-
-
-# Task 2 (dynamic landing) segment speeds.  A faster AB default provides margin
-# for the rule requiring the car to reach B within 15 seconds.  The five values
-# remain independently adjustable for field timing.  CD uses the first value
-# until the drone confirms platform retakeoff, then switches to the second.
-TASK2_AB_SPEED_CM_S = 25.0
-TASK2_BC_SPEED_CM_S = 9.0
-TASK2_CD_SPEED_BEFORE_RETAKEOFF_CM_S = 4.0
-TASK2_CD_SPEED_AFTER_RETAKEOFF_CM_S = 30.0
-TASK2_DA_SPEED_CM_S = 30.0
-
-TASK2_SPEED_PROFILE = CompetitionTrackSpeedProfile(
-    TASK2_AB_SPEED_CM_S,
-    TASK2_BC_SPEED_CM_S,
-    TASK2_CD_SPEED_BEFORE_RETAKEOFF_CM_S,
-    TASK2_DA_SPEED_CM_S,
-)
+from config.loader import load_car_config
+from main_radar_camera_line_following import run_mission as _run_mission
 
 
 def build_core_argv(argv: list[str] | None = None) -> list[str]:
-    """Prepend task defaults while allowing explicit CLI overrides."""
+    """Legacy CLI helper mirroring the default profile for task 2."""
 
     forwarded = list(sys.argv[1:] if argv is None else argv)
+    task = load_car_config().missions.task2
     return [
         "--wait-for-fleet-start",
         "--fleet-mission-request-state",
-        "14",
+        str(task.fleet_mission_request_state),
         "--completion-alarm-seconds",
-        "1.0",
+        str(task.completion_alarm_seconds),
         "--ab-speed-cm-s",
-        str(TASK2_AB_SPEED_CM_S),
+        str(task.ab_speed_cm_s),
         "--bc-speed-cm-s",
-        str(TASK2_BC_SPEED_CM_S),
+        str(task.bc_speed_cm_s),
         "--cd-speed-cm-s",
-        str(TASK2_CD_SPEED_BEFORE_RETAKEOFF_CM_S),
+        str(task.cd_speed_before_retakeoff_cm_s),
         "--cd-second-speed-cm-s",
-        str(TASK2_CD_SPEED_AFTER_RETAKEOFF_CM_S),
+        str(task.cd_speed_after_retakeoff_cm_s),
         "--da-speed-cm-s",
-        str(TASK2_DA_SPEED_CM_S),
+        str(task.da_speed_cm_s),
         *forwarded,
     ]
 
 
 def main(argv: list[str] | None = None) -> int:
-    return _run_core(build_core_argv(argv))
+    return _run_mission("task2", argv)
 
 
 if __name__ == "__main__":

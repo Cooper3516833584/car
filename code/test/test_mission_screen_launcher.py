@@ -1,23 +1,45 @@
 from __future__ import annotations
 
+import shutil
 import sys
-import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from mission_screen_launcher import MissionScreenLauncher  # noqa: E402
-from radar_center_config import load_radar_center_behind_a_cm  # noqa: E402
+from config.loader import load_car_config  # noqa: E402
+from config.runtime_state import load_runtime_radar_center_cm  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+REAL_CONFIG = REPO_ROOT / "configs" / "cooper_rock5a_l150.toml"
 
 
 class MissionScreenLauncherTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Use Path.mkdir (not tempfile.mkdtemp): the Windows file sandbox
+        # denies creating subdirectories inside mkdtemp-created directories.
+        self.temporary_directory = (
+            Path(__file__).resolve().parent
+            / f"_launcher_tmp_{uuid.uuid4().hex}"
+        )
+        self.temporary_directory.mkdir()
+        self.addCleanup(
+            shutil.rmtree, self.temporary_directory, ignore_errors=True
+        )
+        # Mirrors the deployment layout: the launcher runs from a "code" task
+        # directory and the runtime state is anchored at its parent.
+        self.task_directory = self.temporary_directory / "code"
+        self.task_directory.mkdir()
+
     def test_idle_reporter_restarts_around_child_task(self) -> None:
         events = []
 
         class Reporter:
-            def __init__(self, distance_provider):
+            def __init__(self, distance_provider, port):
                 self.distance_provider = distance_provider
+                self.port = port
 
             def start(self):
                 events.append(("start", self.distance_provider()))
@@ -109,102 +131,128 @@ class MissionScreenLauncherTests(unittest.TestCase):
         launcher = MissionScreenLauncher(Path("/tasks"), 10.0)
         launcher.receive(b"MISSION2", 1.0)
 
-        pending_alarm = launcher.pending.alarm if launcher.pending else None
-        self.assertIsNone(pending_alarm)
         launcher.poll(1.0)
 
         self.assertEqual(3, alarm_class.return_value.on.call_count)
-        popen.assert_called_once_with(
+        self.assertEqual(
             [
                 sys.executable,
                 str(Path("/tasks/main_task2.py")),
+                "--config",
+                str(launcher.config_path),
                 "--radar-center-behind-a-cm",
                 "20",
             ],
-            cwd=Path("/tasks"), start_new_session=True,
+            popen.call_args.args[0],
         )
 
     def test_fragmented_radar_distance_is_saved_and_passed_to_task(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            task_directory = Path(directory)
-            config_path = task_directory / "radar-center.json"
-            launcher = MissionScreenLauncher(
-                task_directory, 10.0, config_path=config_path
-            )
+        config_path = REAL_CONFIG
+        launcher = MissionScreenLauncher(
+            self.task_directory, 10.0, config_path=config_path
+        )
 
-            launcher.receive(b"36", 1.0)
-            launcher.receive(b".5\xff\xff\xff", 2.0)
+        launcher.receive(b"36", 1.0)
+        launcher.receive(b".5\xff\xff\xff", 2.0)
 
-            self.assertEqual(36.5, launcher.radar_center_behind_a_cm)
-            self.assertEqual(36.5, load_radar_center_behind_a_cm(config_path))
-            self.assertIsNone(launcher.pending)
+        self.assertEqual(36.5, launcher.radar_center_behind_a_cm)
+        state_file = (
+            self.temporary_directory
+            / "runtime"
+            / "car_state.json"
+        )
+        self.assertEqual(
+            36.5,
+            load_runtime_radar_center_cm(
+                launcher.car_config.runtime,
+                20.0,
+                base_directory=self.temporary_directory,
+            ),
+        )
+        self.assertTrue(state_file.exists())
+        self.assertIsNone(launcher.pending)
 
     def test_saved_radar_distance_survives_launcher_restart(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            task_directory = Path(directory)
-            config_path = task_directory / "radar-center.json"
-            first = MissionScreenLauncher(
-                task_directory, 10.0, config_path=config_path
-            )
-            first.receive(b"36.5", 1.0)
+        config_path = REAL_CONFIG
+        first = MissionScreenLauncher(
+            self.task_directory, 10.0, config_path=config_path
+        )
+        first.receive(b"36.5", 1.0)
 
-            second = MissionScreenLauncher(
-                task_directory, 10.0, config_path=config_path
-            )
+        second = MissionScreenLauncher(
+            self.task_directory, 10.0, config_path=config_path
+        )
 
-            self.assertEqual(36.5, second.radar_center_behind_a_cm)
+        self.assertEqual(36.5, second.radar_center_behind_a_cm)
 
     def test_distance_change_is_ignored_while_task_is_running(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            task_directory = Path(directory)
-            config_path = task_directory / "radar-center.json"
-            launcher = MissionScreenLauncher(
-                task_directory, 10.0, config_path=config_path
-            )
-            launcher.child = unittest.mock.Mock()
-            launcher.child.poll.return_value = None
+        launcher = MissionScreenLauncher(
+            self.task_directory, 10.0, config_path=REAL_CONFIG
+        )
+        launcher.child = unittest.mock.Mock()
+        launcher.child.poll.return_value = None
 
-            launcher.receive(b"36.5\xff\xff\xff", 1.0)
+        launcher.receive(b"36.5\xff\xff\xff", 1.0)
 
-            self.assertEqual(20.0, launcher.radar_center_behind_a_cm)
-            self.assertFalse(config_path.exists())
+        self.assertEqual(20.0, launcher.radar_center_behind_a_cm)
+        self.assertFalse(
+            (self.temporary_directory / "runtime" / "car_state.json").exists()
+        )
 
     def test_distance_digits_inside_a_larger_number_are_ignored(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            task_directory = Path(directory)
-            launcher = MissionScreenLauncher(task_directory, 10.0)
+        launcher = MissionScreenLauncher(
+            self.task_directory, 10.0, config_path=REAL_CONFIG
+        )
 
-            launcher.receive(b"120\xff", 1.0)
+        launcher.receive(b"120\xff", 1.0)
 
-            self.assertEqual(20.0, launcher.radar_center_behind_a_cm)
-            self.assertFalse((task_directory / "radar_center_config.json").exists())
+        self.assertEqual(20.0, launcher.radar_center_behind_a_cm)
+        self.assertFalse(
+            (self.temporary_directory / "runtime" / "car_state.json").exists()
+        )
 
     @patch("mission_screen_launcher.Path.is_file", return_value=True)
     @patch("mission_screen_launcher.subprocess.Popen")
     def test_saved_distance_is_injected_into_real_task_command(
         self, popen, _is_file
     ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            task_directory = Path(directory)
-            launcher = MissionScreenLauncher(task_directory, 10.0)
-            launcher.receive(b"36.5\xff\xff\xff", 1.0)
-            launcher.schedule(task_directory / "main_task1.py", 2.0, delay_s=0.0)
+        launcher = MissionScreenLauncher(
+            self.task_directory, 10.0, config_path=REAL_CONFIG
+        )
+        launcher.receive(b"36.5\xff\xff\xff", 1.0)
+        launcher.schedule(
+            self.task_directory / "main_task1.py", 2.0, delay_s=0.0
+        )
 
-            process = popen.return_value
-            process.poll.return_value = None
-            process.pid = 42
-            launcher.poll(2.0)
+        process = popen.return_value
+        process.poll.return_value = None
+        process.pid = 42
+        launcher.poll(2.0)
 
-            popen.assert_called_once_with(
-                [
-                    sys.executable,
-                    str(task_directory / "main_task1.py"),
-                    "--radar-center-behind-a-cm",
-                    "36.5",
-                ],
-                cwd=task_directory,
-                start_new_session=True,
-            )
+        self.assertEqual(
+            [
+                sys.executable,
+                str(self.task_directory / "main_task1.py"),
+                "--config",
+                str(REAL_CONFIG),
+                "--radar-center-behind-a-cm",
+                "36.5",
+            ],
+            popen.call_args.args[0],
+        )
+
+    def test_launcher_reads_screen_and_hc14_from_profile(self) -> None:
+        launcher = MissionScreenLauncher(
+            self.task_directory, 10.0, config_path=REAL_CONFIG
+        )
+        profile = load_car_config(REAL_CONFIG)
+        self.assertEqual(
+            profile.devices.screen.port, launcher.screen_port
+        )
+        self.assertEqual(
+            profile.devices.screen.baudrate, launcher.screen_baudrate
+        )
+        self.assertEqual(profile.devices.hc14.port, launcher.hc14_port)
 
 
 if __name__ == "__main__":

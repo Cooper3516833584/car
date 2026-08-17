@@ -233,6 +233,10 @@ class LineVisionConfig:
 
 @dataclass(frozen=True, slots=True)
 class LineControlConfig:
+    # Legacy default equals the verified wheelbase (142.5 mm / 10).  Production
+    # entries always build this config from the vehicle profile through
+    # ``from_wheelbase_mm`` so the camera controller never maintains a second
+    # wheelbase truth.
     wheelbase_cm: float = 14.25
     cruise_speed_mm_s: float = 100.0
     degraded_speed_mm_s: float = 55.0
@@ -286,6 +290,18 @@ class LineControlConfig:
     def __post_init__(self) -> None:
         if self.wheelbase_cm <= 0.0:
             raise ValueError("wheelbase_cm must be positive")
+
+    @classmethod
+    def from_wheelbase_mm(
+        cls,
+        wheelbase_mm: float,
+        **overrides: object,
+    ) -> "LineControlConfig":
+        """Build the control config with the wheelbase from the vehicle profile."""
+        wheelbase_cm = float(wheelbase_mm) / 10.0
+        if wheelbase_cm <= 0.0:
+            raise ValueError("wheelbase_mm must be positive")
+        return cls(wheelbase_cm=wheelbase_cm, **overrides)  # type: ignore[arg-type]
         if min(
             self.cruise_speed_mm_s,
             self.degraded_speed_mm_s,

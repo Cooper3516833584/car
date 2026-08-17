@@ -1,0 +1,333 @@
+[profile]
+# 给这份配置起的名字（仅用于日志/文档，不影响行为）
+name = "My School Car"
+description = "Example profile for another school's car - copy and modify"
+
+# ============================================================
+# 主控板 / IO
+# ============================================================
+# 换主控板时主要改这一节。当前只实现了 Linux sysfs PWM/GPIO；
+# 如果新板子用 libgpiod 或厂商 API，只需要在 code/hal/ 里加新的 backend，
+# 不需要改比赛主程序。
+
+[hardware.steering_pwm]
+backend = "linux-sysfs"
+channel = 0
+# 舵机 PWM 周期：50 Hz = 20,000,000 ns。一般不需要改。
+period_ns = 20000000
+polarity = "normal"
+
+# 通过 /sys/class/pwm 下 pwmchip* 解析到的设备路径里包含这个字符串来选择芯片。
+# ROCK 5A 是 "fd8b0000.pwm"；树莓派/Rockchip 其他板子通常是 "fe700000.pwm" 之类。
+# ⚠️ 危险字段：选错芯片会写错 PWM 设备，务必先确认。
+chip_device_match = "fd8b0000.pwm"
+
+# 以下字段只用于文档/诊断，不参与控制，可以随便填：
+physical_pin = 23
+pin_function = "PWM0_M2"
+device_tree_overlay = "rk3588-pwm0-m2"
+
+
+[hardware.alarm_gpio]
+backend = "linux-sysfs-bank"
+sysfs_root = "/sys/class/gpio"
+
+# 声光报警器所在的 gpiochip 的 label。
+bank_label = "gpio4"
+# 该 chip 内部第几号线（相对 chip base 的偏移）。
+line_offset = 11
+
+# ⚠️ 危险字段：active_low=true 表示"拉低电平=报警开"（当前车实测）。
+# 如果新车的报警器是"拉高电平=开"，必须改成 false，否则报警逻辑会反转。
+active_low = true
+
+physical_pin = 11
+pin_function = "GPIO4_B3"
+
+
+# ============================================================
+# Linux 设备（换板/换 USB 口主要改这里）
+# ============================================================
+
+# 后驱 C10B 驱动板串口（USB 设备，重新插拔后路径可能变化）
+[devices.motor]
+port = "/dev/ttyACM0"
+
+# D500 雷达 UART（由设备树 overlay 生成的 /dev/ttySx）
+[devices.radar]
+port = "/dev/ttyS6"
+
+# HC-14 无线串口（建议用 by-id 稳定路径）
+[devices.hc14]
+port = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
+
+# 串口屏（任务选择按钮）
+[devices.screen]
+enabled = true
+port = "/dev/serial/by-id/usb-jixin.pro_CMSIS-DAP_LU_LU_2022_8888-if00"
+baudrate = 9600
+
+# 前置摄像头
+[devices.camera]
+source = 0          # 0 = /dev/video0，也可以是字符串路径
+width = 640
+height = 360
+fps = 30.0
+fourcc = "MJPG"
+backend = "v4l2"
+
+
+# ============================================================
+# 实车几何（必须用卷尺/卡尺实测，不能抄别的车）
+# ============================================================
+
+[vehicle.geometry]
+
+# 实际测量前后轴中心距离，不是车身长度
+wheelbase_mm = 142.5
+
+# 实际左右后轮中心距离（物理差速/转弯半径/导航规划使用）
+physical_track_width_mm = 117.1
+
+# 车身矩形长宽（碰撞检测使用）
+body_length_mm = 230.0
+body_width_mm = 145.0
+
+wheel_thickness_mm = 26.4
+outer_wheel_width_mm = 143.5
+
+# NavigationPose 原点为后轴中心；这里是后轴到车身中心的距离
+rear_axle_to_body_center_mm = 71.25
+
+
+# ============================================================
+# C10B 驱动板
+# ============================================================
+
+[vehicle.drive]
+
+# ⚠️ 注意：这是 C10B 固件内部编译用的轮距，用于 Vz=(right-left)/firmware_track。
+# 它与 physical_track_width_mm 完全不是同一个参数，千万不要合并！
+# 如果换了驱动板固件，按新固件的编译值改这里。
+firmware_track_width_mm = 164.0
+
+# 驱动固件的最小转弯半径
+min_turn_radius_mm = 350.0
+
+# 默认单轮速度限幅（mm/s）
+default_max_wheel_speed_mm_s = 300.0
+
+# 仅 3×5 相邻格救援任务需要原地旋转时才改 true
+allow_in_place_rotation = false
+
+
+# ============================================================
+# 舵机标定（换车必须重新标定！）
+# ============================================================
+
+[vehicle.steering]
+
+# ⚠️ 危险字段：+1 表示"逻辑左转=厂家曲线正方向"，-1 表示安装方向相反（当前车实测 -1）。
+direction_sign = -1.0
+
+# 逻辑车辆范围（负数右转、正数左转）
+logical_right_max_rad = -0.32
+logical_left_max_rad = 0.49
+
+# 厂家标定曲线的角度范围
+calibration_min_rad = -0.49
+calibration_max_rad = 0.32
+
+# PWM 脉宽上下限
+pwm_min_us = 800
+pwm_max_us = 2200
+
+# 厂家曲线 0 点脉宽（出厂默认通常是 1500）
+factory_center_us = 1501
+
+# ⚠️ 危险字段：本车实测机械回中脉宽。换车必须重新回中并测量。
+center_us = 1580
+
+# 厂家三次标定曲线系数（WHEELTEC L150 源码 CONTROL/control.c）
+curve_a3 = -0.628
+curve_a2 = 1.269
+curve_a1 = -1.772
+curve_a0 = 1.573
+
+curve_scale = 640.62
+
+
+# ============================================================
+# 雷达安装（原点：车辆后轴中心）
+# ============================================================
+
+[sensors.radar.mount]
+
+# 雷达测量原点在后轴中心前方的距离（cm）
+x_forward_cm = 0.0
+# 在后轴中心左侧的距离（cm）
+y_left_cm = 0.0
+# 雷达零度方向相对车头的顺时针安装角（度）
+yaw_cw_deg = 0.0
+
+
+# ============================================================
+# 摄像头透视标定（换安装/换镜头必须重新标定）
+# ============================================================
+
+[sensors.camera.perspective]
+
+# 图像归一化坐标（左下、右下、右上、左上）四点，围成地面梯形
+source_points_norm = [
+    [0.02, 0.66],
+    [0.93, 0.66],
+    [0.68, 0.02],
+    [0.23, 0.02],
+]
+
+output_width_px = 320
+output_height_px = 400
+
+# 梯形对应的实际地面宽/深（cm）
+ground_width_cm = 80.0
+ground_depth_cm = 100.0
+
+
+[sensors.camera.line]
+
+require_adaptive_confirmation = false
+
+scan_near_cm = 12.0
+scan_far_cm = 72.0
+
+minimum_band_fill_ratio = 0.20
+
+use_expected_width_window = true
+
+# 赛道黑线的期望宽度窗口（cm），按当前场地油漆线实测
+expected_line_width_cm = 28.0
+minimum_line_width_cm = 10.0
+maximum_line_width_cm = 40.0
+
+maximum_line_internal_gap_cm = 8.0
+maximum_center_jump_cm = 18.0
+
+morphology_close_size = 9
+polynomial_smoothing_alpha = 0.32
+
+transverse_stop_max_height_cm = 8.0
+round_marker_min_height_cm = 12.0
+
+continuity_weight = 0.12
+
+
+# ============================================================
+# 比赛任务
+# ============================================================
+
+[missions.common]
+
+# 后轴在 A 点后方多少 cm 起步；串口屏可在 20 / 36.5 之间现场切换
+radar_center_behind_a_cm = 20.0
+
+startup_scan_count = 3
+calibration_timeout_s = 30.0
+
+camera_correction_enabled = true
+fleet_position_reporting_enabled = true
+
+
+[missions.task1]
+fleet_mission_request_state = 13
+completion_alarm_seconds = 1.0
+
+ab_speed_cm_s = 8.0
+bc_speed_cm_s = 15.0
+cd_speed_cm_s = 20.0
+da_speed_cm_s = 15.0
+
+
+[missions.task2]
+fleet_mission_request_state = 14
+completion_alarm_seconds = 1.0
+
+ab_speed_cm_s = 25.0
+bc_speed_cm_s = 9.0
+
+cd_speed_before_retakeoff_cm_s = 4.0
+cd_speed_after_retakeoff_cm_s = 30.0
+
+da_speed_cm_s = 30.0
+
+
+# ============================================================
+# 比赛控制调参（依赖摄像头安装/视觉效果的参数）
+# 换车或重新做视觉标定时改这里，不要改主程序
+# ============================================================
+
+[missions.control.camera]
+
+lateral_deadband_cm = 10.0
+steering_gain_rad_per_cm = 0.010
+max_steering_correction_rad = 0.140
+
+
+[missions.control]
+
+ab_start_alignment_full_end_progress_cm = 80.0
+ab_start_alignment_fade_end_progress_cm = 100.0
+ab_start_heading_gain = 1.30
+ab_start_max_heading_correction_rad = 0.180
+ab_start_max_total_camera_correction_rad = 0.220
+ab_start_min_valid_frames = 2
+ab_start_max_curvature_per_cm = 0.003
+ab_start_max_forward_heading_change_rad = 0.080
+
+ab_line_assist_full_end_progress_cm = 100.0
+ab_line_assist_fade_end_progress_cm = 135.0
+ab_line_assist_lateral_deadband_cm = 2.0
+ab_line_assist_gain_rad_per_cm = 0.005
+ab_line_assist_max_correction_rad = 0.060
+ab_line_assist_min_valid_frames = 3
+ab_line_assist_max_curvature_per_cm = 0.004
+ab_line_assist_max_forward_heading_change_rad = 0.100
+
+ab_lateral_alignment_learning_start_progress_cm = 50.0
+ab_lateral_alignment_learning_end_progress_cm = 90.0
+ab_lateral_alignment_ramp_start_progress_cm = 60.0
+ab_lateral_alignment_full_progress_cm = 100.0
+ab_lateral_alignment_terminal_fade_distance_cm = 65.0
+ab_lateral_alignment_min_valid_frames = 4
+ab_lateral_alignment_required_measurements = 5
+ab_lateral_alignment_max_abs_offset_cm = 12.0
+ab_lateral_alignment_max_mad_cm = 1.5
+ab_lateral_alignment_max_curvature_per_cm = 0.003
+ab_lateral_alignment_max_forward_heading_change_rad = 0.080
+
+bc_entry_limit_end_progress_cm = 210.0
+bc_entry_min_right_correction_rad = -0.012
+
+final_da_visual_window_cm = 65.0
+final_da_visual_hold_s = 0.65
+final_a_max_camera_error_cm = 6.0
+
+fleet_terminal_report_grace_s = 3.0
+fleet_trace_drain_timeout_s = 6.0
+
+# 可选：显式舵角限幅。缺省由车辆档案派生（右机械极限 / 左几何极限）。
+# steering_min_rad = -0.32
+# steering_max_rad = 0.336
+
+
+# ============================================================
+# Runtime state（现场可改，不属于车辆静态标定）
+# ============================================================
+
+[runtime]
+enabled = true
+state_file = "runtime/car_state.json"
+allowed_radar_center_behind_a_cm = [20.0, 36.5]
+
+
+[schema]
+version = 1

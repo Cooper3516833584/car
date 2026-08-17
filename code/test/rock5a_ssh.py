@@ -1,7 +1,9 @@
-"""Small SSH helper for temporary diagnostics on the ROCK 5A.
+"""Small SSH helper for temporary diagnostics on the car.
 
 Set ROCK5A_PASSWORD in the environment; the password is deliberately not kept
-in this file.  The command is sent verbatim as a single shell command.
+in this file.  Set ROCK5A_HOST (defaults to ``car.local``) and
+ROCK5A_USER (defaults to ``user``) for your board.  The command is sent
+verbatim as a single shell command.
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ import paramiko
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "command", nargs=argparse.REMAINDER, help="command to run on the ROCK 5A"
+        "command", nargs=argparse.REMAINDER, help="command to run on the car"
     )
     parser.add_argument(
         "--sudo", action="store_true", help="run the remote command through sudo"
@@ -25,26 +27,28 @@ def main() -> int:
         "--upload",
         nargs=2,
         metavar=("LOCAL_FILE", "REMOTE_FILE"),
-        help="copy one local file to the ROCK 5A before running the command",
+        help="copy one local file to the car before running the command",
     )
     parser.add_argument(
         "--download",
         nargs=2,
         metavar=("REMOTE_FILE", "LOCAL_FILE"),
-        help="copy one file from the ROCK 5A before running the command",
+        help="copy one file from the car before running the command",
     )
     args = parser.parse_args()
 
     password = os.environ.get("ROCK5A_PASSWORD")
     if not password:
         parser.error("ROCK5A_PASSWORD is not set")
+    host = os.environ.get("ROCK5A_HOST", "car.local")
+    username = os.environ.get("ROCK5A_USER", "user")
 
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
         client.connect(
-            hostname="192.168.31.224",
-            username="radxa",
+            hostname=host,
+            username=username,
             password=password,
             timeout=10,
             banner_timeout=10,

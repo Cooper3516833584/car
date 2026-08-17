@@ -17,11 +17,18 @@ from .rear_motor import (
     wheel_speeds_to_chassis,
 )
 from .steering_servo import (
+    DEFAULT_STEERING_CALIBRATION,
     FrontSteeringServo,
+    SteeringCalibration,
     SteeringCommand,
     YawDirection,
     make_steering_command,
     yaw_to_steering_command,
+)
+from .vehicle_defaults import (
+    DEFAULT_FIRMWARE_TRACK_WIDTH_MM as _DEFAULT_FIRMWARE_TRACK_WIDTH_MM,
+    DEFAULT_PHYSICAL_TRACK_WIDTH_MM as _DEFAULT_PHYSICAL_TRACK_WIDTH_MM,
+    DEFAULT_WHEELBASE_MM as _DEFAULT_WHEELBASE_MM,
 )
 
 try:
@@ -30,9 +37,12 @@ except ModuleNotFoundError:  # Unit tests on Windows never start hardware.
     fcntl = None
 
 
-DEFAULT_WHEELBASE_MM: Final[float] = 142.5
-DEFAULT_TRACK_WIDTH_MM: Final[float] = 117.1
-DEFAULT_FIRMWARE_TRACK_WIDTH_MM: Final[float] = 164.0
+# Legacy backward-compatible defaults equal to the verified Cooper ROCK 5A +
+# WHEELTEC L150 profile.  Production entries build the drive from the TOML
+# profile through ``AckermannDrive.from_config`` / ``config.factory``.
+DEFAULT_WHEELBASE_MM: Final[float] = _DEFAULT_WHEELBASE_MM
+DEFAULT_TRACK_WIDTH_MM: Final[float] = _DEFAULT_PHYSICAL_TRACK_WIDTH_MM
+DEFAULT_FIRMWARE_TRACK_WIDTH_MM: Final[float] = _DEFAULT_FIRMWARE_TRACK_WIDTH_MM
 DEFAULT_HARDWARE_LOCK_PATH: Final[str] = "/run/lock/car-hardware.lock"
 
 
@@ -143,6 +153,7 @@ class AckermannDrive:
         firmware_track_width_mm: float | None = None,
         max_wheel_speed_mm_s: float | None = None,
         allow_in_place_rotation: bool = False,
+        steering_calibration: SteeringCalibration = DEFAULT_STEERING_CALIBRATION,
         hardware_lock_path: str | os.PathLike[str] | None = DEFAULT_HARDWARE_LOCK_PATH,
     ) -> None:
         if rear_motors is None:
@@ -184,7 +195,9 @@ class AckermannDrive:
                 raise ValueError(
                     "allow_in_place_rotation does not match supplied rear motor driver"
                 )
-        self.steering = steering or FrontSteeringServo()
+        self.steering = steering or FrontSteeringServo(
+            calibration=steering_calibration
+        )
         self.wheelbase_mm = float(wheelbase_mm)
         self.track_width_mm = float(track_width_mm)
         self.firmware_track_width_mm = firmware_track
@@ -208,6 +221,45 @@ class AckermannDrive:
     @property
     def is_running(self) -> bool:
         return self._started and self.rear_motors.is_running and self.steering.is_running
+
+    @classmethod
+    def from_config(
+        cls,
+        *,
+        device: str,
+        wheelbase_mm: float,
+        track_width_mm: float,
+        firmware_track_width_mm: float,
+        max_wheel_speed_mm_s: float,
+        min_turn_radius_mm: float,
+        allow_in_place_rotation: bool,
+        steering_calibration: SteeringCalibration,
+        hardware_lock_path: str | os.PathLike[str] | None = DEFAULT_HARDWARE_LOCK_PATH,
+    ) -> "AckermannDrive":
+        """Build the drive from one validated vehicle profile.
+
+        ``wheelbase_mm`` / ``track_width_mm`` are the measured physical
+        Ackermann dimensions; ``firmware_track_width_mm`` is the C10B protocol
+        track and must stay distinct from the physical track.
+        """
+        rear_motors = RearMotorDriver(
+            device=device or None,
+            max_wheel_speed_mm_s=max_wheel_speed_mm_s,
+            track_width_mm=firmware_track_width_mm,
+            min_turn_radius_mm=min_turn_radius_mm,
+            allow_in_place_rotation=allow_in_place_rotation,
+        )
+        steering = FrontSteeringServo(calibration=steering_calibration)
+        return cls(
+            rear_motors=rear_motors,
+            steering=steering,
+            wheelbase_mm=wheelbase_mm,
+            track_width_mm=track_width_mm,
+            firmware_track_width_mm=firmware_track_width_mm,
+            max_wheel_speed_mm_s=max_wheel_speed_mm_s,
+            allow_in_place_rotation=allow_in_place_rotation,
+            hardware_lock_path=hardware_lock_path,
+        )
 
     def start(self) -> "AckermannDrive":
         with self._lock:

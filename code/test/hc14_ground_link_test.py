@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Low-rate bidirectional transparent-serial test: ground station <-> ROCK 5A.
+"""Low-rate bidirectional transparent-serial test: ground station <-> car.
 
 The test sends only ASCII probe lines.  Both serial ports are opened at 115200
 8N1 with DTR and RTS explicitly deasserted, as required by the HC-14 setup.
+Real hosts/passwords are read from the environment; nothing machine-private
+is committed.
 """
 
 from __future__ import annotations
@@ -16,8 +18,36 @@ import uuid
 import paramiko
 
 
-GROUND = ("192.168.31.107", "cooper", "/dev/ttyUSB0", "GROUND_STATION_PASSWORD")
-CAR = ("192.168.31.224", "radxa", "/dev/ttyUSB0", "ROCK5A_PASSWORD")
+def _env_host(name: str, default: str) -> str:
+    return os.environ.get(name, default)
+
+
+def _env_user(name: str, default: str) -> str:
+    return os.environ.get(name, default)
+
+
+def _env_password(name: str) -> str:
+    password = os.environ.get(name, "")
+    if not password:
+        raise SystemExit(f"{name} is not set")
+    return password
+
+
+def targets() -> tuple[tuple[str, str, str, str], tuple[str, str, str, str]]:
+    """(host, user, device, password) for ground station and car."""
+    ground = (
+        _env_host("GROUND_STATION_HOST", "ground-station.local"),
+        _env_user("GROUND_STATION_USER", "user"),
+        "/dev/ttyUSB0",
+        _env_password("GROUND_STATION_PASSWORD"),
+    )
+    car = (
+        _env_host("ROCK5A_HOST", "car.local"),
+        _env_user("ROCK5A_USER", "user"),
+        "/dev/ttyUSB0",
+        _env_password("ROCK5A_PASSWORD"),
+    )
+    return ground, car
 
 
 def connect(host: str, user: str, password: str) -> paramiko.SSHClient:
@@ -120,19 +150,26 @@ def main() -> int:
     if not 1 <= args.count <= 5:
         parser.error("--count must be 1..5")
 
-    ground_password = os.environ.get(GROUND[3])
-    car_password = os.environ.get(CAR[3])
+    ground_spec, car_spec = targets()
+    ground_password = os.environ.get("GROUND_STATION_PASSWORD")
+    car_password = os.environ.get("ROCK5A_PASSWORD")
     if not ground_password or not car_password:
         parser.error("GROUND_STATION_PASSWORD and ROCK5A_PASSWORD must be set")
 
     run_id = uuid.uuid4().hex[:8]
-    ground = connect(GROUND[0], GROUND[1], ground_password)
-    car = connect(CAR[0], CAR[1], car_password)
+    ground = connect(ground_spec[0], ground_spec[1], ground_password)
+    car = connect(car_spec[0], car_spec[1], car_password)
     try:
         g2c = [f"G2C {run_id} {index:02d}" for index in range(args.count)]
         c2g = [f"C2G {run_id} {index:02d}" for index in range(args.count)]
-        received_g2c = run_direction(ground, ground_password, GROUND[2], car, car_password, CAR[2], g2c)
-        received_c2g = run_direction(car, car_password, CAR[2], ground, ground_password, GROUND[2], c2g)
+        received_g2c = run_direction(
+            ground, ground_password, ground_spec[2],
+            car, car_password, car_spec[2], g2c,
+        )
+        received_c2g = run_direction(
+            car, car_password, car_spec[2],
+            ground, ground_password, ground_spec[2], c2g,
+        )
     finally:
         ground.close(); car.close()
 

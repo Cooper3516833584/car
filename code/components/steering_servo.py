@@ -1,30 +1,99 @@
 #!/usr/bin/env python3
-"""Calibrated front-steering servo on ROCK 5A physical Pin 23 (PWM0_M2)."""
+"""Calibrated front-steering servo for the Ackermann car.
+
+The steering *math* (cubic factory curve, direction inversion, PWM pulse
+calculation) lives here and accepts a :class:`SteeringCalibration` object.
+The calibration values, the PWM output and the mechanical limits belong to the
+vehicle profile / HAL layer and are injected by the composition root; this
+module no longer knows ROCK 5A pin names or the physical board layout.
+
+``DEFAULT_STEERING_CALIBRATION`` mirrors the verified Cooper ROCK 5A +
+WHEELTEC L150 profile so pure unit tests and legacy call sites keep working.
+Production entries always build the calibration from the TOML profile.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
 import math
-from pathlib import Path
-import time
-from typing import Final
+from typing import Final, Protocol
+
+from hal.pwm import PWMOutput
 
 
-PWM_PERIOD_NS: Final[int] = 20_000_000  # 50 Hz
-SERVO_MIN_US: Final[int] = 800
-SERVO_MAX_US: Final[int] = 2200
-STEERING_DIRECTION_SIGN: Final[float] = -1.0
-STEERING_RIGHT_MAX_RAD: Final[float] = -0.32
-STEERING_LEFT_MAX_RAD: Final[float] = 0.49
-CALIBRATION_MIN_RAD: Final[float] = -0.49
-CALIBRATION_MAX_RAD: Final[float] = 0.32
-FACTORY_CENTER_US: Final[int] = 1501
-STEERING_CENTER_US: Final[int] = 1580
+@dataclass(frozen=True, slots=True)
+class SteeringCalibration:
+    """All servo calibration data for one physical car."""
+
+    direction_sign: float = -1.0
+    logical_right_max_rad: float = -0.32
+    logical_left_max_rad: float = 0.49
+    calibration_min_rad: float = -0.49
+    calibration_max_rad: float = 0.32
+    pwm_min_us: int = 800
+    pwm_max_us: int = 2200
+    factory_center_us: int = 1501
+    center_us: int = 1580
+    curve_a3: float = -0.628
+    curve_a2: float = 1.269
+    curve_a1: float = -1.772
+    curve_a0: float = 1.573
+    curve_scale: float = 640.62
+
+    def __post_init__(self) -> None:
+        values = (
+            self.direction_sign,
+            self.logical_right_max_rad,
+            self.logical_left_max_rad,
+            self.calibration_min_rad,
+            self.calibration_max_rad,
+            self.curve_a3,
+            self.curve_a2,
+            self.curve_a1,
+            self.curve_a0,
+            self.curve_scale,
+        )
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("steering calibration values must be finite")
+        if self.direction_sign not in (-1.0, 1.0):
+            raise ValueError("direction_sign must be +1 or -1")
+        if self.logical_right_max_rad >= 0.0:
+            raise ValueError("logical_right_max_rad must be negative")
+        if self.logical_left_max_rad <= 0.0:
+            raise ValueError("logical_left_max_rad must be positive")
+        if not self.calibration_min_rad < self.calibration_max_rad:
+            raise ValueError("calibration_min_rad must be below calibration_max_rad")
+        if not self.pwm_min_us < self.center_us < self.pwm_max_us:
+            raise ValueError("pwm must satisfy pwm_min_us < center_us < pwm_max_us")
+        if self.factory_center_us <= 0 or self.curve_scale <= 0.0:
+            raise ValueError("factory_center_us and curve_scale must be positive")
+
+
+# Backward-compatible default = the verified current car profile.  The formal
+# main entries inject the calibration built from the TOML configuration.
+DEFAULT_STEERING_CALIBRATION: Final[SteeringCalibration] = SteeringCalibration()
+
+# Legacy module-level aliases kept for existing tests and call sites.
+STEERING_DIRECTION_SIGN: Final[float] = DEFAULT_STEERING_CALIBRATION.direction_sign
+STEERING_RIGHT_MAX_RAD: Final[float] = (
+    DEFAULT_STEERING_CALIBRATION.logical_right_max_rad
+)
+STEERING_LEFT_MAX_RAD: Final[float] = (
+    DEFAULT_STEERING_CALIBRATION.logical_left_max_rad
+)
+CALIBRATION_MIN_RAD: Final[float] = (
+    DEFAULT_STEERING_CALIBRATION.calibration_min_rad
+)
+CALIBRATION_MAX_RAD: Final[float] = (
+    DEFAULT_STEERING_CALIBRATION.calibration_max_rad
+)
+FACTORY_CENTER_US: Final[int] = DEFAULT_STEERING_CALIBRATION.factory_center_us
+STEERING_CENTER_US: Final[int] = DEFAULT_STEERING_CALIBRATION.center_us
 
 
 class SteeringStateError(RuntimeError):
-    """The steering PWM component is not started or cannot access PWM0."""
+    """The steering PWM component is not started or cannot access PWM."""
 
 
 class YawDirection(Enum):
@@ -50,19 +119,26 @@ class SteeringCommand:
         return None
 
 
-def _finite_angle(angle_rad: float) -> float:
+def _finite_angle(
+    angle_rad: float,
+    calibration: SteeringCalibration,
+) -> float:
     angle = float(angle_rad)
     if not math.isfinite(angle):
         raise ValueError("angle_rad must be finite")
-    if not STEERING_RIGHT_MAX_RAD <= angle <= STEERING_LEFT_MAX_RAD:
+    if not calibration.logical_right_max_rad <= angle <= calibration.logical_left_max_rad:
         raise ValueError(
             "angle_rad must be in "
-            f"[{STEERING_RIGHT_MAX_RAD}, {STEERING_LEFT_MAX_RAD}]"
+            f"[{calibration.logical_right_max_rad}, "
+            f"{calibration.logical_left_max_rad}]"
         )
     return angle
 
 
-def steering_angle_to_pulse_us(angle_rad: float) -> int:
+def steering_angle_to_pulse_us(
+    angle_rad: float,
+    calibration: SteeringCalibration = DEFAULT_STEERING_CALIBRATION,
+) -> int:
     """Apply the WHEELTEC L150 cubic steering-angle calibration.
 
     Vehicle steering remains positive/left and negative/right.  Real-car logs
@@ -71,28 +147,43 @@ def steering_angle_to_pulse_us(angle_rad: float) -> int:
     at a negative calibration angle and produces a pulse above centre.
     """
 
-    angle = _finite_angle(angle_rad)
-    calibration_angle = STEERING_DIRECTION_SIGN * angle
-    if not CALIBRATION_MIN_RAD <= calibration_angle <= CALIBRATION_MAX_RAD:
+    angle = _finite_angle(angle_rad, calibration)
+    calibration_angle = calibration.direction_sign * angle
+    if not calibration.calibration_min_rad <= calibration_angle <= calibration.calibration_max_rad:
         raise ValueError("logical steering angle exceeds calibration travel")
     servo_angle = (
-        -0.628 * calibration_angle**3
-        + 1.269 * calibration_angle**2
-        - 1.772 * calibration_angle
-        + 1.573
+        calibration.curve_a3 * calibration_angle**3
+        + calibration.curve_a2 * calibration_angle**2
+        + calibration.curve_a1 * calibration_angle
+        + calibration.curve_a0
     )
-    factory_pulse = 1500.0 + (servo_angle - 1.572) * 640.62
-    pulse = factory_pulse + (STEERING_CENTER_US - FACTORY_CENTER_US)
-    return round(max(SERVO_MIN_US, min(SERVO_MAX_US, pulse)))
+    factory_pulse = 1500.0 + (
+        servo_angle - (calibration.curve_a0 - 0.001)
+    ) * calibration.curve_scale
+    pulse = factory_pulse + (calibration.center_us - calibration.factory_center_us)
+    return round(
+        max(
+            calibration.pwm_min_us,
+            min(calibration.pwm_max_us, pulse),
+        )
+    )
 
 
-def make_steering_command(angle_rad: float) -> SteeringCommand:
-    angle = _finite_angle(angle_rad)
-    return SteeringCommand(angle, steering_angle_to_pulse_us(angle))
+def make_steering_command(
+    angle_rad: float,
+    calibration: SteeringCalibration = DEFAULT_STEERING_CALIBRATION,
+) -> SteeringCommand:
+    angle = _finite_angle(angle_rad, calibration)
+    return SteeringCommand(
+        angle,
+        steering_angle_to_pulse_us(angle, calibration),
+    )
 
 
 def yaw_to_steering_command(
-    direction: YawDirection, magnitude_rad: float
+    direction: YawDirection,
+    magnitude_rad: float,
+    calibration: SteeringCalibration = DEFAULT_STEERING_CALIBRATION,
 ) -> SteeringCommand:
     """Build a command from an explicit yaw direction and angle magnitude."""
 
@@ -101,34 +192,29 @@ def yaw_to_steering_command(
     magnitude = float(magnitude_rad)
     if not math.isfinite(magnitude) or magnitude < 0.0:
         raise ValueError("magnitude_rad must be finite and non-negative")
-    return make_steering_command(direction.value * magnitude)
-
-
-def _write(path: Path, value: int | str) -> None:
-    path.write_text(f"{value}\n", encoding="ascii")
-
-
-def _find_pwm0_chip() -> Path:
-    for chip in Path("/sys/class/pwm").glob("pwmchip*"):
-        if "fd8b0000.pwm" in str(chip.resolve()):
-            return chip
-    raise SteeringStateError(
-        "PWM0 is unavailable; enable rk3588-pwm0-m2 with rsetup and reboot"
-    )
+    return make_steering_command(direction.value * magnitude, calibration)
 
 
 class FrontSteeringServo:
-    """Sysfs-PWM controller for the front steering servo.
+    """PWM controller for the front steering servo.
 
-    The caller normally runs as root on the ROCK 5A.  Starting centres and
-    enables the servo.  Closing returns to centre and deliberately leaves PWM
-    enabled so the front wheels continue to hold the safe centre position.
+    The PWM output (``PWMOutput``) is provided by the HAL layer and already
+    carries the board-specific configuration.  Starting centres and enables
+    the servo.  Closing returns to centre and deliberately leaves PWM enabled
+    so the front wheels continue to hold the safe centre position.
     """
 
-    def __init__(self, pwm_chip: str | Path | None = None) -> None:
-        self._configured_chip = Path(pwm_chip) if pwm_chip is not None else None
-        self._pwm: Path | None = None
-        self._command = make_steering_command(0.0)
+    def __init__(
+        self,
+        calibration: SteeringCalibration = DEFAULT_STEERING_CALIBRATION,
+        pwm: PWMOutput | None = None,
+    ) -> None:
+        if not isinstance(calibration, SteeringCalibration):
+            raise TypeError("calibration must be a SteeringCalibration")
+        self.calibration = calibration
+        self._pwm = pwm
+        self._started_pwm: PWMOutput | None = None
+        self._command = make_steering_command(0.0, calibration)
 
     @property
     def command(self) -> SteeringCommand:
@@ -136,31 +222,23 @@ class FrontSteeringServo:
 
     @property
     def is_running(self) -> bool:
-        return self._pwm is not None
+        return self._started_pwm is not None
 
     def start(self) -> "FrontSteeringServo":
-        if self._pwm is not None:
+        if self._started_pwm is not None:
             raise SteeringStateError("front steering servo is already running")
-        chip = self._configured_chip or _find_pwm0_chip()
-        pwm = chip / "pwm0"
-        if not pwm.exists():
-            _write(chip / "export", 0)
-            for _ in range(20):
-                if pwm.exists():
-                    break
-                time.sleep(0.05)
-        if not pwm.exists():
-            raise SteeringStateError("PWM0 export did not create pwm0")
-        enable = pwm / "enable"
-        if enable.read_text(encoding="ascii").strip() == "1":
-            _write(enable, 0)
-        _write(pwm / "period", PWM_PERIOD_NS)
-        _write(pwm / "polarity", "normal")
-        self._pwm = pwm
+        if self._pwm is None:
+            raise SteeringStateError(
+                "front steering servo has no PWM output; build it from the "
+                "vehicle profile (config factory) before starting"
+            )
+        output = self._pwm
+        output.start()
+        self._started_pwm = output
         try:
             self.center()
         except BaseException:
-            self._pwm = None
+            self._started_pwm = None
             raise
         return self
 
@@ -171,14 +249,16 @@ class FrontSteeringServo:
         self.close()
 
     def set_angle(self, angle_rad: float) -> SteeringCommand:
-        command = make_steering_command(angle_rad)
+        command = make_steering_command(angle_rad, self.calibration)
         self.apply(command)
         return command
 
     def set_yaw(
         self, direction: YawDirection, magnitude_rad: float
     ) -> SteeringCommand:
-        command = yaw_to_steering_command(direction, magnitude_rad)
+        command = yaw_to_steering_command(
+            direction, magnitude_rad, self.calibration
+        )
         self.apply(command)
         return command
 
@@ -188,23 +268,22 @@ class FrontSteeringServo:
     def apply(self, command: SteeringCommand) -> None:
         if not isinstance(command, SteeringCommand):
             raise TypeError("command must be a SteeringCommand")
-        if self._pwm is None:
+        if self._started_pwm is None:
             raise SteeringStateError("front steering servo is not running")
-        _write(self._pwm / "duty_cycle", command.pulse_us * 1000)
-        _write(self._pwm / "enable", 1)
+        self._started_pwm.set_pulse_us(command.pulse_us)
         self._command = command
 
     def disable(self) -> None:
         """Release servo holding torque; normally only use during maintenance."""
 
-        if self._pwm is None:
+        if self._started_pwm is None:
             raise SteeringStateError("front steering servo is not running")
-        _write(self._pwm / "enable", 0)
+        self._started_pwm.disable()
 
     def close(self) -> None:
-        if self._pwm is None:
+        if self._started_pwm is None:
             return
         try:
             self.center()
         finally:
-            self._pwm = None
+            self._started_pwm = None

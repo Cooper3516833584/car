@@ -13,6 +13,11 @@ from main_radar_camera_line_following import (
 class FakeAlarm:
     def __init__(self):
         self.off_calls = 0
+        self.on_calls = 0
+        self.is_initialized = True
+
+    def on(self):
+        self.on_calls += 1
 
     def off(self):
         self.off_calls += 1
@@ -42,8 +47,9 @@ class Mission1CompletionAlarmTests(unittest.TestCase):
         app._completed_event = threading.Event()
         app.follower = SimpleNamespace(terminal_hard_stop_triggered=False)
         app.config = SimpleNamespace(
-            radar_center_behind_a_cm=18.625,
+            radar_center_behind_a_cm=20.0,
             completion_alarm_seconds=1.0,
+            mission_control=MainConfig().mission_control,
         )
         app._start_completion_alarm = Mock()
         completed = SimpleNamespace(
@@ -59,41 +65,37 @@ class Mission1CompletionAlarmTests(unittest.TestCase):
 
     def test_alarm_waits_one_second_and_always_turns_off(self):
         app = object.__new__(RadarCameraLineApplication)
-        app.config = SimpleNamespace(completion_alarm_seconds=1.0)
+        app.config = MainConfig(completion_alarm_seconds=1.0)
         app._stop_event = FakeStopEvent()
         app._completion_alarm_lock = threading.Lock()
         app._completion_alarm_device = None
         alarm = FakeAlarm()
 
-        with patch(
-            "main_radar_camera_line_following.alarm_on",
-            return_value=alarm,
-        ), patch(
-            "main_radar_camera_line_following.alarm_off"
-        ) as fallback_off:
+        with patch.object(app, "_build_alarm", return_value=alarm) as build:
             app._run_completion_alarm()
 
         self.assertEqual([1.0], app._stop_event.waits)
+        self.assertEqual(1, alarm.on_calls)
         self.assertEqual(1, alarm.off_calls)
-        fallback_off.assert_not_called()
+        build.assert_called_once_with()
         self.assertIsNone(app._completion_alarm_device)
 
     def test_alarm_start_failure_is_nonfatal_and_uses_off_fallback(self):
         app = object.__new__(RadarCameraLineApplication)
-        app.config = SimpleNamespace(completion_alarm_seconds=1.0)
+        app.config = MainConfig(completion_alarm_seconds=1.0)
         app._stop_event = FakeStopEvent()
         app._completion_alarm_lock = threading.Lock()
         app._completion_alarm_device = None
 
-        with patch(
-            "main_radar_camera_line_following.alarm_on",
+        with patch.object(
+            app,
+            "_build_alarm",
             side_effect=RuntimeError("GPIO unavailable"),
-        ), patch(
-            "main_radar_camera_line_following.alarm_off"
-        ) as fallback_off:
+        ) as build:
+            # Must not propagate; the fallback silence attempt may also fail.
             app._run_completion_alarm()
 
-        fallback_off.assert_called_once_with()
+        self.assertEqual(2, build.call_count)
         self.assertIsNone(app._completion_alarm_device)
 
     def test_start_is_deduplicated_and_uses_named_worker(self):

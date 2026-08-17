@@ -1,0 +1,312 @@
+[profile]
+name = "Cooper ROCK 5A + WHEELTEC L150"
+description = "Current verified competition car"
+
+# ============================================================
+# 主控板 / IO
+# ============================================================
+
+[hardware.steering_pwm]
+backend = "linux-sysfs"
+channel = 0
+period_ns = 20000000
+polarity = "normal"
+
+# ROCK 5A 当前 PWM0 对应设备。
+chip_device_match = "fd8b0000.pwm"
+
+# 以下字段主要供文档、诊断和移植参考，不参与舵机数学控制。
+physical_pin = 23
+pin_function = "PWM0_M2"
+device_tree_overlay = "rk3588-pwm0-m2"
+
+
+[hardware.alarm_gpio]
+backend = "linux-sysfs-bank"
+sysfs_root = "/sys/class/gpio"
+
+bank_label = "gpio4"
+line_offset = 11
+
+active_low = true
+
+physical_pin = 11
+pin_function = "GPIO4_B3"
+
+
+# ============================================================
+# Linux设备
+# ============================================================
+
+[devices.motor]
+port = "/dev/ttyACM0"
+
+
+[devices.radar]
+port = "/dev/ttyS6"
+
+
+[devices.hc14]
+port = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
+
+
+[devices.screen]
+enabled = true
+port = "/dev/serial/by-id/usb-jixin.pro_CMSIS-DAP_LU_LU_2022_8888-if00"
+baudrate = 9600
+
+
+[devices.camera]
+source = 0
+width = 640
+height = 360
+fps = 30.0
+fourcc = "MJPG"
+backend = "v4l2"
+
+
+# ============================================================
+# 实车几何
+# ============================================================
+
+[vehicle.geometry]
+
+wheelbase_mm = 142.5
+
+# 实际左右后轮中心距离（阿克曼几何/转弯半径/后轮物理差速/Navigation/路径规划使用）。
+physical_track_width_mm = 117.1
+
+body_length_mm = 230.0
+body_width_mm = 145.0
+
+wheel_thickness_mm = 26.4
+outer_wheel_width_mm = 143.5
+
+# NavigationPose 原点为后轴中心。
+rear_axle_to_body_center_mm = 71.25
+
+
+# ============================================================
+# C10B驱动板相关
+# ============================================================
+
+[vehicle.drive]
+
+# 注意：
+# 这是C10B固件内部用于Vx/Vz逆变换的轮距，与 physical_track_width_mm 不是同一个参数。
+# Vz = (right - left) / firmware_track_width_mm
+firmware_track_width_mm = 164.0
+
+min_turn_radius_mm = 350.0
+
+default_max_wheel_speed_mm_s = 300.0
+
+allow_in_place_rotation = false
+
+
+# ============================================================
+# 舵机标定
+# ============================================================
+
+[vehicle.steering]
+
+direction_sign = -1.0
+
+logical_right_max_rad = -0.32
+logical_left_max_rad = 0.49
+
+calibration_min_rad = -0.49
+calibration_max_rad = 0.32
+
+pwm_min_us = 800
+pwm_max_us = 2200
+
+factory_center_us = 1501
+center_us = 1580
+
+curve_a3 = -0.628
+curve_a2 = 1.269
+curve_a1 = -1.772
+curve_a0 = 1.573
+
+curve_scale = 640.62
+
+
+# ============================================================
+# 雷达安装（原点：车辆后轴中心）
+# ============================================================
+
+[sensors.radar.mount]
+
+x_forward_cm = 0.0
+y_left_cm = 0.0
+yaw_cw_deg = 0.0
+
+
+# ============================================================
+# 当前前置摄像头标定
+# ============================================================
+
+[sensors.camera.perspective]
+
+source_points_norm = [
+    [0.02, 0.66],
+    [0.93, 0.66],
+    [0.68, 0.02],
+    [0.23, 0.02],
+]
+
+output_width_px = 320
+output_height_px = 400
+
+ground_width_cm = 80.0
+ground_depth_cm = 100.0
+
+
+[sensors.camera.line]
+
+require_adaptive_confirmation = false
+
+scan_near_cm = 12.0
+scan_far_cm = 72.0
+
+minimum_band_fill_ratio = 0.20
+
+use_expected_width_window = true
+
+expected_line_width_cm = 28.0
+minimum_line_width_cm = 10.0
+maximum_line_width_cm = 40.0
+
+maximum_line_internal_gap_cm = 8.0
+maximum_center_jump_cm = 18.0
+
+morphology_close_size = 9
+polynomial_smoothing_alpha = 0.32
+
+transverse_stop_max_height_cm = 8.0
+round_marker_min_height_cm = 12.0
+
+continuity_weight = 0.12
+
+
+# ============================================================
+# 比赛任务
+# ============================================================
+
+[missions.common]
+
+radar_center_behind_a_cm = 20.0
+
+startup_scan_count = 3
+calibration_timeout_s = 30.0
+
+camera_correction_enabled = true
+fleet_position_reporting_enabled = true
+
+
+[missions.task1]
+
+fleet_mission_request_state = 13
+completion_alarm_seconds = 1.0
+
+ab_speed_cm_s = 8.0
+bc_speed_cm_s = 15.0
+cd_speed_cm_s = 20.0
+da_speed_cm_s = 15.0
+
+
+[missions.task2]
+
+fleet_mission_request_state = 14
+completion_alarm_seconds = 1.0
+
+ab_speed_cm_s = 25.0
+bc_speed_cm_s = 9.0
+
+cd_speed_before_retakeoff_cm_s = 4.0
+cd_speed_after_retakeoff_cm_s = 30.0
+
+da_speed_cm_s = 30.0
+
+
+# ============================================================
+# 比赛控制调参（依赖当前摄像头安装/当前实车视觉效果的参数）
+# 换车或重新做视觉标定时修改这里，不需要修改主程序。
+# ============================================================
+
+[missions.control.camera]
+
+# 相机纠偏：死区、增益、最大修正量
+lateral_deadband_cm = 10.0
+steering_gain_rad_per_cm = 0.010
+max_steering_correction_rad = 0.140
+
+
+[missions.control]
+
+# 第一段 AB 起点的强航向对齐
+ab_start_alignment_full_end_progress_cm = 80.0
+ab_start_alignment_fade_end_progress_cm = 100.0
+ab_start_heading_gain = 1.30
+ab_start_max_heading_correction_rad = 0.180
+ab_start_max_total_camera_correction_rad = 0.220
+ab_start_min_valid_frames = 2
+ab_start_max_curvature_per_cm = 0.003
+ab_start_max_forward_heading_change_rad = 0.080
+
+# 第一段 AB 的受限横向辅助
+ab_line_assist_full_end_progress_cm = 100.0
+ab_line_assist_fade_end_progress_cm = 135.0
+ab_line_assist_lateral_deadband_cm = 2.0
+ab_line_assist_gain_rad_per_cm = 0.005
+ab_line_assist_max_correction_rad = 0.060
+ab_line_assist_min_valid_frames = 3
+ab_line_assist_max_curvature_per_cm = 0.004
+ab_line_assist_max_forward_heading_change_rad = 0.100
+
+# AB 视觉横向对齐学习
+ab_lateral_alignment_learning_start_progress_cm = 50.0
+ab_lateral_alignment_learning_end_progress_cm = 90.0
+ab_lateral_alignment_ramp_start_progress_cm = 60.0
+ab_lateral_alignment_full_progress_cm = 100.0
+ab_lateral_alignment_terminal_fade_distance_cm = 65.0
+ab_lateral_alignment_min_valid_frames = 4
+ab_lateral_alignment_required_measurements = 5
+ab_lateral_alignment_max_abs_offset_cm = 12.0
+ab_lateral_alignment_max_mad_cm = 1.5
+ab_lateral_alignment_max_curvature_per_cm = 0.003
+ab_lateral_alignment_max_forward_heading_change_rad = 0.080
+
+# BC 入口（第一个右半圆）的相机修正限制
+bc_entry_limit_end_progress_cm = 210.0
+bc_entry_min_right_correction_rad = -0.012
+
+# 终段 DA 视觉质量检查
+final_da_visual_window_cm = 65.0
+final_da_visual_hold_s = 0.65
+final_a_max_camera_error_cm = 6.0
+
+# FleetBus 终态上报 / trace 排空时间
+fleet_terminal_report_grace_s = 3.0
+fleet_trace_drain_timeout_s = 6.0
+
+# 可选：显式舵角限幅（rad）。缺省时由车辆档案自动派生：
+#   最小值 = 舵机机械右极限；最大值 = 满足最小转弯半径的几何左极限。
+# 当前实车派生值为 -0.32 / +0.336，不需要显式填写。
+# steering_min_rad = -0.32
+# steering_max_rad = 0.336
+
+
+# ============================================================
+# Runtime state（现场可改，不属于车辆静态标定）
+# ============================================================
+
+[runtime]
+enabled = true
+state_file = "runtime/car_state.json"
+allowed_radar_center_behind_a_cm = [20.0, 36.5]
+
+
+[schema]
+version = 1

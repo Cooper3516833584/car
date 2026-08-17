@@ -36,6 +36,18 @@ from components.navigation import (
     NavigationState,
     radar_yaw_to_navigation_heading,
 )
+from components.steering_servo import (
+    DEFAULT_STEERING_CALIBRATION,
+    SteeringCalibration,
+)
+from components.vehicle_defaults import (
+    DEFAULT_FIRMWARE_TRACK_WIDTH_MM,
+    DEFAULT_MIN_TURN_RADIUS_MM,
+    DEFAULT_PHYSICAL_TRACK_WIDTH_MM,
+    DEFAULT_WHEELBASE_MM,
+)
+from config.factory import build_steering_calibration
+from config.loader import load_car_config
 
 
 # Fixed-track test speed. Change this one value for the next real-car run.
@@ -128,6 +140,15 @@ class MainConfig:
     calibration_timeout_s: float = 30.0
     radar_center_behind_a_cm: float = RADAR_CENTER_BEHIND_A_ALONG_AB_CM
     speed_cm_s: float = TRACK_SPEED_CM_S
+    # Drive construction data; the rollback entry fills these from the TOML
+    # profile so the car keeps working without hardcoded devices.
+    motor_device: str = ""
+    wheelbase_mm: float = DEFAULT_WHEELBASE_MM
+    physical_track_width_mm: float = DEFAULT_PHYSICAL_TRACK_WIDTH_MM
+    firmware_track_width_mm: float = DEFAULT_FIRMWARE_TRACK_WIDTH_MM
+    min_turn_radius_mm: float = DEFAULT_MIN_TURN_RADIUS_MM
+    allow_in_place_rotation: bool = False
+    steering_calibration: SteeringCalibration = DEFAULT_STEERING_CALIBRATION
 
     def __post_init__(self) -> None:
         if self.startup_scan_count <= 0:
@@ -171,8 +192,15 @@ class CompetitionCarApplication:
         self._closed = False
 
         max_wheel_speed_mm_s = max(300.0, config.speed_cm_s * 12.0)
-        self.drive = AckermannDrive(
+        self.drive = AckermannDrive.from_config(
+            device=config.motor_device or None,
+            wheelbase_mm=config.wheelbase_mm,
+            track_width_mm=config.physical_track_width_mm,
+            firmware_track_width_mm=config.firmware_track_width_mm,
             max_wheel_speed_mm_s=max_wheel_speed_mm_s,
+            min_turn_radius_mm=config.min_turn_radius_mm,
+            allow_in_place_rotation=config.allow_in_place_rotation,
+            steering_calibration=config.steering_calibration,
         )
         self.track = CompetitionTrack.build(
             reference_offset_cm=config.radar_center_behind_a_cm,
@@ -372,6 +400,12 @@ class CompetitionCarApplication:
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="vehicle TOML profile (default: CAR_CONFIG env or the repository "
+        "default profile); used for the motor device and drive geometry",
+    )
     parser.add_argument("--radar-port", default=DEFAULT_D500_PORT)
     parser.add_argument("--radar-x-cm", type=float, default=0.0)
     parser.add_argument("--radar-y-cm", type=float, default=0.0)
@@ -413,6 +447,7 @@ def main(argv: list[str] | None = None) -> int:
 
     app: CompetitionCarApplication | None = None
     try:
+        car_config = load_car_config(args.config)
         app = CompetitionCarApplication(
             MainConfig(
                 radar_port=args.radar_port,
@@ -425,6 +460,21 @@ def main(argv: list[str] | None = None) -> int:
                 calibration_timeout_s=args.calibration_timeout,
                 radar_center_behind_a_cm=args.radar_center_behind_a_cm,
                 speed_cm_s=args.speed_cm_s,
+                motor_device=car_config.devices.motor.port,
+                wheelbase_mm=car_config.vehicle.geometry.wheelbase_mm,
+                physical_track_width_mm=(
+                    car_config.vehicle.geometry.physical_track_width_mm
+                ),
+                firmware_track_width_mm=(
+                    car_config.vehicle.drive.firmware_track_width_mm
+                ),
+                min_turn_radius_mm=(
+                    car_config.vehicle.drive.min_turn_radius_mm
+                ),
+                allow_in_place_rotation=(
+                    car_config.vehicle.drive.allow_in_place_rotation
+                ),
+                steering_calibration=build_steering_calibration(car_config),
             )
         )
 

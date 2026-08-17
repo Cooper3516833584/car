@@ -51,6 +51,12 @@ def build_argument_parser(
     parser = argparse.ArgumentParser(
         description=f"D-task {task_name}: follow the black loop once from A."
     )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="vehicle TOML profile (default: CAR_CONFIG env or the repository "
+        "default profile)",
+    )
     parser.add_argument("--radar-port", default=DEFAULT_D500_PORT)
     parser.add_argument("--radar-x-cm", type=float, default=0.0)
     parser.add_argument("--radar-y-cm", type=float, default=0.0)
@@ -107,6 +113,10 @@ def main(
 
     app: CompetitionTaskApplication | None = None
     try:
+        from config.factory import build_steering_calibration
+        from config.loader import load_car_config
+
+        car_config = load_car_config(args.config)
         speed_profile = CompetitionTrackSpeedProfile(
             args.ab_speed_cm_s,
             args.bc_speed_cm_s,
@@ -125,6 +135,21 @@ def main(
                 calibration_timeout_s=args.calibration_timeout,
                 radar_center_behind_a_cm=args.radar_center_behind_a_cm,
                 speed_cm_s=speed_profile.max_speed_cm_s,
+                motor_device=car_config.devices.motor.port,
+                wheelbase_mm=car_config.vehicle.geometry.wheelbase_mm,
+                physical_track_width_mm=(
+                    car_config.vehicle.geometry.physical_track_width_mm
+                ),
+                firmware_track_width_mm=(
+                    car_config.vehicle.drive.firmware_track_width_mm
+                ),
+                min_turn_radius_mm=(
+                    car_config.vehicle.drive.min_turn_radius_mm
+                ),
+                allow_in_place_rotation=(
+                    car_config.vehicle.drive.allow_in_place_rotation
+                ),
+                steering_calibration=build_steering_calibration(car_config),
             ),
             speed_profile,
         )

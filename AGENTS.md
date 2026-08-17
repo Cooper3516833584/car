@@ -1,9 +1,15 @@
-ROCK 5A ssh地址 radxa@192.168.31.224  密码11223344
+ROCK 5A ssh地址 user@CAR_IP（真实地址/密码只放在不提交 Git 的本地说明里）
 所有代码应位于\car\code内
 
 ## 代码目录约定
 
-- 正式上位机入口为 `code/main.py`。
+- 正式比赛入口为 `code/main_task1.py`（任务1）与 `code/main_task2.py`（任务2），
+  两者共用比赛核心 `code/main_radar_camera_line_following.py`。
+  `code/main_fixed_track_test.py` 是雷达-only 回退入口；
+  旧的坐标导航 main 已归档到 `code/former_code/radar_point_navigation.py`，
+  不要再创建新的 `code/main.py`。
+- 统一车辆配置为 TOML：`configs/*.toml`（加载器在 `code/config/`），
+  硬件抽象层在 `code/hal/`；业务组件不得自行读取 TOML，必须由上层注入。
 - 可复用硬件组件统一放在 `code/components/`。
 - 单元测试、实车联调脚本、临时程序、一次性配置工具和试验补丁统一放在 `code/test/`，不得混入正式组件目录。
 - 正式驱动组件为 `code/components/rear_motor.py`（后轮）、`code/components/steering_servo.py`（前轮舵机）和 `code/components/ackermann_drive.py`（车速/偏航统一控制），详细接口、限制及资料依据见 `code/README.md`。
@@ -14,7 +20,7 @@ ROCK 5A ssh地址 radxa@192.168.31.224  密码11223344
 - ROCK 5A 通过 USB 连接 WHEELTEC L150/C10B 驱动板，设备为 `/dev/ttyACM0`，波特率 `115200`。
 - C10B 接收 11 字节速度帧：`7B 00 00 VX_H VX_L 00 00 VZ_H VZ_L BCC 7D`，其中 BCC 是前 9 字节异或；例如直行 `100 mm/s`：`7B 00 00 00 64 00 00 00 00 1F 7D`。
 - 电机使能由驱动板 `KEY2` 控制。串口遥测帧第 2 字节为 `00` 时已使能，`01` 时电机被关闭；测试前先确认其为 `00`。
-- 左后轮接左侧带编码器电机接口，右后轮接右侧带编码器电机接口。ROCK 5A 上的低速、自动停止测试程序：`/home/radxa/wheel_test.py`；本地源文件为 `code/test/wheel_test.py`。
+- 左后轮接左侧带编码器电机接口，右后轮接右侧带编码器电机接口。ROCK 5A 上的低速、自动停止测试程序：`/path/to/car/code/test/wheel_test.py`；本地源文件为 `code/test/wheel_test.py`。
 - C10B 阿克曼固件只接收 `Vx/Vz`，不接收原始左右轮目标。正式组件将左右轮目标逆变换为 `Vx=(left+right)/2`、`Vz=(right-left)/0.164`。常规阿克曼行驶仍执行 `0.350 m` 最小转弯半径限制；2026-07-25 起，3×5 相邻格任务明确允许以独立配置开启 `Vx=0`、左右后轮等速反向的原地旋转。原地旋转前必须停车并将前轮回正，以雷达航向闭环，到角度后立即停止；普通 Navigation 不得隐式启用该例外。
 
 ## 前轮转向舵机（阿克曼）
@@ -28,7 +34,7 @@ ROCK 5A ssh地址 radxa@192.168.31.224  密码11223344
   实测中位。2026-07-22 实车日志与前轮目测确认本车舵机/连杆方向和厂家车辆方向相反，
   必须使用 `calibration_theta=-vehicle_theta`，不可再当作待确认项。逻辑车辆范围因此为
   `-0.32 .. +0.49 rad`，负数右转、正数左转。
-- ROCK 5A 程序：`/home/radxa/steering_servo_test.py`；本地源文件：`code/test/steering_servo_test.py`。可执行 `sudo python3 /home/radxa/steering_servo_test.py --sweep` 做小幅左右回中测试。
+- ROCK 5A 程序：`/path/to/car/code/test/steering_servo_test.py`；本地源文件：`code/test/steering_servo_test.py`。可执行 `sudo python3 /path/to/car/code/test/steering_servo_test.py --sweep` 做小幅左右回中测试。
 - 正式舵机组件使用厂家三次标定表、反向安装修正和本车 `+79 us` 中位修正；正角为
   左偏航、负角为右偏航，逻辑范围 `-0.32 .. +0.49 rad`，当前对应
   `-0.12/0/+0.12 rad -> 1454/1580/1728 us`。
@@ -50,7 +56,7 @@ ROCK 5A ssh地址 radxa@192.168.31.224  密码11223344
 - 2026-07-22 已通过官方 `rsetup` 启用 `rk3588-uart6-m1.dtbo` 并重启；当前
   `/boot/extlinux/extlinux.conf` 同时保留 `rk3588-pwm0-m2.dtbo` 与
   `rk3588-uart6-m1.dtbo`，设备 `/dev/ttyS6` 已出现，属组 `dialout`。修改前启动配置
-  备份为 `/boot/extlinux/extlinux.conf.codex-before-uart6-20260722`。
+  备份为 `/boot/extlinux/extlinux.conf.backup-before-uart6`。
 - 只读探针 `code/test/d500_uart_probe.py` 可验证 UART、`54 2C` 帧、CRC、完整圆周及
   可选矩形拟合。2026-07-22 实测 6 秒收到 `2498` 个有效包、`59` 个完整圆周、
   `0` 个 CRC 错误，启动矩形拟合成功；探针不访问驱动板、舵机或电机。
@@ -141,7 +147,7 @@ ROCK 5A ssh地址 radxa@192.168.31.224  密码11223344
 
 ## 地面站 HC-14 串口通信（2026-07-21）
 
-- 地面站树莓派：`cooper@192.168.31.107`；无线模块为 CH340/HC-14，稳定设备路径为 `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0`，映射到 `/dev/ttyUSB0`。
+- 地面站树莓派：`user@GROUND_STATION_IP`（真实地址见本地说明）；无线模块为 CH340/HC-14，稳定设备路径为 `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0`，映射到 `/dev/ttyUSB0`。
 - 小车 ROCK 5A 测试架新插入模块：`/dev/ttyUSB0`，稳定路径为 `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0`，USB 标识为 CH340（`1a86_USB_Serial`）。小车驱动板仍固定使用 `/dev/ttyACM0`，两者不可混用。
 - HC-14 透明传输必须使用 `115200 8N1`，关闭流控并在打开串口前后明确清除 `DTR`、`RTS`；地面站既定无线参数为 `B115200 / C28 / S8 / +20 dBm`。
 - 小车新模块最初实测为 `B9600 / C28 / S8 / +20 dBm`，因此首次透明传输双向各 3 条均为 `0/3`。2026-07-21 已发送 `AT+B115200`，回读确认其当前参数为 `B115200 / C28 / S8 / +20 dBm`，与地面站一致。
@@ -151,44 +157,33 @@ ROCK 5A ssh地址 radxa@192.168.31.224  密码11223344
 - 本地双向测试程序：`code/test/hc14_ground_link_test.py`；只读 AT 查询程序：`code/test/hc14_at_probe.py`；经明确授权后使用的单项波特率设置及回读工具：`code/test/hc14_set_baud.py`。测试程序只发送低频 ASCII 探针，不发送小车、飞控或任务控制帧。
 - 本节资料依据：`C:\Users\TZDEZACR\Desktop\ground_station\details.md`、地面站项目的既有 HC-14 联调记录，以及 HC-14 V1.0 厂商用户手册；最终参数和 `5/5` 双向结果均为本车与当前地面站的现场实测。
 
-## 正式 main 启动标定与坐标命令（2026-07-22）
+## 正式比赛入口与配置化（当前结构）
 
-- 正常自主导航巡航速度集中定义在 `code/main.py` 顶部的
-  `NAVIGATION_CRUISE_SPEED_CM_S`，单位 `cm/s`；调整速度只修改此处，主程序传给底层
-  控制器时乘以 `10` 转为 `mm/s`。正式 main 按
-  `max(30, 1.20 × 巡航速度) cm/s` 自动配置单轮限幅，为阿克曼外侧轮保留余量；巡航
-  速度只允许 `0～100 cm/s`，超出范围必须在启动时拒绝。底层通用组件默认单轮限幅
-  仍为 `30 cm/s`，任何超限命令仍须整条拒绝，禁止静默缩放。
-- 正式 main 的倒车默认开关是 `code/main.py` 顶部的
-  `NAVIGATION_ALLOW_REVERSE`，当前为 `True`；`--no-reverse` 可在单次启动中临时关闭，
-  `--allow-reverse` 可显式开启。倒车换挡仍必须先停车至少 `0.25 s`。
-- `code/main.py` 启动时车辆必须静止；先收集 D500 完整圆周并拟合矩形场地四边，再将
-  点云、墙线参考、矩形边界和后续 ICP 位姿一起重基准：启动后轴中心为 `(0,0) cm`，
-  启动车头为 `0°`，`+X` 指向启动车头、`+Y` 在其左侧，Navigation 航向俯视逆时针
-  为正。墙边与车头存在夹角时必须保留旋转后的矩形多边形，禁止只把显示角度清零。
-- 矩形可靠拟合完成前不得打开 HC-14 任务入口或启动电机控制。拟合矩形之外的网格
-  必须全部视为障碍，禁止规划器从墙外绕行；目标坐标也必须位于拟合边界内。
-- 雷达安装参数 `--radar-x-cm/--radar-y-cm/--radar-yaw-cw-deg` 都以后轴中心和车头
-  为基准；默认全零仅适用于测量原点与后轴中心重合且雷达零角与车头一致的安装。
-- 坐标任务沿用 GroundStationLink V2 鉴权帧，新增业务命令 `NAVIGATE_TO=0x20`：
-  `command_id:u8, flags:u8, x_cm:i32LE, y_cm:i32LE, [heading_centideg:u16LE]`；flags bit0
-  表示可选最终航向，角度范围 `0..35999`、单位 `0.01°`、俯视逆时针为正。
-  `STOP_MISSION=5` 取消任务；重复 `(session,seq)` 不得重复执行。
-- 命令中的坐标/航向必须已经位于本次 main 启动建立的场地坐标系；若无人机使用其他
-  原点或方向，发送端必须先应用已标定的 SE(2) 变换，车端禁止猜测该变换。
-- `GROUND_STATION_HMAC_KEY_HEX` 至少 16 字节，只能从环境变量加载，禁止硬编码。
-  当前地面站原代码没有 `0x20`，发送端需按 `code/README.md` 的格式同步扩展。
-- SSH TTY 为正式本地任务入口。建图完成后打印明确提示和场地四角，接受
-  `x_cm y_cm [heading_deg]`；`x/y` 单位 cm，可选航向必须是 `0..359` 整数。还必须
-  支持 `status/stop/help/quit`，同一时间只能执行一个任务，场地多边形外目标必须拒绝。
-  没有 HMAC 环境变量时只关闭 HC-14，严禁降级为未鉴权无线控制，SSH 入口仍可使用。
-- 主程序当前默认允许倒车，可用 `--no-reverse` 临时关闭；退出、停止、定位丢失、规划
-  失败或异常均必须停车回中。当前运行地图假定静态矩形，累计动态障碍不自动衰减。
-- 每次任务进入 `ARRIVED/FAILED/BLOCKED` 后，main 必须清除本次目标并回到可接收下一
-  坐标的 `IDLE`；只清任务状态，必须保留启动矩形地图、雷达累计位姿和本次启动定义的
-  `(0,0,0°)` 原点。下一任务从当前位姿重新规划，禁止重新建图或把结束点重设为原点。
-- `code/main.py` 的详细运行日志固定默认写入其同级 `code/logs/car-main.log`；板端对应
-  `/home/radxa/car/logs/car-main.log`。文件级别始终为 DEBUG，单文件 `20 MiB`、保留
-  `10` 个轮转备份，终端级别仍由 `--log-level` 控制。日志须包含雷达 ICP/墙线、位姿、
-  地图刷新、规划摘要及控制周期的误差/舵角/PWM/后轮/C10B 输出，但不得记录 HMAC 密钥
-  或逐点转储整圈点云。`code/logs/` 必须保持在 `.gitignore` 中。
+- 正式比赛入口为 `code/main_task1.py` / `code/main_task2.py`，共用比赛核心
+  `code/main_radar_camera_line_following.py`（D500 建图 → 起步接近 A → 雷达主导、
+  相机有限纠偏跑一圈 → FleetBus 相对位置上报）。所有车辆数据（设备串口、PWM/GPIO、
+  几何、舵机标定、雷达/相机安装、任务速度、比赛控制调参）来自 TOML
+  `configs/cooper_rock5a_l150.toml`（加载器 `code/config/`）。
+- 换车/换板只改 TOML 或在 `code/hal/` 增加 backend，禁止在比赛主程序里写
+  `if board == "rock5a": ...`。
+- 舵机标定与 PWM 设备已从 `components/steering_servo.py` 拆出：
+  标定数据走 `SteeringCalibration`（来自 `[vehicle.steering]`），PWM 走
+  `code/hal/pwm.py`（来自 `[hardware.steering_pwm]`）。回归值保持不变：
+  `-0.12/0/+0.12 rad -> 1454/1580/1728 us`。
+- 声光报警 GPIO 已拆到 `code/hal/gpio.py`（来自 `[hardware.alarm_gpio]`，
+  `active_low=true`：报警开=GPIO 低）。
+- 两套轮距是独立参数，禁止合并：`vehicle.geometry.physical_track_width_mm`
+  （实测 117.1，用于物理几何）与 `vehicle.drive.firmware_track_width_mm`
+  （固件 164，用于 `Vz=(right-left)/firmware_track`）。
+- 串口屏现场切换 `radar_center_behind_a_cm`（20 / 36.5）写入 runtime state
+  `runtime/car_state.json`（`code/config/runtime_state.py`），不重写 TOML；
+  优先级 CLI > runtime state > TOML。
+- 旧的“坐标导航 main（SSH 输入 x y heading、NAVIGATE_TO=0x20、HMAC 鉴权）”
+  属于已归档的 `code/former_code/radar_point_navigation.py` 历史实现，当前比赛
+  结构不再使用 `code/main.py`，不要重建该文件。
+- 运行日志：`code/main_radar_camera_line_following.py` 写入其同级
+  `code/logs/car-main.log`；板端 `/path/to/car/logs/car-main.log`。文件级别始终
+  DEBUG，单文件 `20 MiB`、保留 `10` 个轮转备份，终端级别由 `--log-level` 控制。
+  日志须包含雷达 ICP/墙线、位姿、地图刷新、规划摘要及控制周期的
+  误差/舵角/PWM/后轮/C10B 输出，但不得记录 HMAC 密钥或逐点转储整圈点云。
+  `code/logs/` 必须保持在 `.gitignore` 中。

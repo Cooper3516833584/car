@@ -23,6 +23,18 @@ import sys
 import threading
 import time
 
+from components.ackermann_drive import DEFAULT_HARDWARE_LOCK_PATH
+from components.vehicle_defaults import (
+    DEFAULT_BODY_LENGTH_MM,
+    DEFAULT_BODY_WIDTH_MM,
+    DEFAULT_FIRMWARE_TRACK_WIDTH_MM,
+    DEFAULT_MIN_TURN_RADIUS_MM,
+    DEFAULT_OUTER_WHEEL_WIDTH_MM,
+    DEFAULT_PHYSICAL_TRACK_WIDTH_MM,
+    DEFAULT_REAR_AXLE_TO_BODY_CENTER_MM,
+    DEFAULT_WHEEL_THICKNESS_MM,
+    DEFAULT_WHEELBASE_MM,
+)
 from components import (
     AckermannDrive,
     CompetitionTrack,
@@ -32,7 +44,6 @@ from components import (
     DEFAULT_HC14_PORT,
     D500RadarComponent,
     LineVisionConfig,
-    PerspectiveConfig,
     Pose2D,
     RadarLocalizationUpdate,
     RadarMount,
@@ -41,8 +52,6 @@ from components import (
     SerialCommunicationDriver,
     SoundLightAlarm,
     AlarmGPIOError,
-    alarm_off,
-    alarm_on,
     TrackFollowerState,
     TrackSegment,
     WallFusionConfig,
@@ -68,87 +77,21 @@ from components.navigation import (
     NavigationState,
     radar_yaw_to_navigation_heading,
 )
+from components.steering_servo import (
+    DEFAULT_STEERING_CALIBRATION,
+    SteeringCalibration,
+)
+from config.loader import load_car_config
+from config.models import MissionControlConfig
 
-
-# Fixed-track segment speeds. Change these four values for the next real-car
-# run; the stable steering/camera parameters below are not changed.
-AB_TRACK_SPEED_CM_S = 8.0
-BC_TRACK_SPEED_CM_S = 15.0
-CD_TRACK_SPEED_CM_S = 20.0
-DA_TRACK_SPEED_CM_S = 15.0
 
 # FleetBus position reports are replies to the read-only ground-station POLL.
 # Coordinates are centimetres relative to this run's radar-rebased start pose.
-FLEET_POSITION_REPORTING_ENABLED = True
 FLEET_POSITION_STALE_TIMEOUT_S = 0.5
 
-# The rules place the physical front of the car on A.  With the measured
-# 23.0 cm body and the rear axle 7.125 cm behind its centre, the rear axle is
-# 18.625 cm behind that front reference. The rear axle first approaches A by
-# this distance, then follows the painted centreline and finishes at A.
-RADAR_CENTER_BEHIND_A_ALONG_AB_CM = 20
-
-# Camera correction stays filtered and gated, but must be strong enough to
-# overcome the repeatable radar bias once the line error is already large.
-CAMERA_CORRECTION_ENABLED = True
-CAMERA_LATERAL_DEADBAND_CM = 10.0
-CAMERA_STEERING_GAIN_RAD_PER_CM = 0.010
-CAMERA_MAX_STEERING_CORRECTION_RAD = 0.140
-
-# Strong camera-heading alignment for an imperfect initial pose at A.  The
-# start line/marker is explicitly rejected; once the longitudinal AB line is
-# reliable, use its fitted heading to square the car before the first curve.
-AB_START_ALIGNMENT_FULL_END_PROGRESS_CM = 80.0
-AB_START_ALIGNMENT_FADE_END_PROGRESS_CM = 100.0
-AB_START_HEADING_GAIN = 1.30
-AB_START_MAX_HEADING_CORRECTION_RAD = 0.180
-AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD = 0.220
-AB_START_MIN_VALID_FRAMES = 2
-AB_START_MAX_CURVATURE_PER_CM = 0.003
-AB_START_MAX_FORWARD_HEADING_CHANGE_RAD = 0.080
-
-# On the first AB only, fill the normal 10 cm camera deadband with a smaller,
-# bounded lateral assist while a robust mission-frame lateral alignment is
-# learned.  The alignment is translation-only: radar still supplies every
-# motion update and heading, while vision contributes one fixed bounded Y
-# offset shared by Pure Pursuit and FleetBus through most of the lap. It fades
-# back to raw radar near the final A so a startup-only bias cannot move the
-# physical stopping line.
-AB_LINE_ASSIST_FULL_END_PROGRESS_CM = 100.0
-AB_LINE_ASSIST_FADE_END_PROGRESS_CM = 135.0
-AB_LINE_ASSIST_LATERAL_DEADBAND_CM = 2.0
-AB_LINE_ASSIST_GAIN_RAD_PER_CM = 0.005
-AB_LINE_ASSIST_MAX_CORRECTION_RAD = 0.060
-AB_LINE_ASSIST_MIN_VALID_FRAMES = 3
-AB_LINE_ASSIST_MAX_CURVATURE_PER_CM = 0.004
-AB_LINE_ASSIST_MAX_FORWARD_HEADING_CHANGE_RAD = 0.100
-
-AB_LATERAL_ALIGNMENT_LEARNING_START_PROGRESS_CM = 50.0
-AB_LATERAL_ALIGNMENT_LEARNING_END_PROGRESS_CM = 90.0
-AB_LATERAL_ALIGNMENT_RAMP_START_PROGRESS_CM = 60.0
-AB_LATERAL_ALIGNMENT_FULL_PROGRESS_CM = 100.0
-AB_LATERAL_ALIGNMENT_TERMINAL_FADE_DISTANCE_CM = 65.0
-AB_LATERAL_ALIGNMENT_MIN_VALID_FRAMES = 4
-AB_LATERAL_ALIGNMENT_REQUIRED_MEASUREMENTS = 5
-AB_LATERAL_ALIGNMENT_MAX_ABS_OFFSET_CM = 12.0
-AB_LATERAL_ALIGNMENT_MAX_MAD_CM = 1.5
-AB_LATERAL_ALIGNMENT_MAX_CURVATURE_PER_CM = 0.003
-AB_LATERAL_ALIGNMENT_MAX_FORWARD_HEADING_CHANGE_RAD = 0.080
-
-# The 60-degree camera mount makes the entrance of the first right semicircle
-# look like a persistent right-side line offset.  Keep that ambiguous
-# same-direction correction weak instead of adding it fully to radar steering.
-BC_ENTRY_LIMIT_END_PROGRESS_CM = 210.0
-BC_ENTRY_MIN_RIGHT_CORRECTION_RAD = -0.012
-
-# Keep the last trustworthy line observation near A only as an independent
-# terminal-quality check. It no longer adds a course-specific steering trim.
-FINAL_DA_VISUAL_WINDOW_CM = 65.0
-FINAL_DA_VISUAL_HOLD_S = 0.65
-FINAL_A_MAX_CAMERA_ERROR_CM = 6.0
+# FleetBus operation-state value reported when the terminal camera/radar
+# disagreement makes the reported pose untrustworthy (protocol semantics).
 CAR_OPERATION_LOCALIZATION_LOST = 10
-FLEET_TERMINAL_REPORT_GRACE_S = 3.0
-FLEET_TRACE_DRAIN_TIMEOUT_S = 6.0
 
 
 LOG = logging.getLogger("radar-camera-line-main")
@@ -156,8 +99,6 @@ LOG_FILENAME = "car-main.log"
 LOG_MAX_BYTES = 20 * 1024 * 1024
 LOG_BACKUP_COUNT = 10
 _LOG_LISTENER: QueueListener | None = None
-MIN_VEHICLE_STEERING_RAD = -0.32
-MAX_VEHICLE_STEERING_RAD = 0.336
 
 
 def default_log_dir() -> Path:
@@ -240,47 +181,58 @@ def _camera_source(value: str) -> int | str:
     return source
 
 
-def _default_correction_config() -> CameraLineCorrectionConfig:
-    return CameraLineCorrectionConfig(
-        lateral_deadband_cm=CAMERA_LATERAL_DEADBAND_CM,
-        steering_gain_rad_per_cm=CAMERA_STEERING_GAIN_RAD_PER_CM,
-        maximum_abs_correction_rad=CAMERA_MAX_STEERING_CORRECTION_RAD,
-    )
-
-
 @dataclass(frozen=True, slots=True)
 class MainConfig:
     radar_port: str = DEFAULT_D500_PORT
     radar_mount: RadarMount = RadarMount()
     startup_scan_count: int = 3
     calibration_timeout_s: float = 30.0
-    radar_center_behind_a_cm: float = (
-        RADAR_CENTER_BEHIND_A_ALONG_AB_CM
-    )
-    ab_speed_cm_s: float = AB_TRACK_SPEED_CM_S
-    bc_speed_cm_s: float = BC_TRACK_SPEED_CM_S
-    cd_speed_cm_s: float = CD_TRACK_SPEED_CM_S
+    radar_center_behind_a_cm: float = 20.0
+    ab_speed_cm_s: float = 8.0
+    bc_speed_cm_s: float = 15.0
+    cd_speed_cm_s: float = 20.0
     cd_second_speed_cm_s: float | None = None
-    da_speed_cm_s: float = DA_TRACK_SPEED_CM_S
+    da_speed_cm_s: float = 15.0
     camera_source: int | str = 0
-    camera_correction_enabled: bool = CAMERA_CORRECTION_ENABLED
+    camera_correction_enabled: bool = True
     camera_correction: CameraLineCorrectionConfig = (
         CameraLineCorrectionConfig(
-            lateral_deadband_cm=CAMERA_LATERAL_DEADBAND_CM,
-            steering_gain_rad_per_cm=CAMERA_STEERING_GAIN_RAD_PER_CM,
-            maximum_abs_correction_rad=(
-                CAMERA_MAX_STEERING_CORRECTION_RAD
-            ),
+            lateral_deadband_cm=10.0,
+            steering_gain_rad_per_cm=0.010,
+            maximum_abs_correction_rad=0.140,
         )
     )
-    fleet_position_reporting_enabled: bool = (
-        FLEET_POSITION_REPORTING_ENABLED
-    )
+    fleet_position_reporting_enabled: bool = True
     fleet_link_port: str = DEFAULT_HC14_PORT
     fleet_position_only: bool = False
     fleet_wait_for_start: bool = False
     fleet_mission_request_state: int | None = None
     completion_alarm_seconds: float = 0.0
+    # Course-control tuning from [missions.control] (camera mount dependent).
+    mission_control: MissionControlConfig = MissionControlConfig()
+    # Steering clamp applied after camera fusion; derived from the profile by
+    # the composition root (servo right bound / geometry left bound).
+    vehicle_steering_min_rad: float = -0.32
+    vehicle_steering_max_rad: float = 0.336
+    fleet_terminal_report_grace_s: float = 3.0
+    fleet_trace_drain_timeout_s: float = 6.0
+    # Current front-camera vision calibration (device + perspective + line
+    # tuning) built from [devices.camera] and [sensors.camera].
+    vision_config: LineVisionConfig = LineVisionConfig()
+    # Unified drive construction data from [devices.motor] / [vehicle].
+    motor_device: str = ""
+    wheelbase_mm: float = DEFAULT_WHEELBASE_MM
+    physical_track_width_mm: float = DEFAULT_PHYSICAL_TRACK_WIDTH_MM
+    firmware_track_width_mm: float = DEFAULT_FIRMWARE_TRACK_WIDTH_MM
+    min_turn_radius_mm: float = DEFAULT_MIN_TURN_RADIUS_MM
+    allow_in_place_rotation: bool = False
+    steering_calibration: SteeringCalibration = DEFAULT_STEERING_CALIBRATION
+    hardware_lock_path: str | None = DEFAULT_HARDWARE_LOCK_PATH
+    # Alarm GPIO from [hardware.alarm_gpio].
+    alarm_sysfs_root: str = "/sys/class/gpio"
+    alarm_bank_label: str = "gpio4"
+    alarm_line_offset: int = 11
+    alarm_active_low: bool = True
 
     def __post_init__(self) -> None:
         if self.startup_scan_count <= 0:
@@ -331,6 +283,19 @@ class MainConfig:
             raise ValueError(
                 "completion_alarm_seconds must be finite and non-negative"
             )
+        if (
+            not math.isfinite(self.vehicle_steering_min_rad)
+            or not math.isfinite(self.vehicle_steering_max_rad)
+            or self.vehicle_steering_min_rad > self.vehicle_steering_max_rad
+        ):
+            raise ValueError("vehicle steering clamp must be finite and ordered")
+        for name in (
+            "fleet_terminal_report_grace_s",
+            "fleet_trace_drain_timeout_s",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
 
     @property
     def speed_profile(self) -> CompetitionTrackSpeedProfile:
@@ -421,8 +386,16 @@ class RadarCameraLineApplication:
             config.speed_profile.max_speed_cm_s * 12.0,
             (config.cd_second_speed_cm_s or 0.0) * 12.0,
         )
-        self.drive = AckermannDrive(
+        self.drive = AckermannDrive.from_config(
+            device=config.motor_device,
+            wheelbase_mm=config.wheelbase_mm,
+            track_width_mm=config.physical_track_width_mm,
+            firmware_track_width_mm=config.firmware_track_width_mm,
             max_wheel_speed_mm_s=max_wheel_speed_mm_s,
+            min_turn_radius_mm=config.min_turn_radius_mm,
+            allow_in_place_rotation=config.allow_in_place_rotation,
+            steering_calibration=config.steering_calibration,
+            hardware_lock_path=config.hardware_lock_path,
         )
         self.track = CompetitionTrack.build(
             reference_offset_cm=config.radar_center_behind_a_cm,
@@ -531,39 +504,14 @@ class RadarCameraLineApplication:
                 error_code=self._fleet_error_code,
             )
 
-    @staticmethod
-    def _front_camera_vision_config() -> LineVisionConfig:
-        """Calibration for the current low-mounted, steep front camera."""
+    def _front_camera_vision_config(self) -> LineVisionConfig:
+        """Return the current front-camera vision calibration.
 
-        return LineVisionConfig(
-            perspective=PerspectiveConfig(
-                source_points_norm=(
-                    (0.02, 0.66),
-                    (0.93, 0.66),
-                    (0.68, 0.02),
-                    (0.23, 0.02),
-                ),
-                output_width_px=320,
-                output_height_px=400,
-                ground_width_cm=80.0,
-                ground_depth_cm=100.0,
-            ),
-            require_adaptive_confirmation=False,
-            scan_near_cm=12.0,
-            scan_far_cm=72.0,
-            minimum_band_fill_ratio=0.20,
-            use_expected_width_window=True,
-            expected_line_width_cm=28.0,
-            minimum_line_width_cm=10.0,
-            maximum_line_width_cm=40.0,
-            maximum_line_internal_gap_cm=8.0,
-            maximum_center_jump_cm=18.0,
-            morphology_close_size=9,
-            polynomial_smoothing_alpha=0.32,
-            transverse_stop_max_height_cm=8.0,
-            round_marker_min_height_cm=12.0,
-            continuity_weight=0.12,
-        )
+        The values come from the TOML ``[devices.camera]`` and
+        ``[sensors.camera]`` sections via ``MainConfig.vision_config``; a
+        student who moves/re-calibrates the camera only edits the profile.
+        """
+        return self.config.vision_config
 
     def run(self) -> None:
         LOG.info(
@@ -648,16 +596,16 @@ class RadarCameraLineApplication:
                 LOG.info(
                     "holding stopped state for %.1fs so D500 localization "
                     "and FleetBus can publish the terminal pose",
-                    FLEET_TERMINAL_REPORT_GRACE_S,
+                    self.config.fleet_terminal_report_grace_s,
                 )
-                self._stop_event.wait(FLEET_TERMINAL_REPORT_GRACE_S)
+                self._stop_event.wait(self.config.fleet_terminal_report_grace_s)
                 if self.fleet_node is not None and not self._stop_event.is_set():
                     LOG.info(
                         "waiting up to %.1fs for FleetBus terminal trace drain",
-                        FLEET_TRACE_DRAIN_TIMEOUT_S,
+                        self.config.fleet_trace_drain_timeout_s,
                     )
                     drained = self.fleet_node.wait_for_trace_drain(
-                        FLEET_TRACE_DRAIN_TIMEOUT_S,
+                        self.config.fleet_trace_drain_timeout_s,
                         cancel_event=self._stop_event,
                     )
                     if drained:
@@ -803,10 +751,19 @@ class RadarCameraLineApplication:
         LOG.info("task 2 CD speed switched to %.1f cm/s", speed_cm_s)
         return FleetCommandResult(FleetAckStatus.COMPLETED)
 
+    def _build_alarm(self) -> SoundLightAlarm:
+        """Build the alarm from the profile's [hardware.alarm_gpio] section."""
+        return SoundLightAlarm(
+            sysfs_gpio_root=self.config.alarm_sysfs_root,
+            bank_label=self.config.alarm_bank_label,
+            line_offset=self.config.alarm_line_offset,
+            active_low=self.config.alarm_active_low,
+        )
+
     def _fleet_set_alarm(self, active: bool) -> FleetCommandResult:
         try:
             if self._alarm is None:
-                self._alarm = SoundLightAlarm()
+                self._alarm = self._build_alarm()
                 if not self._alarm.is_initialized:
                     self._alarm.initialize()
             self._alarm.set_active(active)
@@ -830,8 +787,9 @@ class RadarCameraLineApplication:
         ):
             self.radar.close()
             raise RuntimeError(
-                f"D500 UART {self.config.radar_port} could not be opened; "
-                "verify UART6-M1, Pin 21 RX wiring and dialout permission"
+                f"cannot open configured radar serial device "
+                f"{self.config.radar_port}; check the device path, serial "
+                "permissions and the board UART wiring/overlay"
             )
         fitted = self._wait_for_rectangle_calibration()
         calibration = rebase_calibration_to_start_pose(fitted)
@@ -865,8 +823,8 @@ class RadarCameraLineApplication:
     def _wait_for_rectangle_calibration(self):
         deadline = time.monotonic() + self.config.calibration_timeout_s
         last_error = (
-            f"D500 UART {self.config.radar_port} is open but no complete "
-            "scan arrived"
+            f"radar serial device {self.config.radar_port} is open but no "
+            "complete scan arrived"
         )
         while not self._stop_event.is_set() and time.monotonic() < deadline:
             self._scan_event.wait(0.5)
@@ -934,6 +892,7 @@ class RadarCameraLineApplication:
         """Return radar pose plus one robust first-AB lateral translation."""
 
         now = time.monotonic() if now_s is None else float(now_s)
+        control = self.config.mission_control
         camera_state = self.camera_corrector.state
         observation = camera_state.observation
         with self._lock:
@@ -948,12 +907,12 @@ class RadarCameraLineApplication:
             and follower_state.running
             and not follower_state.completed
             and follower_state.segment is TrackSegment.AB
-            and AB_LATERAL_ALIGNMENT_LEARNING_START_PROGRESS_CM
+            and control.ab_lateral_alignment_learning_start_progress_cm
             <= follower_state.progress_cm
-            < AB_LATERAL_ALIGNMENT_LEARNING_END_PROGRESS_CM
+            < control.ab_lateral_alignment_learning_end_progress_cm
             and camera_state.active
             and camera_state.valid_frames
-            >= AB_LATERAL_ALIGNMENT_MIN_VALID_FRAMES
+            >= control.ab_lateral_alignment_min_valid_frames
             and (
                 last_camera_timestamp_s is None
                 or camera_state.timestamp_s > last_camera_timestamp_s
@@ -973,10 +932,10 @@ class RadarCameraLineApplication:
             and not observation.transverse_line_detected
             and math.isfinite(observation.curvature_per_cm)
             and abs(observation.curvature_per_cm)
-            <= AB_LATERAL_ALIGNMENT_MAX_CURVATURE_PER_CM
+            <= control.ab_lateral_alignment_max_curvature_per_cm
             and math.isfinite(observation.forward_heading_change_rad)
             and abs(observation.forward_heading_change_rad)
-            <= AB_LATERAL_ALIGNMENT_MAX_FORWARD_HEADING_CHANGE_RAD
+            <= control.ab_lateral_alignment_max_forward_heading_change_rad
         )
         if learning_allowed:
             # Positive camera error requests a left correction, meaning the
@@ -987,7 +946,7 @@ class RadarCameraLineApplication:
             )
             if (
                 abs(measured_offset_cm)
-                <= AB_LATERAL_ALIGNMENT_MAX_ABS_OFFSET_CM
+                <= control.ab_lateral_alignment_max_abs_offset_cm
             ):
                 with self._lock:
                     self._ab_lateral_alignment_measurements_cm.append(
@@ -1010,7 +969,7 @@ class RadarCameraLineApplication:
                 )
                 if (
                     len(measurements)
-                    >= AB_LATERAL_ALIGNMENT_REQUIRED_MEASUREMENTS
+                    >= control.ab_lateral_alignment_required_measurements
                 ):
                     median_offset_cm = statistics.median(measurements)
                     median_absolute_deviation_cm = statistics.median(
@@ -1019,7 +978,7 @@ class RadarCameraLineApplication:
                     )
                     if (
                         median_absolute_deviation_cm
-                        <= AB_LATERAL_ALIGNMENT_MAX_MAD_CM
+                        <= control.ab_lateral_alignment_max_mad_cm
                     ):
                         with self._lock:
                             self._ab_lateral_alignment_offset_cm = (
@@ -1066,27 +1025,28 @@ class RadarCameraLineApplication:
         *,
         locked: bool,
     ) -> float:
+        control = self.config.mission_control
         if not locked:
             return 0.0
         if follower_state.completed:
             return 0.0
         progress_cm = follower_state.progress_cm
         remaining_cm = self.track.finish_progress_cm - progress_cm
-        if remaining_cm < AB_LATERAL_ALIGNMENT_TERMINAL_FADE_DISTANCE_CM:
+        if remaining_cm < control.ab_lateral_alignment_terminal_fade_distance_cm:
             return max(
                 0.0,
                 remaining_cm
-                / AB_LATERAL_ALIGNMENT_TERMINAL_FADE_DISTANCE_CM,
+                / control.ab_lateral_alignment_terminal_fade_distance_cm,
             )
-        if progress_cm <= AB_LATERAL_ALIGNMENT_RAMP_START_PROGRESS_CM:
+        if progress_cm <= control.ab_lateral_alignment_ramp_start_progress_cm:
             return 0.0
-        if progress_cm >= AB_LATERAL_ALIGNMENT_FULL_PROGRESS_CM:
+        if progress_cm >= control.ab_lateral_alignment_full_progress_cm:
             return 1.0
         return (
-            progress_cm - AB_LATERAL_ALIGNMENT_RAMP_START_PROGRESS_CM
+            progress_cm - control.ab_lateral_alignment_ramp_start_progress_cm
         ) / (
-            AB_LATERAL_ALIGNMENT_FULL_PROGRESS_CM
-            - AB_LATERAL_ALIGNMENT_RAMP_START_PROGRESS_CM
+            control.ab_lateral_alignment_full_progress_cm
+            - control.ab_lateral_alignment_ramp_start_progress_cm
         )
 
     def _on_follower_state(self, state: TrackFollowerState) -> None:
@@ -1098,6 +1058,7 @@ class RadarCameraLineApplication:
             self._follower_state = state
         if state.completed:
             now_s = time.monotonic()
+            control = self.config.mission_control
             with self._lock:
                 visual_error_cm = self._final_da_visual_error_cm
                 visual_timestamp_s = self._final_da_visual_timestamp_s
@@ -1105,9 +1066,9 @@ class RadarCameraLineApplication:
                     visual_error_cm is not None
                     and visual_timestamp_s is not None
                     and now_s - visual_timestamp_s
-                    <= FINAL_DA_VISUAL_HOLD_S
+                    <= control.final_da_visual_hold_s
                     and abs(visual_error_cm)
-                    > FINAL_A_MAX_CAMERA_ERROR_CM
+                    > control.final_a_max_camera_error_cm
                 )
                 self._terminal_camera_disagreement = (
                     disagreement
@@ -1153,7 +1114,10 @@ class RadarCameraLineApplication:
     def _run_completion_alarm(self) -> None:
         alarm = None
         try:
-            alarm = alarm_on()
+            alarm = self._build_alarm()
+            if not alarm.is_initialized:
+                alarm.initialize()
+            alarm.on()
             with self._completion_alarm_lock:
                 self._completion_alarm_device = alarm
             self._stop_event.wait(self.config.completion_alarm_seconds)
@@ -1164,7 +1128,10 @@ class RadarCameraLineApplication:
                 if alarm is not None:
                     alarm.off()
                 else:
-                    alarm_off()
+                    fallback = self._build_alarm()
+                    if not fallback.is_initialized:
+                        fallback.initialize()
+                    fallback.off()
             except Exception:
                 LOG.exception("failed to turn off MISSION1 completion alarm")
             finally:
@@ -1184,6 +1151,7 @@ class RadarCameraLineApplication:
         if not self.config.camera_correction_enabled:
             return float(radar_steering_rad)
         try:
+            control = self.config.mission_control
             now_s = time.monotonic()
             observed_correction = self.camera_corrector.correction_for_speed(
                 speed_cm_s,
@@ -1202,9 +1170,9 @@ class RadarCameraLineApplication:
                 elif abs(ab_line_assist) > abs(observed_correction):
                     lateral_camera_correction = ab_line_assist
             camera_correction = max(
-                -AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD,
+                -control.ab_start_max_total_camera_correction_rad,
                 min(
-                    AB_START_MAX_TOTAL_CAMERA_CORRECTION_RAD,
+                    control.ab_start_max_total_camera_correction_rad,
                     lateral_camera_correction + ab_start_alignment,
                 ),
             )
@@ -1214,8 +1182,8 @@ class RadarCameraLineApplication:
             correction = course_limited_correction
             combined = float(radar_steering_rad) + correction
             adjusted = max(
-                MIN_VEHICLE_STEERING_RAD,
-                min(MAX_VEHICLE_STEERING_RAD, combined),
+                self.config.vehicle_steering_min_rad,
+                min(self.config.vehicle_steering_max_rad, combined),
             )
             state = self.camera_corrector.state
             LOG.debug(
@@ -1249,6 +1217,7 @@ class RadarCameraLineApplication:
         *,
         now_s: float | None = None,
     ) -> float:
+        control = self.config.mission_control
         now = time.monotonic() if now_s is None else float(now_s)
         with self._lock:
             follower_state = self._follower_state
@@ -1259,10 +1228,10 @@ class RadarCameraLineApplication:
             or follower_state.completed
             or follower_state.segment is not TrackSegment.AB
             or follower_state.progress_cm
-            >= AB_START_ALIGNMENT_FADE_END_PROGRESS_CM
+            >= control.ab_start_alignment_fade_end_progress_cm
             or now - camera_state.timestamp_s
             > self.config.camera_correction.stale_timeout_s
-            or camera_state.valid_frames < AB_START_MIN_VALID_FRAMES
+            or camera_state.valid_frames < control.ab_start_min_valid_frames
             or observation is None
             or not observation.detected
             or not math.isfinite(observation.heading_error_rad)
@@ -1274,41 +1243,41 @@ class RadarCameraLineApplication:
             > self.config.camera_correction.maximum_fit_rmse_cm
             or not math.isfinite(observation.curvature_per_cm)
             or abs(observation.curvature_per_cm)
-            > AB_START_MAX_CURVATURE_PER_CM
+            > control.ab_start_max_curvature_per_cm
             or not math.isfinite(
                 observation.forward_heading_change_rad
             )
             or abs(observation.forward_heading_change_rad)
-            > AB_START_MAX_FORWARD_HEADING_CHANGE_RAD
+            > control.ab_start_max_forward_heading_change_rad
             or observation.round_marker_detected
             or observation.transverse_line_detected
         ):
             return 0.0
 
         fade_span_cm = (
-            AB_START_ALIGNMENT_FADE_END_PROGRESS_CM
-            - AB_START_ALIGNMENT_FULL_END_PROGRESS_CM
+            control.ab_start_alignment_fade_end_progress_cm
+            - control.ab_start_alignment_full_end_progress_cm
         )
         fade_scale = (
             1.0
             if follower_state.progress_cm
-            <= AB_START_ALIGNMENT_FULL_END_PROGRESS_CM
+            <= control.ab_start_alignment_full_end_progress_cm
             else max(
                 0.0,
                 (
-                    AB_START_ALIGNMENT_FADE_END_PROGRESS_CM
+                    control.ab_start_alignment_fade_end_progress_cm
                     - follower_state.progress_cm
                 )
                 / fade_span_cm,
             )
         )
         requested = (
-            AB_START_HEADING_GAIN
+            control.ab_start_heading_gain
             * float(observation.heading_error_rad)
         )
         bounded = max(
-            -AB_START_MAX_HEADING_CORRECTION_RAD,
-            min(AB_START_MAX_HEADING_CORRECTION_RAD, requested),
+            -control.ab_start_max_heading_correction_rad,
+            min(control.ab_start_max_heading_correction_rad, requested),
         )
         return bounded * fade_scale
 
@@ -1319,6 +1288,7 @@ class RadarCameraLineApplication:
     ) -> float | None:
         """Return first-AB steering assist while pose alignment ramps in."""
 
+        control = self.config.mission_control
         now = time.monotonic() if now_s is None else float(now_s)
         with self._lock:
             follower_state = self._follower_state
@@ -1329,11 +1299,11 @@ class RadarCameraLineApplication:
             or follower_state.completed
             or follower_state.segment is not TrackSegment.AB
             or follower_state.progress_cm
-            >= AB_LINE_ASSIST_FADE_END_PROGRESS_CM
+            >= control.ab_line_assist_fade_end_progress_cm
             or now - camera_state.timestamp_s
             > self.config.camera_correction.stale_timeout_s
             or camera_state.valid_frames
-            < AB_LINE_ASSIST_MIN_VALID_FRAMES
+            < control.ab_line_assist_min_valid_frames
             or observation is None
             or not observation.detected
             or not math.isfinite(observation.near_lateral_error_cm)
@@ -1345,12 +1315,12 @@ class RadarCameraLineApplication:
             > self.config.camera_correction.maximum_fit_rmse_cm
             or not math.isfinite(observation.curvature_per_cm)
             or abs(observation.curvature_per_cm)
-            > AB_LINE_ASSIST_MAX_CURVATURE_PER_CM
+            > control.ab_line_assist_max_curvature_per_cm
             or not math.isfinite(
                 observation.forward_heading_change_rad
             )
             or abs(observation.forward_heading_change_rad)
-            > AB_LINE_ASSIST_MAX_FORWARD_HEADING_CHANGE_RAD
+            > control.ab_line_assist_max_forward_heading_change_rad
             or observation.round_marker_detected
             or observation.transverse_line_detected
         ):
@@ -1359,27 +1329,27 @@ class RadarCameraLineApplication:
         magnitude = max(
             0.0,
             abs(float(observation.near_lateral_error_cm))
-            - AB_LINE_ASSIST_LATERAL_DEADBAND_CM,
+            - control.ab_line_assist_lateral_deadband_cm,
         )
         requested = math.copysign(
             min(
-                AB_LINE_ASSIST_MAX_CORRECTION_RAD,
-                AB_LINE_ASSIST_GAIN_RAD_PER_CM * magnitude,
+                control.ab_line_assist_max_correction_rad,
+                control.ab_line_assist_gain_rad_per_cm * magnitude,
             ),
             observation.near_lateral_error_cm,
         )
         fade_span_cm = (
-            AB_LINE_ASSIST_FADE_END_PROGRESS_CM
-            - AB_LINE_ASSIST_FULL_END_PROGRESS_CM
+            control.ab_line_assist_fade_end_progress_cm
+            - control.ab_line_assist_full_end_progress_cm
         )
         fade_scale = (
             1.0
             if follower_state.progress_cm
-            <= AB_LINE_ASSIST_FULL_END_PROGRESS_CM
+            <= control.ab_line_assist_full_end_progress_cm
             else max(
                 0.0,
                 (
-                    AB_LINE_ASSIST_FADE_END_PROGRESS_CM
+                    control.ab_line_assist_fade_end_progress_cm
                     - follower_state.progress_cm
                 )
                 / fade_span_cm,
@@ -1393,17 +1363,18 @@ class RadarCameraLineApplication:
         return requested * fade_scale * (1.0 - alignment_scale)
 
     def _apply_course_camera_limit(self, correction_rad: float) -> float:
+        control = self.config.mission_control
         with self._lock:
             state = self._follower_state
         if (
             state.running
             and not state.completed
             and state.segment is TrackSegment.BC
-            and state.progress_cm < BC_ENTRY_LIMIT_END_PROGRESS_CM
+            and state.progress_cm < control.bc_entry_limit_end_progress_cm
         ):
             return max(
                 float(correction_rad),
-                BC_ENTRY_MIN_RIGHT_CORRECTION_RAD,
+                control.bc_entry_min_right_correction_rad,
             )
         return float(correction_rad)
 
@@ -1419,7 +1390,8 @@ class RadarCameraLineApplication:
             and not follower_state.completed
             and follower_state.segment is TrackSegment.DA
             and follower_state.progress_cm
-            >= self.track.finish_progress_cm - FINAL_DA_VISUAL_WINDOW_CM
+            >= self.track.finish_progress_cm
+            - self.config.mission_control.final_da_visual_window_cm
             and state.active
             and state.valid_frames >= 2
             and observation is not None
@@ -1549,29 +1521,37 @@ class RadarCameraLineApplication:
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--radar-port", default=DEFAULT_D500_PORT)
-    parser.add_argument("--radar-x-cm", type=float, default=0.0)
-    parser.add_argument("--radar-y-cm", type=float, default=0.0)
-    parser.add_argument("--radar-yaw-cw-deg", type=float, default=0.0)
-    parser.add_argument("--startup-scans", type=int, default=3)
-    parser.add_argument("--calibration-timeout", type=float, default=30.0)
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="path to the vehicle TOML profile (default: CAR_CONFIG env or "
+        "configs/cooper_rock5a_l150.toml)",
+    )
+    parser.add_argument("--radar-port", default=None)
+    parser.add_argument("--radar-x-cm", type=float, default=None)
+    parser.add_argument("--radar-y-cm", type=float, default=None)
+    parser.add_argument("--radar-yaw-cw-deg", type=float, default=None)
+    parser.add_argument("--startup-scans", type=int, default=None)
+    parser.add_argument("--calibration-timeout", type=float, default=None)
     parser.add_argument(
         "--radar-center-behind-a-cm",
         type=float,
-        default=RADAR_CENTER_BEHIND_A_ALONG_AB_CM,
+        default=None,
+        help="rear-axle distance ahead of A before the lap; overrides the "
+        "profile and the runtime state file",
     )
-    parser.add_argument("--ab-speed-cm-s", type=float, default=AB_TRACK_SPEED_CM_S)
-    parser.add_argument("--bc-speed-cm-s", type=float, default=BC_TRACK_SPEED_CM_S)
-    parser.add_argument("--cd-speed-cm-s", type=float, default=CD_TRACK_SPEED_CM_S)
+    parser.add_argument("--ab-speed-cm-s", type=float, default=None)
+    parser.add_argument("--bc-speed-cm-s", type=float, default=None)
+    parser.add_argument("--cd-speed-cm-s", type=float, default=None)
     parser.add_argument("--cd-second-speed-cm-s", type=float, default=None)
-    parser.add_argument("--da-speed-cm-s", type=float, default=DA_TRACK_SPEED_CM_S)
-    parser.add_argument("--camera", type=_camera_source, default=0)
+    parser.add_argument("--da-speed-cm-s", type=float, default=None)
+    parser.add_argument("--camera", type=_camera_source, default=None)
     parser.add_argument(
         "--no-camera-correction",
         action="store_true",
-        help="run the copied fixed-track program in radar-only mode",
+        help="run in radar-only mode (camera correction disabled)",
     )
-    parser.add_argument("--fleet-link-port", default=DEFAULT_HC14_PORT)
+    parser.add_argument("--fleet-link-port", default=None)
     parser.add_argument(
         "--no-fleet-position",
         action="store_true",
@@ -1585,6 +1565,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--wait-for-fleet-start",
         action="store_true",
+        default=None,
         help="remain stationary after calibration until CAR_START_MISSION",
     )
     parser.add_argument(
@@ -1596,7 +1577,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--completion-alarm-seconds",
         type=float,
-        default=0.0,
+        default=None,
         help="sound/light duration after a completed lap; zero disables it",
     )
     parser.add_argument(
@@ -1608,7 +1589,184 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_main_config(
+    car_config,
+    mission: str | None = "task1",
+    cli_args=None,
+    config_path: str | None = None,
+):
+    """Compose the validated application config from the TOML profile + CLI.
+
+    Explicit CLI values always win over the profile; the runtime radar-centre
+    selection wins over the TOML default but loses to an explicit CLI value.
+    ``mission`` selects the [missions.task1] / [missions.task2] section;
+    ``None`` keeps the direct-entry behaviour (no FleetBus wait, no mission
+    request state, no completion alarm).
+    """
+    from config.factory import (
+        build_camera_correction_config,
+        build_line_vision_config,
+        build_steering_calibration,
+        derive_steering_clamp_rad,
+    )
+    from config.runtime_state import load_runtime_radar_center_cm
+    from config.loader import resolve_config_path as _resolve_path
+
+    missions = car_config.missions
+    common = missions.common
+    devices = car_config.devices
+    if mission == "task2":
+        task = missions.task2
+        cd_second = task.cd_speed_after_retakeoff_cm_s
+        ab = task.ab_speed_cm_s
+        bc = task.bc_speed_cm_s
+        cd = task.cd_speed_before_retakeoff_cm_s
+        da = task.da_speed_cm_s
+    else:
+        task = missions.task1
+        cd_second = None
+        ab = task.ab_speed_cm_s
+        bc = task.bc_speed_cm_s
+        cd = task.cd_speed_cm_s
+        da = task.da_speed_cm_s
+
+    if mission in ("task1", "task2"):
+        wait_default = True
+        alarm_default = task.completion_alarm_seconds
+        state_default = task.fleet_mission_request_state
+    else:
+        # Direct entry keeps its historical behaviour: no FleetBus wait,
+        # no mission request state, no completion alarm.
+        wait_default = False
+        alarm_default = 0.0
+        state_default = None
+
+    mount = car_config.sensors.radar.mount
+    radar_center_cm = common.radar_center_behind_a_cm
+    if cli_args is not None and cli_args.radar_center_behind_a_cm is not None:
+        radar_center_cm = float(cli_args.radar_center_behind_a_cm)
+    elif car_config.runtime.enabled:
+        resolved = _resolve_path(config_path)
+        base_directory = (
+            None
+            if Path(car_config.runtime.state_file).is_absolute()
+            else resolved.resolve().parent.parent
+        )
+        radar_center_cm = load_runtime_radar_center_cm(
+            car_config.runtime,
+            radar_center_cm,
+            base_directory=base_directory,
+        )
+
+    clamp_min, clamp_max = derive_steering_clamp_rad(car_config)
+    return MainConfig(
+        radar_port=(
+            devices.radar.port
+            if cli_args is None or cli_args.radar_port is None
+            else cli_args.radar_port
+        ),
+        radar_mount=RadarMount(
+            mount.x_forward_cm
+            if cli_args is None or cli_args.radar_x_cm is None
+            else cli_args.radar_x_cm,
+            mount.y_left_cm
+            if cli_args is None or cli_args.radar_y_cm is None
+            else cli_args.radar_y_cm,
+            mount.yaw_cw_deg
+            if cli_args is None or cli_args.radar_yaw_cw_deg is None
+            else cli_args.radar_yaw_cw_deg,
+        ),
+        startup_scan_count=(
+            common.startup_scan_count
+            if cli_args is None or cli_args.startup_scans is None
+            else cli_args.startup_scans
+        ),
+        calibration_timeout_s=(
+            common.calibration_timeout_s
+            if cli_args is None or cli_args.calibration_timeout is None
+            else cli_args.calibration_timeout
+        ),
+        radar_center_behind_a_cm=radar_center_cm,
+        ab_speed_cm_s=ab if cli_args is None or cli_args.ab_speed_cm_s is None else cli_args.ab_speed_cm_s,
+        bc_speed_cm_s=bc if cli_args is None or cli_args.bc_speed_cm_s is None else cli_args.bc_speed_cm_s,
+        cd_speed_cm_s=cd if cli_args is None or cli_args.cd_speed_cm_s is None else cli_args.cd_speed_cm_s,
+        cd_second_speed_cm_s=(
+            cd_second
+            if cli_args is None or cli_args.cd_second_speed_cm_s is None
+            else cli_args.cd_second_speed_cm_s
+        ),
+        da_speed_cm_s=da if cli_args is None or cli_args.da_speed_cm_s is None else cli_args.da_speed_cm_s,
+        camera_source=(
+            devices.camera.source
+            if cli_args is None or cli_args.camera is None
+            else cli_args.camera
+        ),
+        camera_correction_enabled=(
+            common.camera_correction_enabled
+            and not (cli_args is not None and cli_args.no_camera_correction)
+        ),
+        camera_correction=build_camera_correction_config(car_config),
+        vision_config=build_line_vision_config(car_config),
+        fleet_position_reporting_enabled=(
+            common.fleet_position_reporting_enabled
+            and not (cli_args is not None and cli_args.no_fleet_position)
+        ),
+        fleet_link_port=(
+            devices.hc14.port
+            if cli_args is None or cli_args.fleet_link_port is None
+            else cli_args.fleet_link_port
+        ),
+        fleet_position_only=(
+            False if cli_args is None else cli_args.fleet_position_only
+        ),
+        fleet_wait_for_start=(
+            wait_default
+            if cli_args is None or cli_args.wait_for_fleet_start is None
+            else cli_args.wait_for_fleet_start
+        ),
+        fleet_mission_request_state=(
+            state_default
+            if cli_args is None or cli_args.fleet_mission_request_state is None
+            else cli_args.fleet_mission_request_state
+        ),
+        completion_alarm_seconds=(
+            alarm_default
+            if cli_args is None or cli_args.completion_alarm_seconds is None
+            else cli_args.completion_alarm_seconds
+        ),
+        mission_control=missions.control,
+        vehicle_steering_min_rad=clamp_min,
+        vehicle_steering_max_rad=clamp_max,
+        fleet_terminal_report_grace_s=(
+            missions.control.fleet_terminal_report_grace_s
+        ),
+        fleet_trace_drain_timeout_s=(
+            missions.control.fleet_trace_drain_timeout_s
+        ),
+        motor_device=devices.motor.port,
+        wheelbase_mm=car_config.vehicle.geometry.wheelbase_mm,
+        physical_track_width_mm=(
+            car_config.vehicle.geometry.physical_track_width_mm
+        ),
+        firmware_track_width_mm=car_config.vehicle.drive.firmware_track_width_mm,
+        min_turn_radius_mm=car_config.vehicle.drive.min_turn_radius_mm,
+        allow_in_place_rotation=(
+            car_config.vehicle.drive.allow_in_place_rotation
+        ),
+        steering_calibration=build_steering_calibration(car_config),
+        hardware_lock_path=DEFAULT_HARDWARE_LOCK_PATH,
+        alarm_sysfs_root=car_config.hardware.alarm_gpio.sysfs_root,
+        alarm_bank_label=car_config.hardware.alarm_gpio.bank_label,
+        alarm_line_offset=car_config.hardware.alarm_gpio.line_offset,
+        alarm_active_low=car_config.hardware.alarm_gpio.active_low,
+    )
+
+
+def run_mission(
+    mission: str | None = None,
+    argv: list[str] | None = None,
+) -> int:
+    """Composition root: parse CLI, load the profile, run the application."""
     args = build_argument_parser().parse_args(argv)
     requested_log_dir = (
         default_log_dir() if args.log_dir is None else Path(args.log_dir)
@@ -1624,42 +1782,19 @@ def main(argv: list[str] | None = None) -> int:
 
     app: RadarCameraLineApplication | None = None
     try:
-        app = RadarCameraLineApplication(
-            MainConfig(
-                radar_port=args.radar_port,
-                radar_mount=RadarMount(
-                    args.radar_x_cm,
-                    args.radar_y_cm,
-                    args.radar_yaw_cw_deg,
-                ),
-                startup_scan_count=args.startup_scans,
-                calibration_timeout_s=args.calibration_timeout,
-                radar_center_behind_a_cm=args.radar_center_behind_a_cm,
-                ab_speed_cm_s=args.ab_speed_cm_s,
-                bc_speed_cm_s=args.bc_speed_cm_s,
-                cd_speed_cm_s=args.cd_speed_cm_s,
-                cd_second_speed_cm_s=args.cd_second_speed_cm_s,
-                da_speed_cm_s=args.da_speed_cm_s,
-                camera_source=args.camera,
-                camera_correction_enabled=(
-                    not args.no_camera_correction
-                ),
-                camera_correction=_default_correction_config(),
-                fleet_position_reporting_enabled=(
-                    not args.no_fleet_position
-                ),
-                fleet_link_port=args.fleet_link_port,
-                fleet_position_only=args.fleet_position_only,
-                fleet_wait_for_start=args.wait_for_fleet_start,
-                fleet_mission_request_state=args.fleet_mission_request_state,
-                completion_alarm_seconds=args.completion_alarm_seconds,
-            )
+        car_config = load_car_config(args.config)
+        main_config = build_main_config(
+            car_config,
+            mission=mission,
+            cli_args=args,
+            config_path=args.config,
         )
 
         def stop_handler(signum, _frame) -> None:
             LOG.info("received signal %s; stopping", signum)
             app.request_stop()
 
+        app = RadarCameraLineApplication(main_config)
         signal.signal(signal.SIGINT, stop_handler)
         signal.signal(signal.SIGTERM, stop_handler)
         app.run()
@@ -1673,6 +1808,10 @@ def main(argv: list[str] | None = None) -> int:
         if app is not None:
             app.close()
         shutdown_logging()
+
+
+def main(argv: list[str] | None = None) -> int:
+    return run_mission(mission=None, argv=argv)
 
 
 if __name__ == "__main__":

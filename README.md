@@ -1,17 +1,53 @@
 # 小车上位机代码结构
 
-正式入口为 `code/main.py`，可复用硬件模块放在 `code/components`，所有测试、临时脚本和一次性配置工具放在 `code/test`。
+正式比赛入口为 `code/main_task1.py`（任务1）与 `code/main_task2.py`（任务2），
+两者共用 `code/main_radar_camera_line_following.py` 的比赛核心。
+可复用硬件模块放在 `code/components`，硬件抽象层在 `code/hal`，
+统一 TOML 配置在 `configs/` 与 `code/config/`，所有测试放在 `code/test`。
+
+## 🚀 其他学校快速开始
+
+本仓库是**同一道比赛题**的配置化版本：换车不需要改主程序和算法，只需要复制
+示例配置并修改车辆数据。
+
+```bash
+# 1. 复制示例配置，得到自己学校的配置
+cp configs/car.example.toml configs/my_car.toml
+
+# 2. 修改车辆尺寸（[vehicle.geometry]：轴距/轮距/车身）
+# 3. 修改驱动串口（[devices.motor] / [devices.radar] / [devices.hc14] / [devices.screen]）
+# 4. 配置 PWM（[hardware.steering_pwm]，按新主控板改 chip_device_match）
+# 5. 配置 GPIO（[hardware.alarm_gpio]，注意 active_low）
+# 6. 标定舵机（[vehicle.steering]：direction_sign / center_us / 机械范围 / 曲线）
+# 7. 设置雷达位置（[sensors.radar.mount]，相对后轴中心）
+# 8. 标定摄像头（[sensors.camera.perspective] 与 [sensors.camera.line]）
+# 9. 运行低速测试（见 docs/CALIBRATION.md 第 11 步）
+# 10. 启动任务
+python3 code/main_task1.py --config configs/my_car.toml
+python3 code/main_task2.py --config configs/my_car.toml
+```
+
+不传 `--config` 时默认解析到 `configs/cooper_rock5a_l150.toml`（当前验证车辆），
+也可用环境变量 `CAR_CONFIG=/path/to/config.toml` 指定。
+
+详细文档：
+
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — 配置结构、优先级、两套轮距
+- [docs/HARDWARE_PORTING.md](docs/HARDWARE_PORTING.md) — 换主控板步骤
+- [docs/CALIBRATION.md](docs/CALIBRATION.md) — 实车标定操作顺序
+- [docs/platforms/rock5a.md](docs/platforms/rock5a.md) — 当前 ROCK 5A 实车接线
 
 ## 正式驱动组件
 
 - `components/rear_motor.py`：C10B 后轮串口控制、20 Hz 刷新、超时停车。
-- `components/steering_servo.py`：ROCK 5A Pin 23 前轮转向舵机及厂家标定曲线。
+- `components/steering_servo.py`：前轮转向舵机标定曲线（标定数据来自配置）。
 - `components/ackermann_drive.py`：统一设置车速、前轮偏航方向，并可联动后轮差速。
-- `components/sound_light_alarm.py`：ROCK 5A GPIO4_B3 低电平触发声光报警器。
+- `components/sound_light_alarm.py`：声光报警器开关（GPIO 来自配置）。
 - `components/battery_voltage_monitor.py`：C10B 串口电池遥测与低压声光报警服务。
 - `components/trusted_navigation_map.py`：可信雷达位姿门限、车体自反射过滤和导航占据图。
 
-`main.py` 通过 `Navigation` 间接使用 `AckermannDrive`；只有维护、标定或特殊控制时才直接访问前后独立组件。
+`main_radar_camera_line_following.py` 通过 `Navigation`/`AckermannDrive` 间接使用
+前后独立组件；只有维护、标定或特殊控制时才直接访问。
 
 ## C10B 电池低压报警
 
@@ -583,182 +619,56 @@ finally:
 `MainConfig(allow_in_place_rotation=True)` 开启。正式 `main.py` 和普通 Navigation 默认
 保持关闭，避免其他任务意外发出左右后轮反向命令。
 
-## 正式主程序
+## 正式比赛入口（Task 1 / Task 2）
 
-文件：`main.py`
+当前正式比赛程序为三个文件：
 
-使用 `--fleet-bus` 时，主程序会先启动 HC-14/FleetBus 接收，但保持车辆静止且不启动
-D500 建图；只有收到地面站的空载荷 `CAR_START_MAPPING (0x13)` 后，才在后台执行启动矩形
-标定。标定成功后状态才置为 `READY | MAP_READY`。`TARGETED_STOP` 在等待和标定阶段均可
-中断；非 FleetBus/SSH 的原有启动建图流程不变。随后地面站以小车启动后轴中心的场地绝对
-位置和初始朝向执行 `SET_COORDINATE_FRAME`，车端继续复用既有 SE(2) 对齐和 `main` 导航
-方法。
-
-`main.py` 现在只协调 `CoordinateNavigation` 与 HC-14/FleetBus/SSH 命令入口、状态回执、
-日志和安全退出；雷达建图、可信定位、目标校验、规划和控制不再在主程序中重复实现。
-
-正常行驶速度集中在 `main.py` 顶部的 `NAVIGATION_CRUISE_SPEED_CM_S`，单位为
-`cm/s`（例如 `50.0` 等于 `0.5 m/s`），允许范围为 `0～100 cm/s`。主程序只在把
-速度传给底层驱动控制器时转换为 `mm/s`，并将正式 main 所属后轮驱动器的单轮限幅
-自动设置为 `max(30, 1.20 × 巡航速度) cm/s`，为阿克曼弯道外侧轮保留余量。例如
-`50 cm/s` 巡航对应 `60 cm/s` 单轮限幅。底层通用组件的默认限幅仍为 `30 cm/s`；
-规划和驱动层仍会拒绝超出本次配置限幅的整条命令，不会静默缩放。
-
-正式 main 的倒车开关位于同一区域：`NAVIGATION_ALLOW_REVERSE = True`。当前默认允许
-Hybrid A* 规划倒车；前进/倒车切换仍会先停车至少 `0.25 s`。临时启动时可用
-`--no-reverse` 禁止倒车，`--allow-reverse` 可显式开启。
-
-倒车巡航速度也独立放在 `main.py` 顶部：`NAVIGATION_REVERSE_SPEED_CM_S = 15.0`，
-单位和允许范围与前进巡航速度相同。该值是实际倒车速度上限，即使设置得低于接近目标
-速度也不会被控制器重新抬高；正式 main 的单轮限幅会按前进/倒车两者中较大的速度预留
-20% 阿克曼外侧轮余量。
-
-当前正式 main 的前进巡航速度为 `30 cm/s`。距离目标 `60 cm` 内开始分段减速，
-接近速度下限为 `8 cm/s`；倒车恢复上限为 `15 cm/s`。Pure Pursuit 的前视距离为
-`20～50 cm`，终点前视目标不会再沿末段切线延伸到目标坐标之外。
-
-如果车辆越过目标，Navigation 会连续两个雷达位姿确认越点，先停车并保留同一个
-`NavigationGoal`，然后清除旧路径、从当前位置重新规划；允许倒车时规划器可以选择
-倒车返回。预测前方轨迹被墙体或场地边界阻断、但当前车身仍处于安全位置时也采用同一
-恢复流程。单次任务最多自动恢复三次，超过次数或当前车身已经碰撞才进入 `BLOCKED`。
-
-启动阶段车辆必须保持静止。主程序先只打开 D500，收集完整圆周点云并用 RANSAC/PCA
-拟合矩形场地的四条边。拟合成功后，会把点云、矩形边界、墙线纠漂参考和后续 ICP
-位姿统一重基准到本次启动的车体坐标系：启动时后轴中心为 `(0, 0) cm`，启动时车头
-方向为 `0°`，地图 `+X` 指向启动车头，`+Y` 位于车头左侧，航向俯视逆时针为正并
-归一化到 `0～359°`。即使车头与矩形墙边存在小夹角，也不会只修改显示角度；旋转后的
-矩形多边形之外仍全部标为障碍。矩形未可靠拟合前不会接受任务，也不会启动电机控制。
-
-拟合成功后，主程序把矩形内部作为已知场地，矩形外（包括地图边距）全部标为障碍，
-再以雷达击中点补充内部障碍。运行中由 ICP 提供连续相对位姿，并用启动时得到的墙线
-参考周期性纠漂。该建图策略假定场地是静态矩形；动态障碍点当前不会自动衰减。
-
-Navigation 使用独立的可信雷达地图：只有 ICP 残差、相邻位姿跳变和完整车身边界均通过
-门限的定位才会刷新导航和地图。墙线残差仍在积累共识（`PENDING`）或本圈没有合格墙线
-（`NO_OBSERVATION`）不代表 ICP 失效，这类扫描仍可进入可信图；只有墙线已经形成共识却
-触发残差硬门限（`HARD_REJECTED`）时才跳过该圈建图。每次地图刷新及
-通过门限的每个雷达位姿都会从累计地图永久清除当前车身安全包络内的历史自反射；清除
-范围同时包含 Navigation 安全边距和栅格单元对角量化余量。提交新目标前还会再次过滤，
-避免下一任务错误报告“起始车身已占据”。异常位姿仍保留在原始雷达图和日志中用于诊断，超过定位陈旧时间后
-Navigation 按原有安全逻辑停车。`BLOCKED` 日志会同时记录车身四角、附近占据格、地图
-版本、可信位姿年龄和最近拒绝原因。
-
-雷达安装偏移以**后轴中心**为车体原点，通过以下参数提供；三个默认值 `0` 只适用于
-雷达测量原点确实位于后轴中心且朝向与车头完全一致的安装，实车运行前应填入测量值：
+- `code/main_task1.py` —— 任务1 一键入口（只负责选择任务并加载配置）；
+- `code/main_task2.py` —— 任务2 一键入口（同上）；
+- `code/main_radar_camera_line_following.py` —— 共享比赛核心：
+  D500 矩形建图 → 起步接近 A → 沿黑线跑一圈（AB/BC/CD/DA），雷达定位为主、
+  相机做有限纠偏，并上报 FleetBus 相对位置。
 
 ```bash
-export GROUND_STATION_HMAC_KEY_HEX="至少32个十六进制字符的共享密钥"
-sudo -E python3 code/main.py \
-  --radar-x-cm <雷达在后轴中心前方的厘米数> \
-  --radar-y-cm <雷达在后轴中心左侧的厘米数> \
-  --radar-yaw-cw-deg <雷达相对车头顺时针安装角>
+# 当前车默认配置（不传 --config 时自动解析）
+python3 code/main_task1.py
+python3 code/main_task2.py
+
+# 其他学校：用自己的配置
+python3 code/main_task1.py --config configs/my_car.toml
+python3 code/main_task2.py --config configs/my_car.toml
 ```
 
-若只通过 SSH 终端控制，可以不设置 `GROUND_STATION_HMAC_KEY_HEX`；此时 HC-14 命令
-入口保持关闭，终端入口照常工作。程序必须运行在 TTY 中，例如进入上位机后运行：
+任务速度、任务请求状态、完成报警时长全部来自 `[missions.task1]` /
+`[missions.task2]`；比赛控制调参来自 `[missions.control]`。显式 CLI 参数始终
+覆盖配置值。
 
-```bash
-cd /home/radxa/car
-sudo -E python3 main.py
-```
+串口屏启动器 `code/mission_screen_launcher.py` 监听 `MISSION1`/`MISSION2`
+按钮并启动对应任务，同时把同一个 `--config` 传给子任务，保证启动器和任务
+使用同一份硬件配置。systemd 通用模板见
+`deploy/mission-screen-launcher.service.example`。
 
-建图成功后终端会显示 `=== 建图完成，Navigation 已就绪 ===`、启动位姿和旋转后的
-场地四角。提示符下直接输入：
-
-```text
-200 50          # 前往 x=200cm, y=50cm，不限定最终车头
-200 50 90       # 前往同一点，并最终对齐到逆时针 90°
-0 0 0           # 回到启动后轴中心，并恢复启动时的车头方向
-status           # 当前定位、导航状态和原因
-stop             # 立即停车回中并取消任务
-help             # 显示简要帮助
-quit             # 停车并退出 main
-```
-
-`x/y` 单位为厘米，可为小数；可选角度必须是 `0～359` 的整数，`360`、小数角度和场地
-多边形外目标都会被拒绝。同一时间只执行一个任务；Navigation 仍使用 Hybrid A* 自主
-规划，并在行驶中用每个有效雷达位姿持续修正横向误差、航向误差、转角和速度。
-
-每次任务到达、失败或阻塞停车后，main 会清除该次目标并自动回到可接收下一目标的
-`IDLE` 状态。启动时建立的矩形地图、雷达累计定位和坐标原点均保留：下一条命令仍使用
-同一次启动的 `(0,0,0°)` 坐标系，并从小车任务结束时的当前位姿重新规划，不会把当前
-位置重设为原点，也不会重新建图。SSH 会提示“可继续输入下一目标”；HC-14 收到终态
-ACK 后同样可以发送下一条新的 `(session, seq)` 坐标任务。
-
-正式 main 当前默认允许倒车；顶部 `NAVIGATION_ALLOW_REVERSE` 是默认开关，也可在
-启动时用 `--no-reverse` 临时关闭。标定默认使用最近 3 个完整圆周、超时 30 秒，可用
-`--startup-scans` 和 `--calibration-timeout` 调整。
-退出信号、标定失败、定位/规划失败和远端停止都会触发停车回中。
+雷达安装偏移以后轴中心为原点，通过配置 `[sensors.radar.mount]` 或 CLI
+`--radar-x-cm / --radar-y-cm / --radar-yaw-cw-deg` 提供。
 
 ### 运行日志
 
-主程序每次启动都会创建 `main.py` 同级的 `logs/car-main.log`。本地路径为
-`C:\Users\TZDEZACR\Desktop\cccccar\car\code\logs\car-main.log`，部署到 ROCK 5A 后为
-`/home/radxa/car/logs/car-main.log`。文件始终记录 DEBUG 级详细诊断，SSH 终端默认不
-显示运行日志，以免打断坐标输入；建图完成、任务状态、输入提示及命令错误仍直接显示。
-如需临时观察终端日志，可用 `--log-level WARNING`（或 `INFO`/`DEBUG`）显式开启；也可用 `--log-dir` 或环境变量
-`CAR_LOG_DIR` 覆盖目录。
-
-日志包括启动参数（不含 HMAC 密钥）、矩形拟合结果、每圈雷达的 ICP/墙线门限与位姿、
-地图刷新、规划路径摘要，以及每个运动控制周期的横向/航向误差、定位降速系数、限幅
-前后舵角、PWM、左右后轮目标和实际下发的 C10B `Vx/Vz`。它不逐点转储点云，也不记录
-HMAC 密钥。单文件达到 `20 MiB` 后轮转，保留 `10` 个历史文件；`logs/` 已写入
-`.gitignore`，运行记录不会进入 Git。
-
-板端实时查看：
+比赛核心每次启动都会在 `code/logs/car-main.log` 记录 DEBUG 级详细日志（本地
+`code/logs/`，板端 `/home/radxa/car/logs/`），单文件 `20 MiB` 轮转、保留
+`10` 个。终端日志级别由 `--log-level` 控制，目录可用 `--log-dir` 或环境变量
+`CAR_LOG_DIR` 覆盖。
 
 ```bash
 tail -f /home/radxa/car/logs/car-main.log
 ```
 
-### 地面站坐标命令
+日志包括启动参数、矩形拟合结果、每圈雷达 ICP/墙线门限与位姿、地图刷新、
+规划摘要，以及每个运动控制周期的误差/舵角/PWM/后轮/C10B 输出；不逐点转储
+点云。`code/logs/` 已在 `.gitignore` 中。
 
-`components/navigation_protocol.py` 复用地面站既有 GroundStationLink V2 的
-`AA 22` 元数据、校验和及 HMAC。HC-14 串口组件会在链路层自动增加/移除
-`BB 33 | length:u8` 外层。共享密钥只从环境变量
-`GROUND_STATION_HMAC_KEY_HEX` 读取，不得写入源码或日志。未设置密钥时不会以不鉴权方式
-打开 HC-14，而是仅关闭无线命令入口。
+### 固定赛道雷达单圈（回退入口）
 
-新增车辆命令号为 `NAVIGATE_TO = 0x20`，其业务 payload 为：
-
-```text
-command_id:u8 = 0x20
-flags:u8             bit0=1 表示携带最终航向
-x_cm:i32 LE
-y_cm:i32 LE
-[heading_centideg:u16 LE]   可选，0..35999，即 0.00..359.99°，俯视逆时针为正
-```
-
-不带航向时只要求到达目标坐标附近；带航向时只有位置和朝向同时满足容差才返回
-`COMPLETED`。重复的 `(session, seq)` 命令不会重复发车。已有 `STOP_MISSION = 5`
-用于取消当前导航。主程序依次返回 V2 `RECEIVED`、`ACCEPTED/REJECTED`，任务结束后
-返回 `COMPLETED/FAILED`。
-
-发送的 `x/y/heading` 必须属于本次启动建立的车头零度场地坐标系。主程序不会猜测或自动
-转换无人机另一个原点/方向的坐标；若无人机内部使用不同地图，发送端必须先做已标定的
-SE(2) 坐标变换。
-
-发送端可以复用 `pack_navigation_command(NavigationGoal(...))` 生成完整内部
-`AA 22` 帧。当前 `ground_station` 原代码尚无 `0x20` 坐标命令，地面站/无人机发送端
-必须按上述 payload 增加该命令后才能下发坐标；车端接收和 ACK 已完成。
-
-# 固定赛道单圈入口
-
-正式入口 `code/main.py` 当前只验证固定轨迹闭环，不包含比赛任务或 FleetBus。
-小车后轴位于 A 点（本阶段视为雷达中心也在 A 点）并保持静止完成 D500
-矩形标定后，程序自动以 `8 cm/s`
-沿 AB、BC、CD、DA 行驶一圈。控制只在 D500 提供已接受的新位姿时更新，
-转向复用 `PurePursuitController`，车速和舵角由 `AckermannDrive` 下发。
-进度越过 A 并进入重复 AB 采样段后停车并退出。
-单圈速度集中定义在 `code/main.py` 文件前部的 `TRACK_SPEED_CM_S`，修改该值
-即可调整下一次实车测试速度，单位为 `cm/s`。
-启动时雷达中心位于 A 点后方的距离定义在同一位置的
-`RADAR_CENTER_BEHIND_A_ALONG_AB_CM`。该值沿 AB 前进方向计量；小车前进该距离后，
-雷达中心经过 A 点。
-
-```bash
-sudo python3 /home/radxa/car/main.py
-```
-
-旧的雷达建图/坐标导航入口原样归档为
+`code/main_fixed_track_test.py` 是不含相机纠偏的雷达-only 回退入口；
+`code/competition_task_runtime.py` 是更早的分段速度运行器。两者不是比赛正式
+入口，仅用于联调/回退。旧的雷达建图/坐标导航代码归档在
 `code/former_code/radar_point_navigation.py`。

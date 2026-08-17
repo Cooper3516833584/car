@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 from pathlib import Path
-import tempfile
+import shutil
 import unittest
+import uuid
 
 from components.sound_light_alarm import AlarmGPIOError, SoundLightAlarm, resolve_gpio_number
 
 
 class SoundLightAlarmTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary_directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary_directory.cleanup)
-        self.root = Path(self.temporary_directory.name)
+        # Use Path.mkdir (not tempfile.mkdtemp): the Windows file sandbox
+        # denies creating subdirectories inside mkdtemp-created directories.
+        self.root = (
+            Path(__file__).resolve().parent / f"_alarm_tmp_{uuid.uuid4().hex}"
+        )
+        self.root.mkdir()
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         chip = self.root / "gpiochip128"
         chip.mkdir()
         (chip / "label").write_text("gpio4\n", encoding="ascii")
