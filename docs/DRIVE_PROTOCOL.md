@@ -253,4 +253,3 @@ link.close()
   变化一致，禁止再反转 Navigation 或后轮差速来补偿前轮。
 - 地面站活动代码：`Ground_Station/components/serial_transport.py`，用于 `BB 33` 桥封装、`115200 8N1`、DTR/RTS状态、后台收发和重连行为；小车组件保持字节级兼容，但改用标准库以避免ROCK 5A缺少 `pyserial`。
 - 地面站 `details.md`：当前 GroundStationLink V2 串口分层和真实 HC-14 参数/双向验证记录。
-
